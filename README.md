@@ -1,117 +1,107 @@
 # Walt
 
-Walt is a terminal-first wallpaper picker for Hyprland. It gives you a two-column browser with live image preview, themeable UI, path management, and one-key random wallpaper selection.
+Walt is a fast terminal wallpaper picker for Hyprland. Browse your library, preview wallpapers in place, switch themes, and apply a new background without leaving the keyboard.
 
-![Walt wordmark](assets/walt.jpg)
+![Walt banner](assets/walt-banner.jpg)
 
-## Features
+## Why Walt
 
-- Live terminal image preview with `ratatui-image`
-- Wallpaper browser with vim-style and arrow-key navigation
-- `r` to pick and apply a random wallpaper instantly
-- Path manager for adding and removing wallpaper directories
-- Hidden directories included in path suggestions
-- 10 built-in themes plus `System`, which follows your terminal colors
-- Multi-monitor wallpaper application through `hyprpaper`
-
-## Requirements
-
-- `rust` and `cargo`
-- `hyprpaper`
-- `hyprctl`
-- A terminal with image protocol support
-  - Ghostty
-  - Kitty
-  - WezTerm
-  - iTerm2
-
-## Build
-
-```bash
-cargo build --release
-```
-
-The compiled binary will be `target/release/walt`.
+- Stay in the terminal while browsing and applying wallpapers
+- Preview wallpapers before committing to them
+- Keep large wallpaper directories manageable with fast navigation and random selection
+- Match the app to your setup with built-in themes, including a `System` theme that follows your terminal
+- Use it comfortably on multi-monitor Hyprland setups through `hyprpaper`
 
 ## Install
 
-Simple install:
+Quick install:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gitfudge0/walt/main/install.sh | bash
 ```
 
-This downloads Walt from GitHub, builds it with Cargo, and installs it to `~/.local/bin/walt`.
+This installs `walt` to `~/.local/bin/walt`.
 
-Local repo install:
+From a local checkout:
 
 ```bash
 ./install.sh
 ```
 
-Or manually:
+Manual install:
 
 ```bash
 cargo build --release
 install -Dm755 target/release/walt ~/.local/bin/
 ```
 
-## Hyprland Setup
+## Requirements
 
-Add this to [hyprland.conf](/home/gitfudge/.config/hypr/hyprland.conf):
+- `rust` and `cargo`
+- `hyprpaper`
+- `hyprctl`
+- a terminal with image protocol support
+  - Ghostty
+  - Kitty
+  - WezTerm
+  - iTerm2
+
+## Hyprland setup
+
+For Ghostty:
 
 ```conf
 bind = $mainMod SHIFT, D, exec, ghostty --class=walt -e ~/.local/bin/walt
-```
-
-Optional floating rule:
-
-```conf
 windowrulev2 = float, class:^(com\.mitchellh\.ghostty\.walt)$
 windowrulev2 = size 900 600, class:^(com\.mitchellh\.ghostty\.walt)$
 windowrulev2 = center, class:^(com\.mitchellh\.ghostty\.walt)$
 ```
 
-`./install.sh` detects your current terminal and prints the matching launch command and Hyprland rules for Ghostty, WezTerm, or Kitty.
+`install.sh` detects your current terminal and prints matching launch instructions for Ghostty, WezTerm, or Kitty.
 
-Make sure `hyprpaper` is started:
+Make sure `hyprpaper` is running:
 
 ```conf
 exec-once = hyprpaper
 ```
 
-## Usage
+## First run
 
-### First Run
-
-- Copy the path to your wallpaper directory, then paste it into Walt
-- Use `↑/↓` to move through suggestions
-- Press `Tab` to autocomplete a suggestion
-- Press `Enter` to save the path
+1. Copy the path to your wallpaper directory.
+2. Launch Walt.
+3. Paste the directory path into the app and press `Enter`.
 
 Walt stores config in `~/.config/walt/` and automatically reads legacy settings from `~/.config/wallpaper-switcher/`.
 
-### Wallpaper View
+## Usage
 
-- `↑/↓` or `j/k`: move selection
-- `g/G`: jump to top or bottom
-- `Enter`: apply selected wallpaper
-- `r`: pick and apply a random wallpaper
-- `p`: open the path manager
-- `t`: cycle UI themes
-- `q` or `Esc`: quit
+In the wallpaper browser:
 
-### Path Manager
+- `↑/↓` or `j/k` to move
+- `g/G` to jump to the top or bottom
+- `Enter` to apply the selected wallpaper
+- `r` to pick and apply a random wallpaper
+- `p` to manage wallpaper paths
+- `t` to open the theme picker
+- `q` or `Esc` to quit
 
-- `↑/↓` or `j/k`: move selection
-- `a`: add a path
-- `d`: delete the selected path
-- `p`, `q`, or `Esc`: return to wallpaper view
-- `t`: cycle UI themes
+In the path manager:
+
+- `↑/↓` or `j/k` to move
+- `a` to add a path
+- `d` to remove the selected path
+- `p`, `q`, or `Esc` to return
+- `t` to open the theme picker
+
+In the theme picker:
+
+- `↑/↓` or `j/k` to preview themes
+- `Enter` to confirm
+- `Esc` or `q` to cancel
 
 ## Themes
 
-Built-in themes:
+Included themes:
 
 - `System`
 - `Catppuccin Mocha`
@@ -125,18 +115,15 @@ Built-in themes:
 - `Everforest Dark`
 - `Rosé Pine`
 
-`System` intentionally uses the host terminal's default foreground and background behavior instead of hardcoding a palette.
+`System` uses your terminal defaults. The other themes render with opaque surfaces for a cleaner in-app look.
 
-## Files
-
-- Paths: `~/.config/walt/paths.conf`
-- Theme: `~/.config/walt/theme.conf`
-
-## Development
+## Build
 
 ```bash
-cargo build
+cargo build --release
 ```
+
+The binary will be available at `target/release/walt`.
 
 ## License
 
