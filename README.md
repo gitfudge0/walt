@@ -2,7 +2,7 @@
 
 Walt is a terminal-first wallpaper picker for Hyprland. It gives you a two-column browser with live image preview, themeable UI, path management, and one-key random wallpaper selection.
 
-![Walt wordmark](assets/walt-wordmark.svg)
+![Walt wordmark](assets/walt.jpg)
 
 ## Features
 
@@ -34,6 +34,16 @@ cargo build --release
 The compiled binary will be `target/release/walt`.
 
 ## Install
+
+Simple install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gitfudge0/walt/main/install.sh | bash
+```
+
+This downloads Walt from GitHub, builds it with Cargo, and installs it to `~/.local/bin/walt`.
+
+Local repo install:
 
 ```bash
 ./install.sh

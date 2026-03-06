@@ -2,6 +2,13 @@
 
 set -euo pipefail
 
+REPO_OWNER="gitfudge0"
+REPO_NAME="walt"
+DEFAULT_REF="${WALT_REF:-main}"
+ARCHIVE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${DEFAULT_REF}.tar.gz"
+INSTALL_DIR="${HOME}/.local/bin"
+INSTALL_PATH="${INSTALL_DIR}/walt"
+
 detect_terminal() {
   if [[ "${TERM_PROGRAM:-}" == "ghostty" ]] || [[ "${TERM:-}" == "xterm-ghostty" ]]; then
     printf '%s\n' "ghostty"
@@ -13,7 +20,7 @@ detect_terminal() {
     return
   fi
 
-  if [[ "${KITTY_PID:-}" != "" ]] || [[ "${TERM:-}" == "xterm-kitty" ]]; then
+  if [[ -n "${KITTY_PID:-}" ]] || [[ "${TERM:-}" == "xterm-kitty" ]]; then
     printf '%s\n' "kitty"
     return
   fi
@@ -87,24 +94,66 @@ EOF
   esac
 }
 
-echo "Building Walt..."
-cargo build --release
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Missing required command: $cmd" >&2
+    exit 1
+  fi
+}
 
-echo "Installing binary..."
-install -Dm755 target/release/walt ~/.local/bin/
+prepare_source_tree() {
+  if [[ -f "./Cargo.toml" ]] && grep -q '^name = "walt"' "./Cargo.toml"; then
+    pwd
+    return
+  fi
 
-terminal="$(detect_terminal)"
+  require_cmd curl
+  require_cmd tar
 
-echo ""
-echo "Installation complete!"
-echo ""
-print_terminal_instructions "$terminal"
-echo ""
-echo "First run:"
-echo "  1. Copy the path to your wallpaper directory."
-echo "  2. Launch Walt."
-echo "  3. Paste the directory path into the app and press Enter."
-echo ""
-echo "Make sure you have:"
-echo "  - hyprpaper installed and running"
-echo "  - A terminal with image preview support"
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+
+  echo "Downloading Walt source from ${DEFAULT_REF}..."
+  curl -fsSL "$ARCHIVE_URL" | tar -xz -C "$tmp_dir"
+  printf '%s\n' "${tmp_dir}/${REPO_NAME}-${DEFAULT_REF}"
+}
+
+install_walt() {
+  local source_dir="$1"
+
+  require_cmd cargo
+  mkdir -p "$INSTALL_DIR"
+
+  echo "Building Walt..."
+  cargo build --release --manifest-path "${source_dir}/Cargo.toml"
+
+  echo "Installing binary..."
+  install -Dm755 "${source_dir}/target/release/walt" "$INSTALL_PATH"
+}
+
+main() {
+  local source_dir
+  source_dir="$(prepare_source_tree)"
+  install_walt "$source_dir"
+
+  local terminal
+  terminal="$(detect_terminal)"
+
+  echo ""
+  echo "Installation complete!"
+  echo ""
+  print_terminal_instructions "$terminal"
+  echo ""
+  echo "First run:"
+  echo "  1. Copy the path to your wallpaper directory."
+  echo "  2. Launch Walt."
+  echo "  3. Paste the directory path into the app and press Enter."
+  echo ""
+  echo "Make sure you have:"
+  echo "  - hyprpaper installed and running"
+  echo "  - A terminal with image preview support"
+}
+
+main "$@"
