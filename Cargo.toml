@@ -1,0 +1,20 @@
+[package]
+name = "walt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+ratatui-image = { version = "5.0", features = ["crossterm"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+dirs = "5.0"
+walkdir = "2.5"
+anyhow = "1.0"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
