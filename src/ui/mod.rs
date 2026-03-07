@@ -22,8 +22,8 @@ use std::{
     thread,
 };
 
-use crate::backend::{scan_directory, scan_wallpapers_from_paths, set_wallpaper, Wallpaper};
-use crate::cache::ThumbnailCache;
+use crate::backend::{scan_directory, set_wallpaper};
+use crate::cache::{IndexedWallpaper, ThumbnailCache, WallpaperIndex};
 use crate::config::Config;
 use theme::{ThemeKind, ThemePalette};
 
@@ -46,12 +46,22 @@ struct PreviewResponse {
     protocol: anyhow::Result<StatefulProtocol>,
 }
 
+struct IndexRequest {
+    request_id: u64,
+    wallpaper_paths: Vec<PathBuf>,
+}
+
+struct IndexResponse {
+    request_id: u64,
+    wallpapers: anyhow::Result<Vec<IndexedWallpaper>>,
+}
+
 pub struct App {
     config: Config,
     theme: ThemeKind,
     theme_before_picker: ThemeKind,
     theme_return_mode: AppMode,
-    wallpapers: Vec<Wallpaper>,
+    wallpapers: Vec<IndexedWallpaper>,
     list_state: ListState,
     theme_state: ListState,
     selected_index: usize,
@@ -60,7 +70,12 @@ pub struct App {
     preview_request_id: u64,
     preview_tx: Sender<PreviewRequest>,
     preview_rx: Receiver<PreviewResponse>,
+    prewarm_tx: Sender<Vec<PathBuf>>,
     current_image: Option<StatefulProtocol>,
+    wallpaper_index: WallpaperIndex,
+    index_request_id: u64,
+    index_tx: Sender<IndexRequest>,
+    index_rx: Receiver<IndexResponse>,
     input_buffer: String,
     dir_suggestions: Vec<PathBuf>,
     suggestion_state: ListState,
@@ -71,11 +86,12 @@ impl App {
         let config = Config::new();
         let theme = ThemeKind::from_name(&config.theme_name);
         let picker = Picker::from_query_stdio()?;
-
+        let wallpaper_index = WallpaperIndex::new()?;
+        let thumbnail_cache = ThumbnailCache::new().ok();
         let wallpapers = if config.is_empty() {
             vec![]
         } else {
-            scan_wallpapers_from_paths(&config.wallpaper_paths)
+            wallpaper_index.load(&config.wallpaper_paths)
         };
 
         let mut list_state = ListState::default();
@@ -93,7 +109,9 @@ impl App {
         } else {
             AppMode::Wallpaper
         };
-        let (preview_tx, preview_rx) = spawn_preview_worker(picker, ThumbnailCache::new().ok());
+        let (preview_tx, preview_rx) = spawn_preview_worker(picker, thumbnail_cache.clone());
+        let prewarm_tx = spawn_prewarm_worker(thumbnail_cache.clone());
+        let (index_tx, index_rx) = spawn_index_worker(WallpaperIndex::new()?);
 
         let mut app = Self {
             config,
@@ -109,11 +127,20 @@ impl App {
             preview_request_id: 0,
             preview_tx,
             preview_rx,
+            prewarm_tx,
             current_image: None,
+            wallpaper_index,
+            index_request_id: 0,
+            index_tx,
+            index_rx,
             input_buffer: String::new(),
             dir_suggestions: vec![],
             suggestion_state,
         };
+
+        if !app.config.is_empty() {
+            app.request_index_refresh();
+        }
 
         if !app.wallpapers.is_empty() && app.mode == AppMode::Wallpaper {
             app.request_preview_load(0);
@@ -149,6 +176,7 @@ impl App {
     fn run_app<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> io::Result<()> {
         loop {
             self.drain_preview_updates();
+            self.drain_index_updates();
             terminal.draw(|f| self.ui(f))?;
 
             if event::poll(std::time::Duration::from_millis(16))? {
@@ -475,7 +503,7 @@ impl App {
             self.wallpapers = vec![];
             self.mode = AppMode::Setup;
         } else {
-            self.wallpapers = scan_wallpapers_from_paths(&self.config.wallpaper_paths);
+            self.wallpapers = self.wallpaper_index.load(&self.config.wallpaper_paths);
             self.list_state.select(if self.wallpapers.is_empty() {
                 None
             } else {
@@ -485,6 +513,7 @@ impl App {
             if !self.wallpapers.is_empty() {
                 self.request_preview_load(0);
             }
+            self.request_index_refresh();
         }
     }
 
@@ -771,6 +800,14 @@ impl App {
             image_path: wallpaper.path.clone(),
             area: self.preview_area,
         });
+        let prewarm_paths = self
+            .wallpapers
+            .iter()
+            .skip(index.saturating_sub(3))
+            .take(7)
+            .map(|wallpaper| wallpaper.path.clone())
+            .collect::<Vec<_>>();
+        let _ = self.prewarm_tx.send(prewarm_paths);
     }
 
     fn drain_preview_updates(&mut self) {
@@ -789,6 +826,38 @@ impl App {
         }
     }
 
+    fn request_index_refresh(&mut self) {
+        self.index_request_id = self.index_request_id.wrapping_add(1);
+        let _ = self.index_tx.send(IndexRequest {
+            request_id: self.index_request_id,
+            wallpaper_paths: self.config.wallpaper_paths.clone(),
+        });
+    }
+
+    fn drain_index_updates(&mut self) {
+        loop {
+            match self.index_rx.try_recv() {
+                Ok(response) if response.request_id == self.index_request_id => {
+                    if let Ok(wallpapers) = response.wallpapers {
+                        self.wallpapers = wallpapers;
+                        if self.wallpapers.is_empty() {
+                            self.list_state.select(None);
+                            self.selected_index = 0;
+                            self.current_image = None;
+                        } else {
+                            let max_index = self.wallpapers.len() - 1;
+                            self.selected_index = self.selected_index.min(max_index);
+                            self.list_state.select(Some(self.selected_index));
+                            self.request_preview_load(self.selected_index);
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
     fn apply_wallpaper(&self) -> anyhow::Result<()> {
         if let Some(wallpaper) = self.wallpapers.get(self.selected_index) {
             let path_str = wallpaper.path.to_string_lossy().to_string();
@@ -797,6 +866,27 @@ impl App {
         }
         Ok(())
     }
+}
+
+fn spawn_index_worker(index: WallpaperIndex) -> (Sender<IndexRequest>, Receiver<IndexResponse>) {
+    let (request_tx, request_rx) = mpsc::channel::<IndexRequest>();
+    let (response_tx, response_rx) = mpsc::channel::<IndexResponse>();
+
+    thread::spawn(move || {
+        while let Ok(mut request) = request_rx.recv() {
+            while let Ok(next_request) = request_rx.try_recv() {
+                request = next_request;
+            }
+
+            let wallpapers = index.refresh(&request.wallpaper_paths);
+            let _ = response_tx.send(IndexResponse {
+                request_id: request.request_id,
+                wallpapers,
+            });
+        }
+    });
+
+    (request_tx, response_rx)
 }
 
 fn spawn_preview_worker(
@@ -821,6 +911,28 @@ fn spawn_preview_worker(
     });
 
     (request_tx, response_rx)
+}
+
+fn spawn_prewarm_worker(thumbnail_cache: Option<ThumbnailCache>) -> Sender<Vec<PathBuf>> {
+    let (request_tx, request_rx) = mpsc::channel::<Vec<PathBuf>>();
+
+    thread::spawn(move || {
+        while let Ok(mut paths) = request_rx.recv() {
+            while let Ok(next_paths) = request_rx.try_recv() {
+                paths = next_paths;
+            }
+
+            let Some(cache) = thumbnail_cache.as_ref() else {
+                continue;
+            };
+
+            for path in paths {
+                let _ = cache.generate_thumbnail(path);
+            }
+        }
+    });
+
+    request_tx
 }
 
 fn build_preview_protocol(
