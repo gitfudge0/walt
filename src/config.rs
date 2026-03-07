@@ -191,6 +191,23 @@ impl Config {
         self.favorites.iter().any(|entry| entry == path)
     }
 
+    pub fn sort_name_for_section(&self, section: &str) -> &str {
+        match section {
+            "favorites" => &self.favorites_sort,
+            "rotation" => &self.rotation_sort,
+            _ => &self.all_sort,
+        }
+    }
+
+    pub fn set_sort_name_for_section(&mut self, section: &str, value: &str) {
+        let value = default_sort_name(value.to_string());
+        match section {
+            "favorites" => self.favorites_sort = value,
+            "rotation" => self.rotation_sort = value,
+            _ => self.all_sort = value,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.wallpaper_paths.is_empty()
     }
