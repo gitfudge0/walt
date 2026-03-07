@@ -100,6 +100,7 @@ In the wallpaper browser:
 - `y` to add or remove the selected wallpaper from rotation
 - `i` to change the rotation interval in seconds
 - `r` to pick and apply a random wallpaper
+- `?` to open the shortcuts popup
 - `p` to manage wallpaper paths
 - `t` to open the theme picker
 - `q` or `Esc` to quit
