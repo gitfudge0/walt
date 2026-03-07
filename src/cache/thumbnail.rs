@@ -1,12 +1,14 @@
 use image::imageops::FilterType;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 const PREVIEW_VERSION: &str = "preview-v4";
 const PREVIEW_MAX_WIDTH: u32 = 576;
 const PREVIEW_MAX_HEIGHT: u32 = 324;
 const CACHE_DIR: &str = "walt/thumbnails";
 
+#[derive(Clone)]
 pub struct ThumbnailCache {
     cache_dir: PathBuf,
 }
@@ -58,9 +60,18 @@ impl ThumbnailCache {
         use std::hash::{Hash, Hasher};
 
         let path_str = path.to_string_lossy();
+        let metadata = fs::metadata(path).ok();
+        let size = metadata.as_ref().map(|m| m.len()).unwrap_or_default();
+        let modified = metadata
+            .and_then(|m| m.modified().ok())
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
         let mut hasher = DefaultHasher::new();
         PREVIEW_VERSION.hash(&mut hasher);
         path_str.hash(&mut hasher);
+        size.hash(&mut hasher);
+        modified.hash(&mut hasher);
         format!("{:x}", hasher.finish())
     }
 }
