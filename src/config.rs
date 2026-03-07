@@ -285,5 +285,4 @@ mod tests {
             "Rotation interval must be greater than 0 seconds."
         );
     }
-
 }

@@ -28,9 +28,10 @@ use std::{
 };
 
 use crate::backend::{
-    disable_rotation_service, enable_rotation_service, get_rotation_service_status,
-    install_rotation_service, rotation_service_badge, rotation_service_status, scan_directory,
-    set_wallpaper, uninstall_rotation_service, RotationServiceStatus,
+    disable_rotation_service, enable_rotation_service, get_active_wallpapers,
+    get_rotation_service_status, install_rotation_service, rotation_service_badge,
+    rotation_service_status, scan_directory, set_wallpaper, uninstall_rotation_service,
+    RotationServiceStatus,
 };
 use crate::cache::{IndexedWallpaper, ThumbnailCache, WallpaperIndex};
 use crate::config::Config;
@@ -205,6 +206,7 @@ pub struct App {
     all_indices: Vec<usize>,
     favorites_indices: Vec<usize>,
     rotation_indices: Vec<usize>,
+    active_wallpaper_paths: HashSet<PathBuf>,
     favorite_paths: HashSet<PathBuf>,
     rotation_paths: HashSet<PathBuf>,
     last_preview_target: Option<(PathBuf, Rect)>,
@@ -278,6 +280,7 @@ impl App {
             all_indices: vec![],
             favorites_indices: vec![],
             rotation_indices: vec![],
+            active_wallpaper_paths: HashSet::new(),
             favorite_paths: HashSet::new(),
             rotation_paths: HashSet::new(),
             last_preview_target: None,
@@ -293,6 +296,7 @@ impl App {
 
         app.rebuild_section_cache();
         app.ensure_section_selection();
+        app.refresh_active_wallpapers();
         app.refresh_rotation_status();
 
         if !app.config.is_empty() {
@@ -432,7 +436,9 @@ impl App {
             (KeyCode::Char('R'), KeyModifiers::SHIFT) => self.open_rotation_menu(),
             (KeyCode::Char('s'), KeyModifiers::NONE) => self.toggle_sort_mode(),
             (KeyCode::Char('/'), KeyModifiers::NONE) => self.open_search(),
-            (KeyCode::Char('?'), KeyModifiers::SHIFT) => self.mode = AppMode::Keybindings,
+            (KeyCode::Char('?'), _) | (KeyCode::Char('/'), KeyModifiers::SHIFT) => {
+                self.mode = AppMode::Keybindings
+            }
             (KeyCode::Tab, _) | (KeyCode::Char('l'), KeyModifiers::NONE) => self.next_section(),
             (KeyCode::BackTab, _) | (KeyCode::Char('h'), KeyModifiers::NONE) => {
                 self.previous_section()
@@ -824,6 +830,21 @@ impl App {
         self.mode = AppMode::RotationMenu;
     }
 
+    fn refresh_active_wallpapers(&mut self) {
+        match get_active_wallpapers() {
+            Ok(paths) => {
+                self.active_wallpaper_paths = paths.into_iter().collect();
+            }
+            Err(error) => {
+                eprintln!("Failed to refresh active wallpapers: {error}");
+            }
+        }
+    }
+
+    fn is_active_wallpaper(&self, path: &PathBuf) -> bool {
+        self.active_wallpaper_paths.contains(path)
+    }
+
     fn refresh_rotation_status(&mut self) {
         self.rotation_service_state = get_rotation_service_status().ok();
         self.rotation_status_text = rotation_service_status().unwrap_or_else(|error| {
@@ -1031,11 +1052,12 @@ impl App {
         } else {
             self.wallpapers = self.wallpaper_index.load(&self.config.wallpaper_paths);
             self.rebuild_section_cache();
-            self.path_state.select(if self.config.wallpaper_paths.is_empty() {
-                None
-            } else {
-                Some(0)
-            });
+            self.path_state
+                .select(if self.config.wallpaper_paths.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                });
             self.ensure_section_selection();
             if self.current_selected_wallpaper().is_some() {
                 self.request_preview_load();
@@ -1357,11 +1379,10 @@ impl App {
                     .map(|wallpaper| (visible_index, wallpaper))
             })
             .map(|(visible_index, wallpaper)| {
-                let marker = if self.favorite_paths.contains(&wallpaper.path) {
-                    "★ "
-                } else {
-                    ""
-                };
+                let marker = wallpaper_marker_prefix(
+                    self.favorite_paths.contains(&wallpaper.path),
+                    self.is_active_wallpaper(&wallpaper.path),
+                );
                 let style = if selected == Some(visible_index) {
                     theme.highlight
                 } else {
@@ -1430,73 +1451,31 @@ impl App {
     }
 
     fn render_help(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
-        let (mode_text, controls) = match self.mode {
-            AppMode::Setup => (
-                " Setup ",
-                vec![("Type", "path"), ("Enter", "add"), ("Tab", "suggestion")],
-            ),
-            AppMode::PathManage => (
-                " Path Manager ",
-                vec![("a", "add"), ("d", "remove"), ("p", "back")],
-            ),
-            AppMode::Search => (
-                " Search ",
-                vec![("Type", "filter"), ("Enter", "confirm"), ("Esc", "cancel")],
-            ),
-            AppMode::IntervalEdit => (
-                " Rotation Interval ",
-                vec![("Type", "seconds"), ("Enter", "save"), ("Esc", "cancel")],
-            ),
-            AppMode::RotationMenu => (
-                " Rotation Menu ",
-                vec![("↑/↓", "choose"), ("Enter", "run"), ("Esc", "close")],
-            ),
-            AppMode::Keybindings => (" Keybindings ", vec![("?", "close"), ("Esc", "close")]),
-            AppMode::ThemeSelect => (
-                " Theme Picker ",
-                vec![("↑/↓", "preview"), ("Enter", "confirm"), ("Esc", "cancel")],
-            ),
-            AppMode::Wallpaper => (
-                " Wallpapers ",
-                vec![
-                    ("↑/↓", "move"),
-                    ("Enter", "apply"),
-                    ("/", "filter"),
-                    ("r", "rotate"),
-                    ("Ctrl+r", "random"),
-                    ("p", "paths"),
-                    ("R", "rotation"),
-                    ("?", "keybindings"),
-                ],
-            ),
+        let controls = match self.mode {
+            AppMode::Setup => vec![("Type", "path"), ("Enter", "add"), ("Tab", "suggestion")],
+            AppMode::PathManage => vec![("a", "add"), ("d", "remove"), ("p", "back")],
+            AppMode::Search => vec![("Type", "filter"), ("Enter", "confirm"), ("Esc", "cancel")],
+            AppMode::IntervalEdit => {
+                vec![("Type", "seconds"), ("Enter", "save"), ("Esc", "cancel")]
+            }
+            AppMode::RotationMenu => vec![("↑/↓", "choose"), ("Enter", "run"), ("Esc", "close")],
+            AppMode::Keybindings => vec![("?", "close"), ("Esc", "close")],
+            AppMode::ThemeSelect => {
+                vec![("↑/↓", "preview"), ("Enter", "confirm"), ("Esc", "cancel")]
+            }
+            AppMode::Wallpaper => vec![
+                ("?", "keybindings"),
+                ("↑/↓", "move"),
+                ("Enter", "apply"),
+                ("/", "filter"),
+                ("r", "rotate"),
+                ("Ctrl+r", "random"),
+                ("R", "rotation"),
+                ("p", "paths"),
+            ],
         };
 
-        let mut spans = vec![
-            Span::raw(" "),
-            Span::styled(mode_text, theme.title),
-            Span::raw(" | "),
-            Span::styled("Theme", theme.key),
-            Span::raw(": "),
-            Span::styled(self.theme.name(), theme.accent),
-            Span::raw(" | "),
-        ];
-
-        if matches!(
-            self.mode,
-            AppMode::Wallpaper
-                | AppMode::Search
-                | AppMode::IntervalEdit
-                | AppMode::RotationMenu
-                | AppMode::Keybindings
-        ) {
-            spans.push(Span::styled("Section", theme.key));
-            spans.push(Span::raw(": "));
-            spans.push(Span::styled(
-                self.active_section.title().trim(),
-                theme.accent,
-            ));
-            spans.push(Span::raw(" | "));
-        }
+        let mut spans = vec![Span::raw(" ")];
 
         for (key, action) in controls {
             spans.push(Span::styled(key, theme.key));
@@ -1798,6 +1777,7 @@ impl App {
         {
             let path_str = path.to_string_lossy().to_string();
             set_wallpaper(&path_str)?;
+            self.refresh_active_wallpapers();
             println!("Wallpaper set to: {path_str}");
         }
         Ok(())
@@ -1921,4 +1901,38 @@ fn format_timestamp(unix_secs: u64) -> String {
         .single()
         .map(|datetime| datetime.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| unix_secs.to_string())
+}
+
+fn wallpaper_marker_prefix(is_favorite: bool, is_active: bool) -> String {
+    match (is_favorite, is_active) {
+        (true, true) => "★ ● ".to_string(),
+        (true, false) => "★ ".to_string(),
+        (false, true) => "● ".to_string(),
+        (false, false) => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::wallpaper_marker_prefix;
+
+    #[test]
+    fn marker_prefix_for_plain_wallpaper() {
+        assert_eq!(wallpaper_marker_prefix(false, false), "");
+    }
+
+    #[test]
+    fn marker_prefix_for_favorite_wallpaper() {
+        assert_eq!(wallpaper_marker_prefix(true, false), "★ ");
+    }
+
+    #[test]
+    fn marker_prefix_for_active_wallpaper() {
+        assert_eq!(wallpaper_marker_prefix(false, true), "● ");
+    }
+
+    #[test]
+    fn marker_prefix_for_favorite_and_active_wallpaper() {
+        assert_eq!(wallpaper_marker_prefix(true, true), "★ ● ");
+    }
 }
