@@ -9,8 +9,8 @@ use ratatui::{
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     },
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    text::{Line, Span},
     symbols::border,
+    text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph as Para},
     Frame, Terminal,
 };
@@ -27,12 +27,31 @@ use crate::cache::{IndexedWallpaper, ThumbnailCache, WallpaperIndex};
 use crate::config::Config;
 use theme::{ThemeKind, ThemePalette};
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum AppMode {
     Setup,
     PathManage,
     Wallpaper,
     ThemeSelect,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SectionKind {
+    All,
+    Favorites,
+    Rotation,
+}
+
+impl SectionKind {
+    const ALL: [SectionKind; 3] = [SectionKind::All, SectionKind::Favorites, SectionKind::Rotation];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::All => " All ",
+            Self::Favorites => " Favorites ",
+            Self::Rotation => " Rotation ",
+        }
+    }
 }
 
 struct PreviewRequest {
@@ -62,9 +81,12 @@ pub struct App {
     theme_before_picker: ThemeKind,
     theme_return_mode: AppMode,
     wallpapers: Vec<IndexedWallpaper>,
-    list_state: ListState,
+    path_state: ListState,
+    all_state: ListState,
+    favorites_state: ListState,
+    rotation_state: ListState,
     theme_state: ListState,
-    selected_index: usize,
+    active_section: SectionKind,
     mode: AppMode,
     preview_area: Rect,
     preview_request_id: u64,
@@ -94,11 +116,6 @@ impl App {
             wallpaper_index.load(&config.wallpaper_paths)
         };
 
-        let mut list_state = ListState::default();
-        if !wallpapers.is_empty() {
-            list_state.select(Some(0));
-        }
-
         let mut suggestion_state = ListState::default();
         suggestion_state.select(Some(0));
         let mut theme_state = ListState::default();
@@ -110,7 +127,7 @@ impl App {
             AppMode::Wallpaper
         };
         let (preview_tx, preview_rx) = spawn_preview_worker(picker, thumbnail_cache.clone());
-        let prewarm_tx = spawn_prewarm_worker(thumbnail_cache.clone());
+        let prewarm_tx = spawn_prewarm_worker(thumbnail_cache);
         let (index_tx, index_rx) = spawn_index_worker(WallpaperIndex::new()?);
 
         let mut app = Self {
@@ -119,9 +136,12 @@ impl App {
             theme_before_picker: theme,
             theme_return_mode: mode,
             wallpapers,
-            list_state,
+            path_state: ListState::default(),
+            all_state: ListState::default(),
+            favorites_state: ListState::default(),
+            rotation_state: ListState::default(),
             theme_state,
-            selected_index: 0,
+            active_section: SectionKind::All,
             mode,
             preview_area: Rect::default(),
             preview_request_id: 0,
@@ -138,12 +158,14 @@ impl App {
             suggestion_state,
         };
 
+        app.ensure_section_selection();
+
         if !app.config.is_empty() {
             app.request_index_refresh();
         }
 
-        if !app.wallpapers.is_empty() && app.mode == AppMode::Wallpaper {
-            app.request_preview_load(0);
+        if app.current_selected_wallpaper().is_some() && app.mode == AppMode::Wallpaper {
+            app.request_preview_load();
         }
 
         Ok(app)
@@ -234,12 +256,12 @@ impl App {
                 self.refresh_wallpapers();
             }
             KeyCode::Char('a') => {
-                self.input_buffer = String::new();
+                self.input_buffer.clear();
                 self.update_suggestions();
                 self.mode = AppMode::Setup;
             }
             KeyCode::Char('d') => {
-                if let Some(idx) = self.list_state.selected() {
+                if let Some(idx) = self.path_state.selected() {
                     if idx < self.config.wallpaper_paths.len() {
                         let path_clone = self.config.wallpaper_paths[idx].clone();
                         self.config.remove_path(&path_clone);
@@ -263,6 +285,9 @@ impl App {
             KeyCode::Char('p') => self.mode = AppMode::PathManage,
             KeyCode::Char('r') => self.select_random_wallpaper()?,
             KeyCode::Char('t') => self.open_theme_picker(),
+            KeyCode::Char('f') => self.toggle_favorite(),
+            KeyCode::Tab => self.next_section(),
+            KeyCode::BackTab => self.previous_section(),
             KeyCode::Char('j') | KeyCode::Down => self.move_down(),
             KeyCode::Char('k') | KeyCode::Up => self.move_up(),
             KeyCode::Char('g') | KeyCode::Home => self.go_to_top(),
@@ -272,25 +297,6 @@ impl App {
         }
 
         Ok(false)
-    }
-
-    fn select_random_wallpaper(&mut self) -> io::Result<()> {
-        if self.wallpapers.is_empty() {
-            return Ok(());
-        }
-
-        let random_index = rand::thread_rng().gen_range(0..self.wallpapers.len());
-        self.list_state.select(Some(random_index));
-        self.selected_index = random_index;
-        self.request_preview_load(random_index);
-
-        if let Err(error) = self.apply_wallpaper() {
-            eprintln!("Failed to apply random wallpaper: {}", error);
-        } else {
-            return Ok(());
-        }
-
-        Ok(())
     }
 
     fn handle_theme_select_key(&mut self, key: KeyCode) {
@@ -331,17 +337,15 @@ impl App {
                 if path.is_dir() {
                     self.config.add_path(path);
                     let _ = self.config.save();
-                    self.input_buffer = String::new();
-                    self.dir_suggestions = vec![];
+                    self.input_buffer.clear();
+                    self.dir_suggestions.clear();
                     self.mode = AppMode::Wallpaper;
                     self.refresh_wallpapers();
                 }
             }
             AppMode::Wallpaper => {
-                if let Err(e) = self.apply_wallpaper() {
-                    eprintln!("Failed to apply: {}", e);
-                } else {
-                    return Ok(());
+                if let Err(error) = self.apply_wallpaper() {
+                    eprintln!("Failed to apply: {error}");
                 }
             }
             AppMode::ThemeSelect => self.confirm_theme_picker(),
@@ -354,31 +358,31 @@ impl App {
         match self.mode {
             AppMode::Setup => {
                 if !self.dir_suggestions.is_empty() {
-                    let i = self.suggestion_state.selected().unwrap_or(0);
+                    let index = self.suggestion_state.selected().unwrap_or(0);
                     self.suggestion_state
-                        .select(Some((i + 1) % self.dir_suggestions.len()));
+                        .select(Some((index + 1) % self.dir_suggestions.len()));
                 }
             }
             AppMode::ThemeSelect => {
-                let i = self.theme_state.selected().unwrap_or(self.theme.index());
-                let new_i = (i + 1) % ThemeKind::ALL.len();
-                self.theme_state.select(Some(new_i));
-                self.theme = ThemeKind::ALL[new_i];
+                let index = self.theme_state.selected().unwrap_or(self.theme.index());
+                let new_index = (index + 1) % ThemeKind::ALL.len();
+                self.theme_state.select(Some(new_index));
+                self.theme = ThemeKind::ALL[new_index];
             }
-            AppMode::PathManage | AppMode::Wallpaper => {
-                let len = if self.mode == AppMode::PathManage {
-                    self.config.wallpaper_paths.len()
-                } else {
-                    self.wallpapers.len()
-                };
+            AppMode::PathManage => {
+                let len = self.config.wallpaper_paths.len();
                 if len > 0 {
-                    let i = self.list_state.selected().unwrap_or(0);
-                    let new_i = (i + 1) % len;
-                    self.list_state.select(Some(new_i));
-                    self.selected_index = new_i;
-                    if self.mode == AppMode::Wallpaper {
-                        self.request_preview_load(new_i);
-                    }
+                    let index = self.path_state.selected().unwrap_or(0);
+                    self.path_state.select(Some((index + 1) % len));
+                }
+            }
+            AppMode::Wallpaper => {
+                let len = self.section_indices(self.active_section).len();
+                if len > 0 {
+                    let state = self.section_state_mut(self.active_section);
+                    let index = state.selected().unwrap_or(0);
+                    state.select(Some((index + 1) % len));
+                    self.request_preview_load();
                 }
             }
         }
@@ -388,34 +392,34 @@ impl App {
         match self.mode {
             AppMode::Setup => {
                 if !self.dir_suggestions.is_empty() {
-                    let i = self.suggestion_state.selected().unwrap_or(0);
-                    self.suggestion_state.select(Some(if i == 0 {
+                    let index = self.suggestion_state.selected().unwrap_or(0);
+                    self.suggestion_state.select(Some(if index == 0 {
                         self.dir_suggestions.len() - 1
                     } else {
-                        i - 1
+                        index - 1
                     }));
                 }
             }
             AppMode::ThemeSelect => {
-                let i = self.theme_state.selected().unwrap_or(self.theme.index());
-                let new_i = if i == 0 { ThemeKind::ALL.len() - 1 } else { i - 1 };
-                self.theme_state.select(Some(new_i));
-                self.theme = ThemeKind::ALL[new_i];
+                let index = self.theme_state.selected().unwrap_or(self.theme.index());
+                let new_index = if index == 0 { ThemeKind::ALL.len() - 1 } else { index - 1 };
+                self.theme_state.select(Some(new_index));
+                self.theme = ThemeKind::ALL[new_index];
             }
-            AppMode::PathManage | AppMode::Wallpaper => {
-                let len = if self.mode == AppMode::PathManage {
-                    self.config.wallpaper_paths.len()
-                } else {
-                    self.wallpapers.len()
-                };
+            AppMode::PathManage => {
+                let len = self.config.wallpaper_paths.len();
                 if len > 0 {
-                    let i = self.list_state.selected().unwrap_or(0);
-                    let new_i = if i == 0 { len - 1 } else { i - 1 };
-                    self.list_state.select(Some(new_i));
-                    self.selected_index = new_i;
-                    if self.mode == AppMode::Wallpaper {
-                        self.request_preview_load(new_i);
-                    }
+                    let index = self.path_state.selected().unwrap_or(0);
+                    self.path_state.select(Some(if index == 0 { len - 1 } else { index - 1 }));
+                }
+            }
+            AppMode::Wallpaper => {
+                let len = self.section_indices(self.active_section).len();
+                if len > 0 {
+                    let state = self.section_state_mut(self.active_section);
+                    let index = state.selected().unwrap_or(0);
+                    state.select(Some(if index == 0 { len - 1 } else { index - 1 }));
+                    self.request_preview_load();
                 }
             }
         }
@@ -428,18 +432,15 @@ impl App {
                 self.theme_state.select(Some(0));
                 self.theme = ThemeKind::ALL[0];
             }
-            AppMode::PathManage | AppMode::Wallpaper => {
-                let len = if self.mode == AppMode::PathManage {
-                    self.config.wallpaper_paths.len()
-                } else {
-                    self.wallpapers.len()
-                };
-                if len > 0 {
-                    self.list_state.select(Some(0));
-                    self.selected_index = 0;
-                    if self.mode == AppMode::Wallpaper {
-                        self.request_preview_load(0);
-                    }
+            AppMode::PathManage => {
+                if !self.config.wallpaper_paths.is_empty() {
+                    self.path_state.select(Some(0));
+                }
+            }
+            AppMode::Wallpaper => {
+                if !self.section_indices(self.active_section).is_empty() {
+                    self.section_state_mut(self.active_section).select(Some(0));
+                    self.request_preview_load();
                 }
             }
         }
@@ -458,22 +459,102 @@ impl App {
                 self.theme_state.select(Some(last));
                 self.theme = ThemeKind::ALL[last];
             }
-            AppMode::PathManage | AppMode::Wallpaper => {
-                let len = if self.mode == AppMode::PathManage {
-                    self.config.wallpaper_paths.len()
-                } else {
-                    self.wallpapers.len()
-                };
+            AppMode::PathManage => {
+                if !self.config.wallpaper_paths.is_empty() {
+                    self.path_state.select(Some(self.config.wallpaper_paths.len() - 1));
+                }
+            }
+            AppMode::Wallpaper => {
+                let len = self.section_indices(self.active_section).len();
                 if len > 0 {
-                    let last = len - 1;
-                    self.list_state.select(Some(last));
-                    self.selected_index = last;
-                    if self.mode == AppMode::Wallpaper {
-                        self.request_preview_load(last);
-                    }
+                    self.section_state_mut(self.active_section).select(Some(len - 1));
+                    self.request_preview_load();
                 }
             }
         }
+    }
+
+    fn next_section(&mut self) {
+        let current = SectionKind::ALL
+            .iter()
+            .position(|section| *section == self.active_section)
+            .unwrap_or(0);
+        self.active_section = SectionKind::ALL[(current + 1) % SectionKind::ALL.len()];
+        self.ensure_section_selection();
+        self.request_preview_load();
+    }
+
+    fn previous_section(&mut self) {
+        let current = SectionKind::ALL
+            .iter()
+            .position(|section| *section == self.active_section)
+            .unwrap_or(0);
+        self.active_section = if current == 0 {
+            SectionKind::ALL[SectionKind::ALL.len() - 1]
+        } else {
+            SectionKind::ALL[current - 1]
+        };
+        self.ensure_section_selection();
+        self.request_preview_load();
+    }
+
+    fn toggle_favorite(&mut self) {
+        let Some(path) = self.current_selected_wallpaper().map(|wallpaper| wallpaper.path.clone()) else {
+            return;
+        };
+
+        self.config.toggle_favorite(&path);
+        let _ = self.config.save();
+        self.ensure_section_selection();
+    }
+
+    fn section_state_mut(&mut self, section: SectionKind) -> &mut ListState {
+        match section {
+            SectionKind::All => &mut self.all_state,
+            SectionKind::Favorites => &mut self.favorites_state,
+            SectionKind::Rotation => &mut self.rotation_state,
+        }
+    }
+
+    fn section_state(&self, section: SectionKind) -> &ListState {
+        match section {
+            SectionKind::All => &self.all_state,
+            SectionKind::Favorites => &self.favorites_state,
+            SectionKind::Rotation => &self.rotation_state,
+        }
+    }
+
+    fn section_indices(&self, section: SectionKind) -> Vec<usize> {
+        self.wallpapers
+            .iter()
+            .enumerate()
+            .filter(|(_, wallpaper)| match section {
+                SectionKind::All => true,
+                SectionKind::Favorites => self.config.is_favorite(&wallpaper.path),
+                SectionKind::Rotation => self.config.rotation.iter().any(|path| path == &wallpaper.path),
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn ensure_section_selection(&mut self) {
+        for section in SectionKind::ALL {
+            let len = self.section_indices(section).len();
+            let state = self.section_state_mut(section);
+            if len == 0 {
+                state.select(None);
+            } else {
+                let selected = state.selected().unwrap_or(0).min(len - 1);
+                state.select(Some(selected));
+            }
+        }
+    }
+
+    fn current_selected_wallpaper(&self) -> Option<&IndexedWallpaper> {
+        let indices = self.section_indices(self.active_section);
+        let selected = self.section_state(self.active_section).selected()?;
+        let wallpaper_index = *indices.get(selected)?;
+        self.wallpapers.get(wallpaper_index)
     }
 
     fn update_suggestions(&mut self) {
@@ -500,21 +581,39 @@ impl App {
 
     fn refresh_wallpapers(&mut self) {
         if self.config.is_empty() {
-            self.wallpapers = vec![];
+            self.wallpapers.clear();
             self.mode = AppMode::Setup;
         } else {
             self.wallpapers = self.wallpaper_index.load(&self.config.wallpaper_paths);
-            self.list_state.select(if self.wallpapers.is_empty() {
+            self.path_state.select(if self.config.wallpaper_paths.is_empty() {
                 None
             } else {
                 Some(0)
             });
-            self.selected_index = 0;
-            if !self.wallpapers.is_empty() {
-                self.request_preview_load(0);
+            self.ensure_section_selection();
+            if self.current_selected_wallpaper().is_some() {
+                self.request_preview_load();
             }
             self.request_index_refresh();
         }
+    }
+
+    fn select_random_wallpaper(&mut self) -> io::Result<()> {
+        let indices = self.section_indices(self.active_section);
+        if indices.is_empty() {
+            return Ok(());
+        }
+
+        let random_index = rand::thread_rng().gen_range(0..indices.len());
+        self.section_state_mut(self.active_section)
+            .select(Some(random_index));
+        self.request_preview_load();
+
+        if let Err(error) = self.apply_wallpaper() {
+            eprintln!("Failed to apply random wallpaper: {error}");
+        }
+
+        Ok(())
     }
 
     fn ui(&mut self, frame: &mut Frame) {
@@ -532,16 +631,14 @@ impl App {
             AppMode::Wallpaper => {
                 let main_chunks = Layout::default()
                     .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+                    .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
                     .split(chunks[0]);
                 let preview_area = self.themed_block(" Preview ", theme).inner(main_chunks[1]);
                 if preview_area != self.preview_area {
                     self.preview_area = preview_area;
-                    if !self.wallpapers.is_empty() {
-                        self.request_preview_load(self.selected_index);
-                    }
+                    self.request_preview_load();
                 }
-                self.render_wallpaper_list(frame, main_chunks[0], theme);
+                self.render_library_sections(frame, main_chunks[0], theme);
                 self.render_preview(frame, main_chunks[1], theme);
             }
         }
@@ -594,14 +691,14 @@ impl App {
             let items: Vec<ListItem> = self
                 .dir_suggestions
                 .iter()
-                .map(|p| ListItem::new(p.to_string_lossy().to_string()).style(theme.accent))
+                .map(|path| ListItem::new(path.to_string_lossy().to_string()).style(theme.accent))
                 .collect();
-            let mut ss = self.suggestion_state.clone();
+            let mut state = self.suggestion_state.clone();
             let list = List::new(items)
                 .block(self.themed_block(" Directories ", theme))
                 .highlight_style(theme.highlight)
                 .highlight_symbol("▶ ");
-            frame.render_stateful_widget(list, list_area, &mut ss);
+            frame.render_stateful_widget(list, list_area, &mut state);
         }
     }
 
@@ -625,14 +722,14 @@ impl App {
                 .config
                 .wallpaper_paths
                 .iter()
-                .map(|p| ListItem::new(p.to_string_lossy().to_string()).style(theme.accent))
+                .map(|path| ListItem::new(path.to_string_lossy().to_string()).style(theme.accent))
                 .collect();
-            let mut ls = self.list_state.clone();
+            let mut state = self.path_state.clone();
             let list = List::new(items)
                 .block(self.themed_block(" Paths ", theme))
                 .highlight_style(theme.highlight)
                 .highlight_symbol("▶ ");
-            frame.render_stateful_widget(list, inner, &mut ls);
+            frame.render_stateful_widget(list, inner, &mut state);
         }
     }
 
@@ -649,18 +746,18 @@ impl App {
             .split(inner);
 
         let picker_help = Para::new(vec![
-                Line::from(Span::styled(
-                    "Select a theme to preview it immediately.",
-                    theme.muted,
-                )),
-                Line::from(vec![
-                    Span::styled("Enter", theme.key),
-                    Span::raw(" confirm  "),
-                    Span::styled("Esc", theme.key),
-                    Span::raw(" cancel"),
-                ]),
-            ])
-            .style(theme.surface);
+            Line::from(Span::styled(
+                "Select a theme to preview it immediately.",
+                theme.muted,
+            )),
+            Line::from(vec![
+                Span::styled("Enter", theme.key),
+                Span::raw(" confirm  "),
+                Span::styled("Esc", theme.key),
+                Span::raw(" cancel"),
+            ]),
+        ])
+        .style(theme.surface);
         frame.render_widget(picker_help, content[0]);
 
         let items: Vec<ListItem> = ThemeKind::ALL
@@ -676,17 +773,90 @@ impl App {
         frame.render_stateful_widget(list, content[1], &mut state);
     }
 
-    fn render_wallpaper_list(&mut self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
-        let items: Vec<ListItem> = self
-            .wallpapers
+    fn render_library_sections(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(48),
+                Constraint::Percentage(26),
+                Constraint::Percentage(26),
+            ])
+            .split(area);
+
+        self.render_section(
+            frame,
+            layout[0],
+            SectionKind::All,
+            theme,
+            self.section_indices(SectionKind::All),
+            &self.all_state,
+        );
+        self.render_section(
+            frame,
+            layout[1],
+            SectionKind::Favorites,
+            theme,
+            self.section_indices(SectionKind::Favorites),
+            &self.favorites_state,
+        );
+        self.render_section(
+            frame,
+            layout[2],
+            SectionKind::Rotation,
+            theme,
+            self.section_indices(SectionKind::Rotation),
+            &self.rotation_state,
+        );
+    }
+
+    fn render_section(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        section: SectionKind,
+        theme: ThemePalette,
+        indices: Vec<usize>,
+        state: &ListState,
+    ) {
+        let mut border_theme = theme;
+        if self.active_section == section {
+            border_theme.border = theme.highlight;
+            border_theme.title = theme.key;
+        }
+
+        if indices.is_empty() {
+            let message = match section {
+                SectionKind::All => "No wallpapers indexed",
+                SectionKind::Favorites => "No favorites yet",
+                SectionKind::Rotation => "Rotation list is empty",
+            };
+            frame.render_widget(
+                Para::new(Line::from(Span::styled(message, theme.muted)))
+                    .block(self.themed_block(section.title(), border_theme))
+                    .alignment(Alignment::Center),
+                area,
+            );
+            return;
+        }
+
+        let items = indices
             .iter()
-            .map(|w| ListItem::new(w.name.clone()).style(theme.accent))
-            .collect();
+            .filter_map(|index| self.wallpapers.get(*index))
+            .map(|wallpaper| {
+                let marker = if self.config.is_favorite(&wallpaper.path) {
+                    "★ "
+                } else {
+                    ""
+                };
+                ListItem::new(format!("{marker}{}", wallpaper.name)).style(theme.accent)
+            })
+            .collect::<Vec<_>>();
+        let mut list_state = state.clone();
         let list = List::new(items)
-            .block(self.themed_block(" Wallpapers ", theme))
+            .block(self.themed_block(section.title(), border_theme))
             .highlight_style(theme.highlight)
             .highlight_symbol("▶ ");
-        frame.render_stateful_widget(list, area, &mut self.list_state);
+        frame.render_stateful_widget(list, area, &mut list_state);
     }
 
     fn render_preview(&mut self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
@@ -698,8 +868,8 @@ impl App {
         if let Some(ref mut protocol) = self.current_image {
             let resize = Resize::Scale(None);
             let render_area = center_rect(inner, protocol.size_for(&resize, inner));
-            let img = StatefulImage::default().resize(resize);
-            frame.render_stateful_widget(img, render_area, protocol);
+            let image = StatefulImage::default().resize(resize);
+            frame.render_stateful_widget(image, render_area, protocol);
         } else {
             let content = if self.wallpapers.is_empty() {
                 vec![
@@ -749,11 +919,13 @@ impl App {
             AppMode::Wallpaper => (
                 " Wallpapers ",
                 vec![
-                    ("p", "paths"),
+                    ("Tab", "section"),
+                    ("f", "favorite"),
                     ("r", "random"),
                     ("↑/↓/j/k", "navigate"),
                     ("g/G", "top/bottom"),
                     ("Enter", "apply"),
+                    ("p", "paths"),
                     ("t", "theme"),
                     ("q", "quit"),
                 ],
@@ -770,6 +942,13 @@ impl App {
             Span::raw(" | "),
         ];
 
+        if self.mode == AppMode::Wallpaper {
+            spans.push(Span::styled("Section", theme.key));
+            spans.push(Span::raw(": "));
+            spans.push(Span::styled(self.active_section.title().trim(), theme.accent));
+            spans.push(Span::raw(" | "));
+        }
+
         for (key, action) in controls {
             spans.push(Span::styled(key, theme.key));
             spans.push(Span::raw(" "));
@@ -785,26 +964,33 @@ impl App {
         );
     }
 
-    fn request_preview_load(&mut self, index: usize) {
+    fn request_preview_load(&mut self) {
         if self.preview_area.width == 0 || self.preview_area.height == 0 {
             return;
         }
 
-        let Some(wallpaper) = self.wallpapers.get(index) else {
+        let Some(image_path) = self
+            .current_selected_wallpaper()
+            .map(|wallpaper| wallpaper.path.clone())
+        else {
+            self.current_image = None;
             return;
         };
 
         self.preview_request_id = self.preview_request_id.wrapping_add(1);
         let _ = self.preview_tx.send(PreviewRequest {
             request_id: self.preview_request_id,
-            image_path: wallpaper.path.clone(),
+            image_path,
             area: self.preview_area,
         });
-        let prewarm_paths = self
-            .wallpapers
-            .iter()
-            .skip(index.saturating_sub(3))
+
+        let indices = self.section_indices(self.active_section);
+        let selected = self.section_state(self.active_section).selected().unwrap_or(0);
+        let prewarm_paths = indices
+            .into_iter()
+            .skip(selected.saturating_sub(3))
             .take(7)
+            .filter_map(|index| self.wallpapers.get(index))
             .map(|wallpaper| wallpaper.path.clone())
             .collect::<Vec<_>>();
         let _ = self.prewarm_tx.send(prewarm_paths);
@@ -817,7 +1003,7 @@ impl App {
                     if response.request_id == self.preview_request_id {
                         match response.protocol {
                             Ok(protocol) => self.current_image = Some(protocol),
-                            Err(error) => eprintln!("Failed to load preview: {}", error),
+                            Err(error) => eprintln!("Failed to load preview: {error}"),
                         }
                     }
                 }
@@ -840,16 +1026,8 @@ impl App {
                 Ok(response) if response.request_id == self.index_request_id => {
                     if let Ok(wallpapers) = response.wallpapers {
                         self.wallpapers = wallpapers;
-                        if self.wallpapers.is_empty() {
-                            self.list_state.select(None);
-                            self.selected_index = 0;
-                            self.current_image = None;
-                        } else {
-                            let max_index = self.wallpapers.len() - 1;
-                            self.selected_index = self.selected_index.min(max_index);
-                            self.list_state.select(Some(self.selected_index));
-                            self.request_preview_load(self.selected_index);
-                        }
+                        self.ensure_section_selection();
+                        self.request_preview_load();
                     }
                 }
                 Ok(_) => {}
@@ -859,10 +1037,10 @@ impl App {
     }
 
     fn apply_wallpaper(&self) -> anyhow::Result<()> {
-        if let Some(wallpaper) = self.wallpapers.get(self.selected_index) {
+        if let Some(wallpaper) = self.current_selected_wallpaper() {
             let path_str = wallpaper.path.to_string_lossy().to_string();
             set_wallpaper(&path_str)?;
-            println!("Wallpaper set to: {}", path_str);
+            println!("Wallpaper set to: {path_str}");
         }
         Ok(())
     }
