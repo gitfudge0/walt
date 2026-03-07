@@ -32,6 +32,7 @@ enum AppMode {
     Setup,
     PathManage,
     Wallpaper,
+    Search,
     ThemeSelect,
 }
 
@@ -50,6 +51,50 @@ impl SectionKind {
             Self::All => " All ",
             Self::Favorites => " Favorites ",
             Self::Rotation => " Rotation ",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Favorites => "favorites",
+            Self::Rotation => "rotation",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SortMode {
+    Name,
+    Modified,
+}
+
+impl SortMode {
+    fn from_name(name: &str) -> Self {
+        match name {
+            "modified" => Self::Modified,
+            _ => Self::Name,
+        }
+    }
+
+    fn as_name(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Modified => "modified",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Modified => "Modified",
+        }
+    }
+
+    fn toggle(self) -> Self {
+        match self {
+            Self::Name => Self::Modified,
+            Self::Modified => Self::Name,
         }
     }
 }
@@ -98,7 +143,12 @@ pub struct App {
     index_request_id: u64,
     index_tx: Sender<IndexRequest>,
     index_rx: Receiver<IndexResponse>,
+    search_buffer: String,
+    search_before_open: String,
     input_buffer: String,
+    all_filter: String,
+    favorites_filter: String,
+    rotation_filter: String,
     dir_suggestions: Vec<PathBuf>,
     suggestion_state: ListState,
 }
@@ -153,7 +203,12 @@ impl App {
             index_request_id: 0,
             index_tx,
             index_rx,
+            search_buffer: String::new(),
+            search_before_open: String::new(),
             input_buffer: String::new(),
+            all_filter: String::new(),
+            favorites_filter: String::new(),
+            rotation_filter: String::new(),
             dir_suggestions: vec![],
             suggestion_state,
         };
@@ -207,6 +262,7 @@ impl App {
                         match self.mode {
                             AppMode::Setup => self.handle_setup_key(key.code)?,
                             AppMode::PathManage => self.handle_path_manage_key(key.code),
+                            AppMode::Search => self.handle_search_key(key.code),
                             AppMode::ThemeSelect => self.handle_theme_select_key(key.code),
                             AppMode::Wallpaper => {
                                 if self.handle_wallpaper_key(key.code)? {
@@ -286,6 +342,8 @@ impl App {
             KeyCode::Char('r') => self.select_random_wallpaper()?,
             KeyCode::Char('t') => self.open_theme_picker(),
             KeyCode::Char('f') => self.toggle_favorite(),
+            KeyCode::Char('s') => self.toggle_sort_mode(),
+            KeyCode::Char('/') => self.open_search(),
             KeyCode::Tab => self.next_section(),
             KeyCode::BackTab => self.previous_section(),
             KeyCode::Char('j') | KeyCode::Down => self.move_down(),
@@ -297,6 +355,36 @@ impl App {
         }
 
         Ok(false)
+    }
+
+    fn handle_search_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => {
+                self.set_active_filter(self.search_before_open.clone());
+                self.mode = AppMode::Wallpaper;
+                self.ensure_section_selection();
+                self.request_preview_load();
+            }
+            KeyCode::Enter => {
+                self.set_active_filter(self.search_buffer.clone());
+                self.mode = AppMode::Wallpaper;
+                self.ensure_section_selection();
+                self.request_preview_load();
+            }
+            KeyCode::Backspace => {
+                self.search_buffer.pop();
+                self.set_active_filter(self.search_buffer.clone());
+                self.ensure_section_selection();
+                self.request_preview_load();
+            }
+            KeyCode::Char(c) => {
+                self.search_buffer.push(c);
+                self.set_active_filter(self.search_buffer.clone());
+                self.ensure_section_selection();
+                self.request_preview_load();
+            }
+            _ => {}
+        }
     }
 
     fn handle_theme_select_key(&mut self, key: KeyCode) {
@@ -348,6 +436,7 @@ impl App {
                     eprintln!("Failed to apply: {error}");
                 }
             }
+            AppMode::Search => {}
             AppMode::ThemeSelect => self.confirm_theme_picker(),
             AppMode::PathManage => {}
         }
@@ -385,6 +474,7 @@ impl App {
                     self.request_preview_load();
                 }
             }
+            AppMode::Search => {}
         }
     }
 
@@ -422,6 +512,7 @@ impl App {
                     self.request_preview_load();
                 }
             }
+            AppMode::Search => {}
         }
     }
 
@@ -443,6 +534,7 @@ impl App {
                     self.request_preview_load();
                 }
             }
+            AppMode::Search => {}
         }
     }
 
@@ -471,6 +563,7 @@ impl App {
                     self.request_preview_load();
                 }
             }
+            AppMode::Search => {}
         }
     }
 
@@ -508,6 +601,21 @@ impl App {
         self.ensure_section_selection();
     }
 
+    fn toggle_sort_mode(&mut self) {
+        let next = self.sort_mode(self.active_section).toggle();
+        self.config
+            .set_sort_name_for_section(self.active_section.key(), next.as_name());
+        let _ = self.config.save();
+        self.ensure_section_selection();
+        self.request_preview_load();
+    }
+
+    fn open_search(&mut self) {
+        self.search_buffer = self.active_filter().to_string();
+        self.search_before_open = self.search_buffer.clone();
+        self.mode = AppMode::Search;
+    }
+
     fn section_state_mut(&mut self, section: SectionKind) -> &mut ListState {
         match section {
             SectionKind::All => &mut self.all_state,
@@ -525,16 +633,75 @@ impl App {
     }
 
     fn section_indices(&self, section: SectionKind) -> Vec<usize> {
-        self.wallpapers
+        let filter = self.filter_query(section).to_lowercase();
+        let mut indices = self
+            .wallpapers
             .iter()
             .enumerate()
             .filter(|(_, wallpaper)| match section {
                 SectionKind::All => true,
                 SectionKind::Favorites => self.config.is_favorite(&wallpaper.path),
-                SectionKind::Rotation => self.config.rotation.iter().any(|path| path == &wallpaper.path),
+                SectionKind::Rotation => self
+                    .config
+                    .rotation
+                    .iter()
+                    .any(|path| path == &wallpaper.path),
+            })
+            .filter(|(_, wallpaper)| {
+                if filter.is_empty() {
+                    true
+                } else {
+                    wallpaper.name.to_lowercase().contains(&filter)
+                        || wallpaper
+                            .path
+                            .to_string_lossy()
+                            .to_lowercase()
+                            .contains(&filter)
+                }
             })
             .map(|(index, _)| index)
-            .collect()
+            .collect::<Vec<_>>();
+        let sort_mode = self.sort_mode(section);
+        indices.sort_by(|left, right| {
+            let left = &self.wallpapers[*left];
+            let right = &self.wallpapers[*right];
+            match sort_mode {
+                SortMode::Name => left
+                    .name
+                    .to_lowercase()
+                    .cmp(&right.name.to_lowercase())
+                    .then_with(|| left.path.cmp(&right.path)),
+                SortMode::Modified => right
+                    .modified_unix_secs
+                    .cmp(&left.modified_unix_secs)
+                    .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase())),
+            }
+        });
+        indices
+    }
+
+    fn sort_mode(&self, section: SectionKind) -> SortMode {
+        SortMode::from_name(self.config.sort_name_for_section(section.key()))
+    }
+
+    fn filter_query(&self, section: SectionKind) -> &str {
+        match section {
+            SectionKind::All => &self.all_filter,
+            SectionKind::Favorites => &self.favorites_filter,
+            SectionKind::Rotation => &self.rotation_filter,
+        }
+    }
+
+    fn active_filter(&self) -> &str {
+        self.filter_query(self.active_section)
+    }
+
+    fn set_active_filter(&mut self, value: String) {
+        match self.active_section {
+            SectionKind::All => self.all_filter = value,
+            SectionKind::Favorites => self.favorites_filter = value,
+            SectionKind::Rotation => self.rotation_filter = value,
+        }
     }
 
     fn ensure_section_selection(&mut self) {
@@ -628,7 +795,7 @@ impl App {
             AppMode::Setup => self.render_setup(frame, chunks[0], theme),
             AppMode::PathManage => self.render_path_manage(frame, chunks[0], theme),
             AppMode::ThemeSelect => self.render_theme_picker(frame, chunks[0], theme),
-            AppMode::Wallpaper => {
+            AppMode::Wallpaper | AppMode::Search => {
                 let main_chunks = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
@@ -640,6 +807,9 @@ impl App {
                 }
                 self.render_library_sections(frame, main_chunks[0], theme);
                 self.render_preview(frame, main_chunks[1], theme);
+                if self.mode == AppMode::Search {
+                    self.render_search_overlay(frame, chunks[0], theme);
+                }
             }
         }
 
@@ -826,9 +996,10 @@ impl App {
 
         if indices.is_empty() {
             let message = match section {
-                SectionKind::All => "No wallpapers indexed",
-                SectionKind::Favorites => "No favorites yet",
-                SectionKind::Rotation => "Rotation list is empty",
+                SectionKind::All if self.filter_query(section).is_empty() => "No wallpapers indexed",
+                SectionKind::Favorites if self.filter_query(section).is_empty() => "No favorites yet",
+                SectionKind::Rotation if self.filter_query(section).is_empty() => "Rotation list is empty",
+                _ => "No matches for current filter",
             };
             frame.render_widget(
                 Para::new(Line::from(Span::styled(message, theme.muted)))
@@ -851,9 +1022,20 @@ impl App {
                 ListItem::new(format!("{marker}{}", wallpaper.name)).style(theme.accent)
             })
             .collect::<Vec<_>>();
+        let title = format!(
+            "{} [{}]",
+            section.title().trim(),
+            self.sort_mode(section).label()
+        );
         let mut list_state = state.clone();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_set(border::ROUNDED)
+            .border_style(border_theme.border)
+            .title(title)
+            .title_style(border_theme.title);
         let list = List::new(items)
-            .block(self.themed_block(section.title(), border_theme))
+            .block(block)
             .highlight_style(theme.highlight)
             .highlight_symbol("▶ ");
         frame.render_stateful_widget(list, area, &mut list_state);
@@ -907,6 +1089,14 @@ impl App {
                     ("t", "theme"),
                 ],
             ),
+            AppMode::Search => (
+                " Search ",
+                vec![
+                    ("type", "filter"),
+                    ("Enter", "confirm"),
+                    ("Esc", "cancel"),
+                ],
+            ),
             AppMode::ThemeSelect => (
                 " Theme Picker ",
                 vec![
@@ -920,7 +1110,9 @@ impl App {
                 " Wallpapers ",
                 vec![
                     ("Tab", "section"),
+                    ("/", "filter"),
                     ("f", "favorite"),
+                    ("s", "sort"),
                     ("r", "random"),
                     ("↑/↓/j/k", "navigate"),
                     ("g/G", "top/bottom"),
@@ -962,6 +1154,23 @@ impl App {
                 .alignment(Alignment::Center),
             area,
         );
+    }
+
+    fn render_search_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
+        let popup = centered_rect(60, 5, area);
+        frame.render_widget(Clear, popup);
+        let text = if self.search_buffer.is_empty() {
+            "/"
+        } else {
+            ""
+        };
+        let input = Para::new(Line::from(vec![
+            Span::styled("/", theme.key),
+            Span::styled(format!("{}{}", self.search_buffer, text), theme.accent),
+        ]))
+        .block(self.themed_block(" Filter Active Section ", theme))
+        .alignment(Alignment::Left);
+        frame.render_widget(input, popup);
     }
 
     fn request_preview_load(&mut self) {
@@ -1133,4 +1342,13 @@ fn center_rect(area: Rect, size: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     Rect::new(x, y, width, height)
+}
+
+fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
+    let width = area.width.saturating_mul(width_percent).saturating_div(100);
+    let popup_width = width.max(24).min(area.width);
+    let popup_height = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
+    Rect::new(x, y, popup_width, popup_height)
 }
