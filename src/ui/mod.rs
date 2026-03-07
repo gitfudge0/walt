@@ -1,5 +1,6 @@
 mod theme;
 
+use chrono::{Local, TimeZone};
 use rand::Rng;
 use ratatui::{
     backend::{Backend, CrosstermBackend},
@@ -1108,13 +1109,18 @@ impl App {
         frame.render_widget(block, area);
         frame.render_widget(Block::default().style(theme.surface), inner);
 
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(12), Constraint::Length(7)])
+            .split(inner);
+
         if let Some(ref mut protocol) = self.current_image {
             let resize = Resize::Scale(None);
-            let render_area = center_rect(inner, protocol.size_for(&resize, inner));
+            let render_area = center_rect(layout[0], protocol.size_for(&resize, layout[0]));
             let image = StatefulImage::default().resize(resize);
             frame.render_stateful_widget(image, render_area, protocol);
         } else {
-            let content = if self.wallpapers.is_empty() {
+            let lines = if self.wallpapers.is_empty() {
                 vec![
                     Line::from(Span::styled("No wallpapers found", theme.muted)),
                     Line::from(Span::styled("Configure paths with 'p'", theme.key)),
@@ -1125,8 +1131,10 @@ impl App {
                     Line::from(Span::styled("to see preview", theme.muted)),
                 ]
             };
-            frame.render_widget(Para::new(content).alignment(Alignment::Center), inner);
+            frame.render_widget(Para::new(lines).alignment(Alignment::Center), layout[0]);
         }
+
+        self.render_metadata(frame, layout[1], theme);
     }
 
     fn render_help(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
@@ -1259,6 +1267,52 @@ impl App {
         .block(self.themed_block(" Edit Rotation Interval ", theme))
         .alignment(Alignment::Left);
         frame.render_widget(input, popup);
+    }
+
+    fn render_metadata(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
+        let block = self.themed_block(" Metadata ", theme);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let Some(wallpaper) = self.current_selected_wallpaper() else {
+            frame.render_widget(
+                Para::new(Line::from(Span::styled("No wallpaper selected", theme.muted)))
+                    .alignment(Alignment::Center),
+                inner,
+            );
+            return;
+        };
+
+        let resolution = match (wallpaper.width, wallpaper.height) {
+            (Some(width), Some(height)) => format!("{width}x{height}"),
+            _ => "unknown".to_string(),
+        };
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("File: ", theme.key),
+                Span::styled(wallpaper.name.clone(), theme.accent),
+            ]),
+            Line::from(vec![
+                Span::styled("Dir: ", theme.key),
+                Span::styled(wallpaper.directory.to_string_lossy().to_string(), theme.accent),
+            ]),
+            Line::from(vec![
+                Span::styled("Resolution: ", theme.key),
+                Span::styled(resolution, theme.accent),
+                Span::raw("  "),
+                Span::styled("Size: ", theme.key),
+                Span::styled(format_file_size(wallpaper.file_size), theme.accent),
+            ]),
+            Line::from(vec![
+                Span::styled("Modified: ", theme.key),
+                Span::styled(format_timestamp(wallpaper.modified_unix_secs), theme.accent),
+            ]),
+            Line::from(vec![
+                Span::styled("Format: ", theme.key),
+                Span::styled(wallpaper.extension.to_uppercase(), theme.accent),
+            ]),
+        ];
+        frame.render_widget(Para::new(lines), inner);
     }
 
     fn request_preview_load(&mut self) {
@@ -1439,4 +1493,25 @@ fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     Rect::new(x, y, popup_width, popup_height)
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+
+    if bytes as f64 >= MB {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else if bytes as f64 >= KB {
+        format!("{:.1} KB", bytes as f64 / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_timestamp(unix_secs: u64) -> String {
+    Local
+        .timestamp_opt(unix_secs as i64, 0)
+        .single()
+        .map(|datetime| datetime.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| unix_secs.to_string())
 }
