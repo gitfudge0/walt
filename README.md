@@ -4,6 +4,8 @@ Walt is a fast terminal wallpaper picker for Hyprland. Browse your library, prev
 
 ![Walt banner](assets/walt-banner.jpg)
 
+![Walt screenshot](assets/screenshot.png)
+
 ## Why Walt
 
 - Stay in the terminal while browsing and applying wallpapers
@@ -52,7 +54,7 @@ For Ghostty:
 
 ```conf
 bind = $mainMod SHIFT, D, exec, ghostty --class=walt -e ~/.local/bin/walt
-bind = $mainMod, D, exec, ~/.local/bin/walt --random
+bind = $mainMod, D, exec, ~/.local/bin/walt random
 windowrulev2 = float, class:^(com\.mitchellh\.ghostty\.walt)$
 windowrulev2 = size 900 600, class:^(com\.mitchellh\.ghostty\.walt)$
 windowrulev2 = center, class:^(com\.mitchellh\.ghostty\.walt)$
@@ -81,10 +83,53 @@ Walt stores config in `~/.config/walt/` and automatically reads legacy settings 
 CLI mode:
 
 ```bash
-walt --random
+walt random
 ```
 
 This picks one random wallpaper from all configured directories combined and applies it through `hyprpaper`, without opening the TUI.
+
+To enable persistent auto-rotation, install the user service manually:
+
+```bash
+walt rotation install
+```
+
+Check whether it is running with:
+
+```bash
+walt rotation status
+```
+
+Example output:
+
+```text
+Rotation Service
+Status:   running
+Loaded:   loaded (~/.config/systemd/user/walt-rotation.service)
+Enabled:  enabled
+Active:   active
+Interval: 300s (5m)
+Entries:  12 wallpapers
+```
+
+Set the rotation interval from the CLI with:
+
+```bash
+walt rotation interval 900
+```
+
+Temporarily stop or restart the installed rotation service with:
+
+```bash
+walt rotation disable
+walt rotation enable
+```
+
+Remove the installed service completely with:
+
+```bash
+walt rotation uninstall
+```
 
 In the wallpaper browser:
 
@@ -96,13 +141,16 @@ In the wallpaper browser:
 - `/` to filter the active section
 - `s` to toggle sorting for the active section between name and modification date
 - `f` to add or remove the selected wallpaper from favorites
-- `y` to add or remove the selected wallpaper from rotation
-- `i` to change the rotation interval in seconds
-- `r` to pick and apply a random wallpaper
-- `?` to open the shortcuts popup
+- `r` to add or remove the selected wallpaper from rotation
+- `Ctrl+r` to pick and apply a random wallpaper
+- `R` to open the rotation actions popup
+- `i` to change the interval used by the installed rotation service
 - `p` to manage wallpaper paths
 - `t` to open the theme picker
+- `?` to open the keybindings popup
 - `q` or `Esc` to quit
+
+Walt does not auto-rotate wallpapers on its own while the TUI is open. Rotation only happens if you explicitly install the background service.
 
 In the path manager:
 

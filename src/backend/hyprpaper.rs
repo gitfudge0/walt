@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::{collections::HashSet, path::PathBuf, process::Command};
 
 #[derive(Debug)]
 pub struct Monitor {
@@ -75,6 +75,53 @@ pub fn set_wallpaper(wallpaper_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn get_active_wallpapers() -> anyhow::Result<Vec<PathBuf>> {
+    let output = Command::new("hyprctl")
+        .args(["hyprpaper", "listactive"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to read active wallpapers: {}", e))?;
+
+    if !output.status.success() {
+        return Err(command_failure("Active wallpaper query failed", &output));
+    }
+
+    Ok(parse_active_wallpapers(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn parse_active_wallpapers(output: &str) -> Vec<PathBuf> {
+    let mut wallpapers = Vec::new();
+    let mut seen = HashSet::new();
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let path_text = trimmed
+            .split_once(" = ")
+            .map(|(_, right)| right.trim())
+            .or_else(|| trimmed.split_once(',').map(|(_, right)| right.trim()));
+
+        let Some(path_text) = path_text else {
+            continue;
+        };
+
+        if path_text.is_empty() {
+            continue;
+        }
+
+        let path = PathBuf::from(path_text);
+        if seen.insert(path.clone()) {
+            wallpapers.push(path);
+        }
+    }
+
+    wallpapers
+}
+
 fn command_failure(context: &str, output: &std::process::Output) -> anyhow::Error {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -89,4 +136,46 @@ fn command_failure(context: &str, output: &std::process::Output) -> anyhow::Erro
     }
 
     anyhow::anyhow!("{context}: {details}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_active_wallpapers;
+    use std::path::PathBuf;
+
+    #[test]
+    fn parses_one_active_wallpaper() {
+        let wallpapers = parse_active_wallpapers("HDMI-A-1 = /wallpapers/alpha.jpg\n");
+        assert_eq!(wallpapers, vec![PathBuf::from("/wallpapers/alpha.jpg")]);
+    }
+
+    #[test]
+    fn parses_multiple_active_wallpapers() {
+        let wallpapers = parse_active_wallpapers(
+            "HDMI-A-1 = /wallpapers/alpha.jpg\nDP-1 = /wallpapers/beta.png\n",
+        );
+
+        assert_eq!(
+            wallpapers,
+            vec![
+                PathBuf::from("/wallpapers/alpha.jpg"),
+                PathBuf::from("/wallpapers/beta.png")
+            ]
+        );
+    }
+
+    #[test]
+    fn deduplicates_active_wallpapers() {
+        let wallpapers = parse_active_wallpapers(
+            "HDMI-A-1 = /wallpapers/alpha.jpg\nDP-1 = /wallpapers/alpha.jpg\n",
+        );
+
+        assert_eq!(wallpapers, vec![PathBuf::from("/wallpapers/alpha.jpg")]);
+    }
+
+    #[test]
+    fn ignores_unparseable_lines() {
+        let wallpapers = parse_active_wallpapers("not valid output\nstill not valid\n");
+        assert!(wallpapers.is_empty());
+    }
 }

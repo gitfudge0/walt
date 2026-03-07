@@ -103,8 +103,12 @@ mod tests {
         let wallpapers = scan_wallpapers_from_paths(&[first.clone(), second.clone()]);
 
         assert_eq!(wallpapers.len(), 2);
-        assert!(wallpapers.iter().any(|wallpaper| wallpaper.path == first_wallpaper));
-        assert!(wallpapers.iter().any(|wallpaper| wallpaper.path == second_wallpaper));
+        assert!(wallpapers
+            .iter()
+            .any(|wallpaper| wallpaper.path == first_wallpaper));
+        assert!(wallpapers
+            .iter()
+            .any(|wallpaper| wallpaper.path == second_wallpaper));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

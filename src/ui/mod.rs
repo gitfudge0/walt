@@ -5,7 +5,10 @@ use rand::Rng;
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     crossterm::{
-        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+        event::{
+            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+            KeyModifiers,
+        },
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     },
@@ -24,7 +27,12 @@ use std::{
     thread,
 };
 
-use crate::backend::{scan_directory, set_wallpaper};
+use crate::backend::{
+    disable_rotation_service, enable_rotation_service, get_active_wallpapers,
+    get_rotation_service_status, install_rotation_service, rotation_service_badge,
+    rotation_service_status, scan_directory, set_wallpaper, uninstall_rotation_service,
+    RotationServiceStatus,
+};
 use crate::cache::{IndexedWallpaper, ThumbnailCache, WallpaperIndex};
 use crate::config::Config;
 use theme::{ThemeKind, ThemePalette};
@@ -36,6 +44,8 @@ enum AppMode {
     Wallpaper,
     Search,
     IntervalEdit,
+    RotationMenu,
+    Keybindings,
     ThemeSelect,
 }
 
@@ -46,13 +56,12 @@ enum SectionKind {
     Rotation,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Overlay {
-    Shortcuts,
-}
-
 impl SectionKind {
-    const ALL: [SectionKind; 3] = [SectionKind::All, SectionKind::Favorites, SectionKind::Rotation];
+    const ALL: [SectionKind; 3] = [
+        SectionKind::All,
+        SectionKind::Favorites,
+        SectionKind::Rotation,
+    ];
 
     fn title(self) -> &'static str {
         match self {
@@ -75,6 +84,44 @@ impl SectionKind {
 enum SortMode {
     Name,
     Modified,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RotationMenuAction {
+    InstallOrUninstall,
+    EnableOrDisable,
+    SetInterval,
+}
+
+impl RotationMenuAction {
+    const ALL: [RotationMenuAction; 3] = [
+        RotationMenuAction::InstallOrUninstall,
+        RotationMenuAction::EnableOrDisable,
+        RotationMenuAction::SetInterval,
+    ];
+
+    fn label(self, status: Option<&RotationServiceStatus>) -> &'static str {
+        match self {
+            Self::InstallOrUninstall => {
+                if status.map(|status| status.installed).unwrap_or(false) {
+                    "Uninstall service"
+                } else {
+                    "Install service"
+                }
+            }
+            Self::EnableOrDisable => {
+                if status
+                    .map(|status| status.active == "active")
+                    .unwrap_or(false)
+                {
+                    "Disable service"
+                } else {
+                    "Enable service"
+                }
+            }
+            Self::SetInterval => "Change interval",
+        }
+    }
 }
 
 impl SortMode {
@@ -139,9 +186,10 @@ pub struct App {
     favorites_state: ListState,
     rotation_state: ListState,
     theme_state: ListState,
+    rotation_menu_state: ListState,
     active_section: SectionKind,
     mode: AppMode,
-    overlay: Option<Overlay>,
+    interval_return_mode: AppMode,
     preview_area: Rect,
     preview_request_id: u64,
     preview_tx: Sender<PreviewRequest>,
@@ -158,9 +206,12 @@ pub struct App {
     all_indices: Vec<usize>,
     favorites_indices: Vec<usize>,
     rotation_indices: Vec<usize>,
+    active_wallpaper_paths: HashSet<PathBuf>,
     favorite_paths: HashSet<PathBuf>,
     rotation_paths: HashSet<PathBuf>,
     last_preview_target: Option<(PathBuf, Rect)>,
+    rotation_service_state: Option<RotationServiceStatus>,
+    rotation_status_text: String,
     input_buffer: String,
     all_filter: String,
     favorites_filter: String,
@@ -186,6 +237,8 @@ impl App {
         suggestion_state.select(Some(0));
         let mut theme_state = ListState::default();
         theme_state.select(Some(theme.index()));
+        let mut rotation_menu_state = ListState::default();
+        rotation_menu_state.select(Some(0));
 
         let mode = if config.is_empty() {
             AppMode::Setup
@@ -207,9 +260,10 @@ impl App {
             favorites_state: ListState::default(),
             rotation_state: ListState::default(),
             theme_state,
+            rotation_menu_state,
             active_section: SectionKind::All,
             mode,
-            overlay: None,
+            interval_return_mode: AppMode::Wallpaper,
             preview_area: Rect::default(),
             preview_request_id: 0,
             preview_tx,
@@ -226,9 +280,12 @@ impl App {
             all_indices: vec![],
             favorites_indices: vec![],
             rotation_indices: vec![],
+            active_wallpaper_paths: HashSet::new(),
             favorite_paths: HashSet::new(),
             rotation_paths: HashSet::new(),
             last_preview_target: None,
+            rotation_service_state: None,
+            rotation_status_text: String::new(),
             input_buffer: String::new(),
             all_filter: String::new(),
             favorites_filter: String::new(),
@@ -239,6 +296,8 @@ impl App {
 
         app.rebuild_section_cache();
         app.ensure_section_selection();
+        app.refresh_active_wallpapers();
+        app.refresh_rotation_status();
 
         if !app.config.is_empty() {
             app.request_index_refresh();
@@ -284,19 +343,17 @@ impl App {
             if event::poll(std::time::Duration::from_millis(16))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
-                        if self.overlay.is_some() {
-                            self.handle_overlay_key(key.code);
-                        } else {
-                            match self.mode {
-                                AppMode::Setup => self.handle_setup_key(key.code)?,
-                                AppMode::PathManage => self.handle_path_manage_key(key.code),
-                                AppMode::Search => self.handle_search_key(key.code),
-                                AppMode::IntervalEdit => self.handle_interval_key(key.code),
-                                AppMode::ThemeSelect => self.handle_theme_select_key(key.code),
-                                AppMode::Wallpaper => {
-                                    if self.handle_wallpaper_key(key.code)? {
-                                        return Ok(());
-                                    }
+                        match self.mode {
+                            AppMode::Setup => self.handle_setup_key(key.code)?,
+                            AppMode::PathManage => self.handle_path_manage_key(key.code),
+                            AppMode::Search => self.handle_search_key(key.code),
+                            AppMode::IntervalEdit => self.handle_interval_key(key.code),
+                            AppMode::RotationMenu => self.handle_rotation_menu_key(key.code),
+                            AppMode::Keybindings => self.handle_keybindings_key(key.code),
+                            AppMode::ThemeSelect => self.handle_theme_select_key(key.code),
+                            AppMode::Wallpaper => {
+                                if self.handle_wallpaper_key(key)? {
+                                    return Ok(());
                                 }
                             }
                         }
@@ -365,25 +422,32 @@ impl App {
         }
     }
 
-    fn handle_wallpaper_key(&mut self, key: KeyCode) -> io::Result<bool> {
-        match key {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
-            KeyCode::Char('?') => self.overlay = Some(Overlay::Shortcuts),
-            KeyCode::Char('p') => self.mode = AppMode::PathManage,
-            KeyCode::Char('r') => self.select_random_wallpaper()?,
-            KeyCode::Char('t') => self.open_theme_picker(),
-            KeyCode::Char('f') => self.toggle_favorite(),
-            KeyCode::Char('y') => self.toggle_rotation(),
-            KeyCode::Char('i') => self.open_interval_editor(),
-            KeyCode::Char('s') => self.toggle_sort_mode(),
-            KeyCode::Char('/') => self.open_search(),
-            KeyCode::Tab | KeyCode::Char('l') => self.next_section(),
-            KeyCode::BackTab | KeyCode::Char('h') => self.previous_section(),
-            KeyCode::Char('j') | KeyCode::Down => self.move_down(),
-            KeyCode::Char('k') | KeyCode::Up => self.move_up(),
-            KeyCode::Char('g') | KeyCode::Home => self.go_to_top(),
-            KeyCode::Char('G') | KeyCode::End => self.go_to_bottom(),
-            KeyCode::Enter => self.handle_enter()?,
+    fn handle_wallpaper_key(&mut self, key: KeyEvent) -> io::Result<bool> {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), KeyModifiers::NONE) | (KeyCode::Esc, _) => return Ok(true),
+            (KeyCode::Char('p'), KeyModifiers::NONE) => self.mode = AppMode::PathManage,
+            (KeyCode::Char('r'), KeyModifiers::NONE) => self.toggle_rotation(),
+            (KeyCode::Char('r'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.select_random_wallpaper()?
+            }
+            (KeyCode::Char('t'), KeyModifiers::NONE) => self.open_theme_picker(),
+            (KeyCode::Char('f'), KeyModifiers::NONE) => self.toggle_favorite(),
+            (KeyCode::Char('i'), KeyModifiers::NONE) => self.open_interval_editor(),
+            (KeyCode::Char('R'), KeyModifiers::SHIFT) => self.open_rotation_menu(),
+            (KeyCode::Char('s'), KeyModifiers::NONE) => self.toggle_sort_mode(),
+            (KeyCode::Char('/'), KeyModifiers::NONE) => self.open_search(),
+            (KeyCode::Char('?'), _) | (KeyCode::Char('/'), KeyModifiers::SHIFT) => {
+                self.mode = AppMode::Keybindings
+            }
+            (KeyCode::Tab, _) | (KeyCode::Char('l'), KeyModifiers::NONE) => self.next_section(),
+            (KeyCode::BackTab, _) | (KeyCode::Char('h'), KeyModifiers::NONE) => {
+                self.previous_section()
+            }
+            (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, _) => self.move_down(),
+            (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, _) => self.move_up(),
+            (KeyCode::Char('g'), KeyModifiers::NONE) | (KeyCode::Home, _) => self.go_to_top(),
+            (KeyCode::Char('G'), KeyModifiers::SHIFT) | (KeyCode::End, _) => self.go_to_bottom(),
+            (KeyCode::Enter, _) => self.handle_enter()?,
             _ => {}
         }
 
@@ -422,15 +486,14 @@ impl App {
 
     fn handle_interval_key(&mut self, key: KeyCode) {
         match key {
-            KeyCode::Esc => self.mode = AppMode::Wallpaper,
+            KeyCode::Esc => self.mode = self.interval_return_mode,
             KeyCode::Enter => {
                 if let Ok(seconds) = self.interval_buffer.parse::<u64>() {
-                    if seconds > 0 {
-                        self.config.set_rotation_interval_secs(seconds);
-                        let _ = self.config.save();
+                    if self.config.set_rotation_interval_secs(seconds).is_ok() {
+                        self.refresh_rotation_status();
+                        self.mode = self.interval_return_mode;
                     }
                 }
-                self.mode = AppMode::Wallpaper;
             }
             KeyCode::Backspace => {
                 self.interval_buffer.pop();
@@ -440,9 +503,26 @@ impl App {
         }
     }
 
-    fn handle_overlay_key(&mut self, key: KeyCode) {
-        if matches!(key, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
-            self.overlay = None;
+    fn handle_rotation_menu_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('R') => {
+                self.mode = AppMode::Wallpaper;
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.move_down(),
+            KeyCode::Char('k') | KeyCode::Up => self.move_up(),
+            KeyCode::Char('g') | KeyCode::Home => self.go_to_top(),
+            KeyCode::Char('G') | KeyCode::End => self.go_to_bottom(),
+            KeyCode::Enter => self.run_rotation_menu_action(),
+            _ => {}
+        }
+    }
+
+    fn handle_keybindings_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+                self.mode = AppMode::Wallpaper;
+            }
+            _ => {}
         }
     }
 
@@ -497,6 +577,8 @@ impl App {
             }
             AppMode::Search => {}
             AppMode::IntervalEdit => {}
+            AppMode::RotationMenu => {}
+            AppMode::Keybindings => {}
             AppMode::ThemeSelect => self.confirm_theme_picker(),
             AppMode::PathManage => {}
         }
@@ -536,6 +618,14 @@ impl App {
             }
             AppMode::Search => {}
             AppMode::IntervalEdit => {}
+            AppMode::RotationMenu => {
+                let len = RotationMenuAction::ALL.len();
+                if len > 0 {
+                    let index = self.rotation_menu_state.selected().unwrap_or(0);
+                    self.rotation_menu_state.select(Some((index + 1) % len));
+                }
+            }
+            AppMode::Keybindings => {}
         }
     }
 
@@ -553,7 +643,11 @@ impl App {
             }
             AppMode::ThemeSelect => {
                 let index = self.theme_state.selected().unwrap_or(self.theme.index());
-                let new_index = if index == 0 { ThemeKind::ALL.len() - 1 } else { index - 1 };
+                let new_index = if index == 0 {
+                    ThemeKind::ALL.len() - 1
+                } else {
+                    index - 1
+                };
                 self.theme_state.select(Some(new_index));
                 self.theme = ThemeKind::ALL[new_index];
             }
@@ -561,7 +655,8 @@ impl App {
                 let len = self.config.wallpaper_paths.len();
                 if len > 0 {
                     let index = self.path_state.selected().unwrap_or(0);
-                    self.path_state.select(Some(if index == 0 { len - 1 } else { index - 1 }));
+                    self.path_state
+                        .select(Some(if index == 0 { len - 1 } else { index - 1 }));
                 }
             }
             AppMode::Wallpaper => {
@@ -575,6 +670,18 @@ impl App {
             }
             AppMode::Search => {}
             AppMode::IntervalEdit => {}
+            AppMode::RotationMenu => {
+                let len = RotationMenuAction::ALL.len();
+                if len > 0 {
+                    let index = self.rotation_menu_state.selected().unwrap_or(0);
+                    self.rotation_menu_state.select(Some(if index == 0 {
+                        len - 1
+                    } else {
+                        index - 1
+                    }));
+                }
+            }
+            AppMode::Keybindings => {}
         }
     }
 
@@ -598,6 +705,8 @@ impl App {
             }
             AppMode::Search => {}
             AppMode::IntervalEdit => {}
+            AppMode::RotationMenu => self.rotation_menu_state.select(Some(0)),
+            AppMode::Keybindings => {}
         }
     }
 
@@ -616,18 +725,25 @@ impl App {
             }
             AppMode::PathManage => {
                 if !self.config.wallpaper_paths.is_empty() {
-                    self.path_state.select(Some(self.config.wallpaper_paths.len() - 1));
+                    self.path_state
+                        .select(Some(self.config.wallpaper_paths.len() - 1));
                 }
             }
             AppMode::Wallpaper => {
                 let len = self.section_indices(self.active_section).len();
                 if len > 0 {
-                    self.section_state_mut(self.active_section).select(Some(len - 1));
+                    self.section_state_mut(self.active_section)
+                        .select(Some(len - 1));
                     self.request_preview_load();
                 }
             }
             AppMode::Search => {}
             AppMode::IntervalEdit => {}
+            AppMode::RotationMenu => {
+                self.rotation_menu_state
+                    .select(Some(RotationMenuAction::ALL.len() - 1));
+            }
+            AppMode::Keybindings => {}
         }
     }
 
@@ -656,7 +772,10 @@ impl App {
     }
 
     fn toggle_favorite(&mut self) {
-        let Some(path) = self.current_selected_wallpaper().map(|wallpaper| wallpaper.path.clone()) else {
+        let Some(path) = self
+            .current_selected_wallpaper()
+            .map(|wallpaper| wallpaper.path.clone())
+        else {
             return;
         };
 
@@ -667,7 +786,10 @@ impl App {
     }
 
     fn toggle_rotation(&mut self) {
-        let Some(path) = self.current_selected_wallpaper().map(|wallpaper| wallpaper.path.clone()) else {
+        let Some(path) = self
+            .current_selected_wallpaper()
+            .map(|wallpaper| wallpaper.path.clone())
+        else {
             return;
         };
 
@@ -675,6 +797,9 @@ impl App {
         let _ = self.config.save();
         self.rebuild_section_cache();
         self.ensure_section_selection();
+        if self.mode == AppMode::RotationMenu {
+            self.refresh_rotation_status();
+        }
         self.request_preview_load();
     }
 
@@ -694,8 +819,86 @@ impl App {
     }
 
     fn open_interval_editor(&mut self) {
+        self.interval_return_mode = self.mode;
         self.interval_buffer = self.config.rotation_interval_secs.to_string();
         self.mode = AppMode::IntervalEdit;
+    }
+
+    fn open_rotation_menu(&mut self) {
+        self.rotation_menu_state.select(Some(0));
+        self.refresh_rotation_status();
+        self.mode = AppMode::RotationMenu;
+    }
+
+    fn refresh_active_wallpapers(&mut self) {
+        match get_active_wallpapers() {
+            Ok(paths) => {
+                self.active_wallpaper_paths = paths.into_iter().collect();
+            }
+            Err(error) => {
+                eprintln!("Failed to refresh active wallpapers: {error}");
+            }
+        }
+    }
+
+    fn is_active_wallpaper(&self, path: &PathBuf) -> bool {
+        self.active_wallpaper_paths.contains(path)
+    }
+
+    fn refresh_rotation_status(&mut self) {
+        self.rotation_service_state = get_rotation_service_status().ok();
+        self.rotation_status_text = rotation_service_status().unwrap_or_else(|error| {
+            format!("Rotation Service\nStatus:   error\nError:    {error}")
+        });
+    }
+
+    fn run_rotation_menu_action(&mut self) {
+        let Some(index) = self.rotation_menu_state.selected() else {
+            return;
+        };
+
+        let action = RotationMenuAction::ALL[index];
+        match action {
+            RotationMenuAction::InstallOrUninstall => {
+                if self
+                    .rotation_service_state
+                    .as_ref()
+                    .map(|status| status.installed)
+                    .unwrap_or(false)
+                {
+                    self.run_rotation_service_action(|| uninstall_rotation_service());
+                } else {
+                    self.run_rotation_service_action(|| install_rotation_service());
+                }
+            }
+            RotationMenuAction::EnableOrDisable => {
+                if self
+                    .rotation_service_state
+                    .as_ref()
+                    .map(|status| status.active == "active")
+                    .unwrap_or(false)
+                {
+                    self.run_rotation_service_action(|| disable_rotation_service());
+                } else {
+                    self.run_rotation_service_action(|| enable_rotation_service());
+                }
+            }
+            RotationMenuAction::SetInterval => self.open_interval_editor(),
+        }
+    }
+
+    fn run_rotation_service_action<F>(&mut self, action: F)
+    where
+        F: FnOnce() -> anyhow::Result<()>,
+    {
+        match action() {
+            Ok(()) => self.refresh_rotation_status(),
+            Err(error) => {
+                self.rotation_service_state = None;
+                self.rotation_status_text =
+                    format!("Rotation Service\nStatus:   error\nError:    {error}");
+            }
+        }
     }
 
     fn section_state_mut(&mut self, section: SectionKind) -> &mut ListState {
@@ -849,11 +1052,12 @@ impl App {
         } else {
             self.wallpapers = self.wallpaper_index.load(&self.config.wallpaper_paths);
             self.rebuild_section_cache();
-            self.path_state.select(if self.config.wallpaper_paths.is_empty() {
-                None
-            } else {
-                Some(0)
-            });
+            self.path_state
+                .select(if self.config.wallpaper_paths.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                });
             self.ensure_section_selection();
             if self.current_selected_wallpaper().is_some() {
                 self.request_preview_load();
@@ -892,47 +1096,48 @@ impl App {
             AppMode::Setup => self.render_setup(frame, chunks[0], theme),
             AppMode::PathManage => self.render_path_manage(frame, chunks[0], theme),
             AppMode::ThemeSelect => self.render_theme_picker(frame, chunks[0], theme),
-            AppMode::Wallpaper | AppMode::Search => {
+            AppMode::Wallpaper
+            | AppMode::Search
+            | AppMode::IntervalEdit
+            | AppMode::RotationMenu
+            | AppMode::Keybindings => {
                 let main_chunks = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
                     .split(chunks[0]);
-                let preview_area = self.themed_block(" Preview ", theme).inner(main_chunks[1]);
+                let right_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(12), Constraint::Length(8)])
+                    .split(main_chunks[1]);
+                let preview_area = self.themed_block(" Preview ", theme).inner(right_chunks[0]);
                 if preview_area != self.preview_area {
                     self.preview_area = preview_area;
                     self.request_preview_load();
                 }
                 self.render_library_sections(frame, main_chunks[0], theme);
-                self.render_preview(frame, main_chunks[1], theme);
-                if self.mode == AppMode::Search {
-                    self.render_search_overlay(frame, chunks[0], theme);
+                self.render_preview(frame, right_chunks[0], theme);
+                self.render_metadata(frame, right_chunks[1], theme);
+
+                match self.mode {
+                    AppMode::Search => self.render_search_overlay(frame, chunks[0], theme),
+                    AppMode::IntervalEdit => self.render_interval_overlay(frame, chunks[0], theme),
+                    AppMode::RotationMenu => {
+                        self.render_rotation_menu_overlay(frame, chunks[0], theme)
+                    }
+                    AppMode::Keybindings => {
+                        self.render_keybindings_overlay(frame, chunks[0], theme)
+                    }
+                    _ => {}
                 }
-            }
-            AppMode::IntervalEdit => {
-                let main_chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
-                    .split(chunks[0]);
-                let preview_area = self.themed_block(" Preview ", theme).inner(main_chunks[1]);
-                if preview_area != self.preview_area {
-                    self.preview_area = preview_area;
-                    self.request_preview_load();
-                }
-                self.render_library_sections(frame, main_chunks[0], theme);
-                self.render_preview(frame, main_chunks[1], theme);
-                self.render_interval_overlay(frame, chunks[0], theme);
             }
         }
 
         self.render_help(frame, chunks[1], theme);
-
-        if self.overlay == Some(Overlay::Shortcuts) {
-            self.render_shortcuts_overlay(frame, theme);
-        }
     }
 
     fn themed_block<'a>(&self, title: &'a str, theme: ThemePalette) -> Block<'a> {
         Block::default()
+            .style(theme.surface)
             .borders(Borders::ALL)
             .border_set(border::ROUNDED)
             .border_style(theme.border)
@@ -952,7 +1157,11 @@ impl App {
             inner.width.saturating_sub(2),
             input_height,
         );
-        let cursor = if self.input_buffer.is_empty() { "_" } else { "" };
+        let cursor = if self.input_buffer.is_empty() {
+            "_"
+        } else {
+            ""
+        };
         let input_style = if self.input_buffer.is_empty() {
             theme.placeholder
         } else {
@@ -973,16 +1182,25 @@ impl App {
                 inner.width.saturating_sub(2),
                 inner.height.saturating_sub(input_height + 2),
             );
+            let selected = self.suggestion_state.selected();
             let items: Vec<ListItem> = self
                 .dir_suggestions
                 .iter()
-                .map(|path| ListItem::new(path.to_string_lossy().to_string()).style(theme.accent))
+                .enumerate()
+                .map(|(index, path)| {
+                    let style = if selected == Some(index) {
+                        theme.highlight
+                    } else {
+                        theme.accent
+                    };
+                    ListItem::new(path.to_string_lossy().to_string()).style(style)
+                })
                 .collect();
             let mut state = self.suggestion_state.clone();
             let list = List::new(items)
                 .block(self.themed_block(" Directories ", theme))
                 .highlight_style(theme.highlight)
-                .highlight_symbol("▶ ");
+                .highlight_symbol("› ");
             frame.render_stateful_widget(list, list_area, &mut state);
         }
     }
@@ -1003,17 +1221,26 @@ impl App {
                 inner,
             );
         } else {
+            let selected = self.path_state.selected();
             let items: Vec<ListItem> = self
                 .config
                 .wallpaper_paths
                 .iter()
-                .map(|path| ListItem::new(path.to_string_lossy().to_string()).style(theme.accent))
+                .enumerate()
+                .map(|(index, path)| {
+                    let style = if selected == Some(index) {
+                        theme.highlight
+                    } else {
+                        theme.accent
+                    };
+                    ListItem::new(path.to_string_lossy().to_string()).style(style)
+                })
                 .collect();
             let mut state = self.path_state.clone();
             let list = List::new(items)
                 .block(self.themed_block(" Paths ", theme))
                 .highlight_style(theme.highlight)
-                .highlight_symbol("▶ ");
+                .highlight_symbol("› ");
             frame.render_stateful_widget(list, inner, &mut state);
         }
     }
@@ -1021,7 +1248,9 @@ impl App {
     fn render_theme_picker(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
         frame.render_widget(Clear, area);
         frame.render_widget(Block::default().style(theme.surface), area);
-        let outer = self.themed_block(" Theme Picker ", theme).style(theme.surface);
+        let outer = self
+            .themed_block(" Theme Picker ", theme)
+            .style(theme.surface);
         let inner = outer.inner(area);
         frame.render_widget(outer, area);
 
@@ -1045,16 +1274,25 @@ impl App {
         .style(theme.surface);
         frame.render_widget(picker_help, content[0]);
 
+        let selected = self.theme_state.selected();
         let items: Vec<ListItem> = ThemeKind::ALL
             .iter()
-            .map(|theme_kind| ListItem::new(theme_kind.name()).style(theme.accent))
+            .enumerate()
+            .map(|(index, theme_kind)| {
+                let style = if selected == Some(index) {
+                    theme.highlight
+                } else {
+                    theme.accent
+                };
+                ListItem::new(theme_kind.name()).style(style)
+            })
             .collect();
         let mut state = self.theme_state.clone();
         let list = List::new(items)
             .block(self.themed_block(" Themes ", theme))
             .style(theme.surface)
             .highlight_style(theme.highlight)
-            .highlight_symbol("▶ ");
+            .highlight_symbol("› ");
         frame.render_stateful_widget(list, content[1], &mut state);
     }
 
@@ -1106,14 +1344,20 @@ impl App {
         let mut border_theme = theme;
         if self.active_section == section {
             border_theme.border = theme.highlight;
-            border_theme.title = theme.key;
+            border_theme.title = theme.highlight;
         }
 
         if indices.is_empty() {
             let message = match section {
-                SectionKind::All if self.filter_query(section).is_empty() => "No wallpapers indexed",
-                SectionKind::Favorites if self.filter_query(section).is_empty() => "No favorites yet",
-                SectionKind::Rotation if self.filter_query(section).is_empty() => "Rotation list is empty",
+                SectionKind::All if self.filter_query(section).is_empty() => {
+                    "No wallpapers indexed"
+                }
+                SectionKind::Favorites if self.filter_query(section).is_empty() => {
+                    "No favorites yet"
+                }
+                SectionKind::Rotation if self.filter_query(section).is_empty() => {
+                    "Rotation list is empty"
+                }
                 _ => "No matches for current filter",
             };
             frame.render_widget(
@@ -1125,22 +1369,40 @@ impl App {
             return;
         }
 
+        let selected = state.selected();
         let items = indices
             .iter()
-            .filter_map(|index| self.wallpapers.get(*index))
-            .map(|wallpaper| {
-                let marker = if self.favorite_paths.contains(&wallpaper.path) {
-                    "★ "
+            .enumerate()
+            .filter_map(|(visible_index, index)| {
+                self.wallpapers
+                    .get(*index)
+                    .map(|wallpaper| (visible_index, wallpaper))
+            })
+            .map(|(visible_index, wallpaper)| {
+                let marker = wallpaper_marker_prefix(
+                    self.favorite_paths.contains(&wallpaper.path),
+                    self.is_active_wallpaper(&wallpaper.path),
+                );
+                let style = if selected == Some(visible_index) {
+                    theme.highlight
                 } else {
-                    ""
+                    theme.accent
                 };
-                ListItem::new(format!("{marker}{}", wallpaper.name)).style(theme.accent)
+                ListItem::new(format!("{marker}{}", wallpaper.name)).style(style)
             })
             .collect::<Vec<_>>();
         let title = format!(
             "{} [{}{}]",
             section.title().trim(),
-            self.sort_mode(section).label(),
+            if section == SectionKind::Rotation {
+                self.rotation_service_state
+                    .as_ref()
+                    .map(rotation_service_badge)
+                    .unwrap_or("unknown")
+                    .to_string()
+            } else {
+                self.sort_mode(section).label().to_string()
+            },
             if section == SectionKind::Rotation {
                 format!(" · {}s", self.config.rotation_interval_secs)
             } else {
@@ -1157,7 +1419,7 @@ impl App {
         let list = List::new(items)
             .block(block)
             .highlight_style(theme.highlight)
-            .highlight_symbol("▶ ");
+            .highlight_symbol("› ");
         frame.render_stateful_widget(list, area, &mut list_state);
     }
 
@@ -1167,14 +1429,9 @@ impl App {
         frame.render_widget(block, area);
         frame.render_widget(Block::default().style(theme.surface), inner);
 
-        let layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(12), Constraint::Length(7)])
-            .split(inner);
-
         if let Some(ref mut protocol) = self.current_image {
             let resize = Resize::Scale(None);
-            let render_area = center_rect(layout[0], protocol.size_for(&resize, layout[0]));
+            let render_area = center_rect(inner, protocol.size_for(&resize, inner));
             let image = StatefulImage::default().resize(resize);
             frame.render_stateful_widget(image, render_area, protocol);
         } else {
@@ -1189,48 +1446,43 @@ impl App {
                     Line::from(Span::styled("to see preview", theme.muted)),
                 ]
             };
-            frame.render_widget(Para::new(lines).alignment(Alignment::Center), layout[0]);
+            frame.render_widget(Para::new(lines).alignment(Alignment::Center), inner);
         }
-
-        self.render_metadata(frame, layout[1], theme);
     }
 
     fn render_help(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
-        let mode_text = match self.mode {
-            AppMode::Setup => " Setup ",
-            AppMode::PathManage => " Path Manager ",
-            AppMode::Search => " Search ",
-            AppMode::IntervalEdit => " Rotation Interval ",
-            AppMode::ThemeSelect => " Theme Picker ",
-            AppMode::Wallpaper => " Wallpapers ",
+        let controls = match self.mode {
+            AppMode::Setup => vec![("Type", "path"), ("Enter", "add"), ("Tab", "suggestion")],
+            AppMode::PathManage => vec![("a", "add"), ("d", "remove"), ("p", "back")],
+            AppMode::Search => vec![("Type", "filter"), ("Enter", "confirm"), ("Esc", "cancel")],
+            AppMode::IntervalEdit => {
+                vec![("Type", "seconds"), ("Enter", "save"), ("Esc", "cancel")]
+            }
+            AppMode::RotationMenu => vec![("↑/↓", "choose"), ("Enter", "run"), ("Esc", "close")],
+            AppMode::Keybindings => vec![("?", "close"), ("Esc", "close")],
+            AppMode::ThemeSelect => {
+                vec![("↑/↓", "preview"), ("Enter", "confirm"), ("Esc", "cancel")]
+            }
+            AppMode::Wallpaper => vec![
+                ("?", "keybindings"),
+                ("↑/↓", "move"),
+                ("Enter", "apply"),
+                ("/", "filter"),
+                ("r", "rotate"),
+                ("Ctrl+r", "random"),
+                ("R", "rotation"),
+                ("p", "paths"),
+            ],
         };
 
-        let mut spans = vec![
-            Span::raw(" "),
-            Span::styled(mode_text, theme.title),
-            Span::raw(" | "),
-            Span::styled("Theme", theme.key),
-            Span::raw(": "),
-            Span::styled(self.theme.name(), theme.accent),
-            Span::raw(" | "),
-        ];
+        let mut spans = vec![Span::raw(" ")];
 
-        if self.mode == AppMode::Wallpaper {
-            spans.push(Span::styled("Section", theme.key));
-            spans.push(Span::raw(": "));
-            spans.push(Span::styled(self.active_section.title().trim(), theme.accent));
+        for (key, action) in controls {
+            spans.push(Span::styled(key, theme.key));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(action, theme.muted));
             spans.push(Span::raw(" | "));
         }
-
-        let hint = match self.mode {
-            AppMode::Setup => "Type a path and press Enter",
-            AppMode::PathManage => "a add path | d remove path",
-            AppMode::Search => "Type to filter | Enter confirm | Esc cancel",
-            AppMode::IntervalEdit => "Type seconds | Enter save | Esc cancel",
-            AppMode::ThemeSelect => "Enter confirm | Esc cancel",
-            AppMode::Wallpaper => "? shortcuts | y rotation | i interval",
-        };
-        spans.push(Span::styled(hint, theme.muted));
 
         frame.render_widget(
             Para::new(Line::from(spans))
@@ -1242,22 +1494,24 @@ impl App {
 
     fn render_search_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
         let popup = centered_rect(60, 5, area);
-        frame.render_widget(Clear, popup);
-        let text = if self.search_buffer.is_empty() { "/" } else { "" };
+        let text = if self.search_buffer.is_empty() {
+            "/"
+        } else {
+            ""
+        };
         let input = Para::new(Line::from(vec![
             Span::styled("/", theme.key),
             Span::styled(format!("{}{}", self.search_buffer, text), theme.accent),
         ]))
         .block(self.themed_block(" Filter Active Section ", theme))
         .alignment(Alignment::Left);
-        frame.render_widget(input, popup);
+        self.render_popup(frame, popup, theme, input);
     }
 
     fn render_interval_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
         let popup = centered_rect(60, 5, area);
-        frame.render_widget(Clear, popup);
         let text = if self.interval_buffer.is_empty() {
-            self.config.rotation_interval_secs.to_string()
+            "_".to_string()
         } else {
             self.interval_buffer.clone()
         };
@@ -1267,89 +1521,118 @@ impl App {
         ]))
         .block(self.themed_block(" Edit Rotation Interval ", theme))
         .alignment(Alignment::Left);
-        frame.render_widget(input, popup);
+        self.render_popup(frame, popup, theme, input);
     }
 
-    fn render_shortcuts_overlay(&self, frame: &mut Frame, theme: ThemePalette) {
-        let popup = centered_rect(62, 16, frame.area());
-        let block = self.themed_block(" Shortcuts ", theme).style(theme.surface);
-        let inner = block.inner(popup);
-
-        let lines = vec![
-            Line::from(vec![
-                Span::styled("Move", theme.title),
-                Span::raw("        "),
-                Span::styled("↑/↓ or j/k", theme.key),
-                Span::raw(" navigate"),
-            ]),
-            Line::from(vec![
-                Span::styled("Sections", theme.title),
-                Span::raw("    "),
-                Span::styled("Tab/l", theme.key),
-                Span::raw(" next  "),
-                Span::styled("S-Tab/h", theme.key),
-                Span::raw(" previous"),
-            ]),
-            Line::from(vec![
-                Span::styled("Jump", theme.title),
-                Span::raw("        "),
-                Span::styled("g/G", theme.key),
-                Span::raw(" top/bottom"),
-            ]),
-            Line::from(vec![
-                Span::styled("Apply", theme.title),
-                Span::raw("       "),
-                Span::styled("Enter", theme.key),
-                Span::raw(" set wallpaper"),
-            ]),
-            Line::from(vec![
-                Span::styled("Filter", theme.title),
-                Span::raw("      "),
-                Span::styled("/", theme.key),
-                Span::raw(" filter active section"),
-            ]),
-            Line::from(vec![
-                Span::styled("Favorite", theme.title),
-                Span::raw("    "),
-                Span::styled("f", theme.key),
-                Span::raw(" toggle favorite"),
-            ]),
-            Line::from(vec![
-                Span::styled("Rotation", theme.title),
-                Span::raw("    "),
-                Span::styled("y", theme.key),
-                Span::raw(" toggle rotation  "),
-                Span::styled("i", theme.key),
-                Span::raw(" interval"),
-            ]),
-            Line::from(vec![
-                Span::styled("Sort", theme.title),
-                Span::raw("        "),
-                Span::styled("s", theme.key),
-                Span::raw(" toggle sort  "),
-                Span::styled("r", theme.key),
-                Span::raw(" random"),
-            ]),
-            Line::from(vec![
-                Span::styled("Manage", theme.title),
-                Span::raw("      "),
-                Span::styled("p", theme.key),
-                Span::raw(" paths  "),
-                Span::styled("t", theme.key),
-                Span::raw(" theme  "),
-                Span::styled("q", theme.key),
-                Span::raw(" quit"),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("? / Esc / q", theme.key),
-                Span::raw(" close"),
-            ]),
-        ];
-
+    fn render_rotation_menu_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
+        let popup = centered_rect(72, 16, area);
         frame.render_widget(Clear, popup);
+        frame.render_widget(Block::default().style(theme.surface), popup);
+        let block = self
+            .themed_block(" Rotation Actions ", theme)
+            .style(theme.surface);
+        let inner = block.inner(popup);
         frame.render_widget(block, popup);
-        frame.render_widget(Para::new(lines).alignment(Alignment::Left), inner);
+
+        let status_lines = self
+            .rotation_status_text
+            .lines()
+            .map(|line| Line::from(Span::styled(line.to_string(), theme.accent)))
+            .collect::<Vec<_>>();
+        let selected = self.rotation_menu_state.selected();
+        let items = RotationMenuAction::ALL
+            .iter()
+            .enumerate()
+            .map(|(index, action)| {
+                let style = if selected == Some(index) {
+                    theme.highlight
+                } else {
+                    theme.accent
+                };
+                ListItem::new(action.label(self.rotation_service_state.as_ref())).style(style)
+            })
+            .collect::<Vec<_>>();
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(7), Constraint::Min(0)])
+            .split(inner);
+
+        let status = Para::new(status_lines)
+            .block(self.themed_block(" Service Status ", theme))
+            .alignment(Alignment::Left);
+        frame.render_widget(status, sections[0]);
+
+        let mut state = self.rotation_menu_state.clone();
+        let actions = List::new(items)
+            .block(self.themed_block(" Actions ", theme))
+            .highlight_style(theme.highlight)
+            .highlight_symbol("› ");
+        frame.render_stateful_widget(actions, sections[1], &mut state);
+    }
+
+    fn render_keybindings_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
+        let popup = centered_rect(72, 12, area);
+        let pairs = [
+            (("Move", "↑/↓ or j/k"), ("Sections", "Tab/l, S-Tab/h")),
+            (("Apply", "Enter"), ("Random", "Ctrl+r")),
+            (("Favorite", "f"), ("Rotation", "r")),
+            (("Rotation Menu", "R"), ("Interval", "i")),
+            (("Filter", "/"), ("Sort", "s")),
+            (("Paths", "p"), ("Theme", "t")),
+            (("Keybindings", "?"), ("Quit", "q / Esc")),
+        ];
+        let left_label_width = pairs
+            .iter()
+            .map(|(left, _)| left.0.len())
+            .chain(std::iter::once("Close".len()))
+            .max()
+            .unwrap_or(0);
+        let right_label_width = pairs
+            .iter()
+            .map(|(_, right)| right.0.len())
+            .max()
+            .unwrap_or(0);
+        let left_value_width = pairs
+            .iter()
+            .map(|(left, _)| left.1.len())
+            .max()
+            .unwrap_or(0);
+
+        let mut lines = pairs
+            .iter()
+            .map(|(left, right)| {
+                Line::from(vec![
+                    Span::styled(format!("{:<left_label_width$}", left.0), theme.key),
+                    Span::raw("  "),
+                    Span::styled(format!("{:<left_value_width$}", left.1), theme.accent),
+                    Span::raw("    "),
+                    Span::styled(format!("{:<right_label_width$}", right.0), theme.key),
+                    Span::raw("  "),
+                    Span::styled(right.1, theme.accent),
+                ])
+            })
+            .collect::<Vec<_>>();
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<left_label_width$}", "Close"), theme.key),
+            Span::raw("  "),
+            Span::styled("? / Esc", theme.accent),
+        ]));
+
+        let body = Para::new(lines)
+            .block(self.themed_block(" Keybindings ", theme))
+            .alignment(Alignment::Left);
+        self.render_popup(frame, popup, theme, body);
+    }
+
+    fn render_popup<W>(&self, frame: &mut Frame, popup: Rect, theme: ThemePalette, widget: W)
+    where
+        W: ratatui::widgets::Widget,
+    {
+        frame.render_widget(Clear, popup);
+        frame.render_widget(Block::default().style(theme.surface), popup);
+        frame.render_widget(widget, popup);
     }
 
     fn render_metadata(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
@@ -1359,8 +1642,11 @@ impl App {
 
         let Some(wallpaper) = self.current_selected_wallpaper() else {
             frame.render_widget(
-                Para::new(Line::from(Span::styled("No wallpaper selected", theme.muted)))
-                    .alignment(Alignment::Center),
+                Para::new(Line::from(Span::styled(
+                    "No wallpaper selected",
+                    theme.muted,
+                )))
+                .alignment(Alignment::Center),
                 inner,
             );
             return;
@@ -1377,7 +1663,10 @@ impl App {
             ]),
             Line::from(vec![
                 Span::styled("Dir: ", theme.key),
-                Span::styled(wallpaper.directory.to_string_lossy().to_string(), theme.accent),
+                Span::styled(
+                    wallpaper.directory.to_string_lossy().to_string(),
+                    theme.accent,
+                ),
             ]),
             Line::from(vec![
                 Span::styled("Resolution: ", theme.key),
@@ -1426,7 +1715,10 @@ impl App {
         });
 
         let indices = self.section_indices(self.active_section);
-        let selected = self.section_state(self.active_section).selected().unwrap_or(0);
+        let selected = self
+            .section_state(self.active_section)
+            .selected()
+            .unwrap_or(0);
         let prewarm_paths = indices
             .into_iter()
             .skip(selected.saturating_sub(3))
@@ -1478,10 +1770,14 @@ impl App {
         }
     }
 
-    fn apply_wallpaper(&self) -> anyhow::Result<()> {
-        if let Some(wallpaper) = self.current_selected_wallpaper() {
-            let path_str = wallpaper.path.to_string_lossy().to_string();
+    fn apply_wallpaper(&mut self) -> anyhow::Result<()> {
+        if let Some(path) = self
+            .current_selected_wallpaper()
+            .map(|wallpaper| wallpaper.path.clone())
+        {
+            let path_str = path.to_string_lossy().to_string();
             set_wallpaper(&path_str)?;
+            self.refresh_active_wallpapers();
             println!("Wallpaper set to: {path_str}");
         }
         Ok(())
@@ -1605,4 +1901,38 @@ fn format_timestamp(unix_secs: u64) -> String {
         .single()
         .map(|datetime| datetime.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| unix_secs.to_string())
+}
+
+fn wallpaper_marker_prefix(is_favorite: bool, is_active: bool) -> String {
+    match (is_favorite, is_active) {
+        (true, true) => "★ ● ".to_string(),
+        (true, false) => "★ ".to_string(),
+        (false, true) => "● ".to_string(),
+        (false, false) => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::wallpaper_marker_prefix;
+
+    #[test]
+    fn marker_prefix_for_plain_wallpaper() {
+        assert_eq!(wallpaper_marker_prefix(false, false), "");
+    }
+
+    #[test]
+    fn marker_prefix_for_favorite_wallpaper() {
+        assert_eq!(wallpaper_marker_prefix(true, false), "★ ");
+    }
+
+    #[test]
+    fn marker_prefix_for_active_wallpaper() {
+        assert_eq!(wallpaper_marker_prefix(false, true), "● ");
+    }
+
+    #[test]
+    fn marker_prefix_for_favorite_and_active_wallpaper() {
+        assert_eq!(wallpaper_marker_prefix(true, true), "★ ● ");
+    }
 }

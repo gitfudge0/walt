@@ -93,7 +93,8 @@ impl WallpaperIndex {
                     continue;
                 }
 
-                let Some(indexed) = build_indexed_wallpaper(path, existing_by_path.get(path)) else {
+                let Some(indexed) = build_indexed_wallpaper(path, existing_by_path.get(path))
+                else {
                     continue;
                 };
                 wallpapers.push(indexed);
@@ -168,7 +169,10 @@ fn has_valid_extension(path: &Path) -> bool {
 }
 
 fn canonical_path_set(paths: &[PathBuf]) -> HashSet<PathBuf> {
-    paths.iter().filter_map(|path| fs::canonicalize(path).ok()).collect()
+    paths
+        .iter()
+        .filter_map(|path| fs::canonicalize(path).ok())
+        .collect()
 }
 
 fn canonicalize_parented(path: &Path) -> Option<PathBuf> {
@@ -186,7 +190,11 @@ fn starts_with_any(path: &Path, roots: &HashSet<PathBuf>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::build_indexed_wallpaper;
-    use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn make_temp_dir() -> PathBuf {
         let unique = SystemTime::now()

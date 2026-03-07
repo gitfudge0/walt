@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use anyhow::bail;
 use serde::{Deserialize, Serialize};
 
 const CONFIG_DIR: &str = "walt";
@@ -156,7 +157,10 @@ impl Config {
             .collect::<Vec<_>>()
             .join("\n");
         fs::write(config_dir.join(PATHS_FILE), paths_content)?;
-        fs::write(config_dir.join(THEME_FILE), format!("{}\n", self.theme_name))?;
+        fs::write(
+            config_dir.join(THEME_FILE),
+            format!("{}\n", self.theme_name),
+        )?;
 
         Ok(())
     }
@@ -197,6 +201,10 @@ impl Config {
         }
     }
 
+    pub fn is_in_rotation(&self, path: &PathBuf) -> bool {
+        self.rotation.iter().any(|entry| entry == path)
+    }
+
     pub fn sort_name_for_section(&self, section: &str) -> &str {
         match section {
             "favorites" => &self.favorites_sort,
@@ -214,11 +222,17 @@ impl Config {
         }
     }
 
-    pub fn set_rotation_interval_secs(&mut self, secs: u64) {
-        self.rotation_interval_secs = secs.max(1);
-    }
     pub fn is_empty(&self) -> bool {
         self.wallpaper_paths.is_empty()
+    }
+
+    pub fn set_rotation_interval_secs(&mut self, seconds: u64) -> anyhow::Result<()> {
+        if seconds == 0 {
+            bail!("Rotation interval must be greater than 0 seconds.");
+        }
+
+        self.rotation_interval_secs = seconds;
+        self.save()
     }
 }
 
@@ -260,13 +274,15 @@ mod tests {
     }
 
     #[test]
-    fn clamps_rotation_interval_to_positive_seconds() {
+    fn rejects_zero_rotation_interval() {
         let mut config = test_config();
 
-        config.set_rotation_interval_secs(0);
-        assert_eq!(config.rotation_interval_secs, 1);
-
-        config.set_rotation_interval_secs(45);
-        assert_eq!(config.rotation_interval_secs, 45);
+        let error = config
+            .set_rotation_interval_secs(0)
+            .expect_err("zero seconds should fail");
+        assert_eq!(
+            error.to_string(),
+            "Rotation interval must be greater than 0 seconds."
+        );
     }
 }

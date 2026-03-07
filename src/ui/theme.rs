@@ -75,7 +75,10 @@ impl ThemeKind {
     }
 
     pub fn index(self) -> usize {
-        Self::ALL.iter().position(|theme| *theme == self).unwrap_or(0)
+        Self::ALL
+            .iter()
+            .position(|theme| *theme == self)
+            .unwrap_or(0)
     }
 
     pub fn palette(self) -> ThemePalette {
@@ -87,7 +90,7 @@ impl ThemeKind {
                 accent: Style::default().add_modifier(Modifier::BOLD),
                 muted: Style::default().add_modifier(Modifier::DIM),
                 highlight: Style::default()
-                    .add_modifier(Modifier::REVERSED)
+                    .fg(selection_color())
                     .add_modifier(Modifier::BOLD),
                 key: Style::default().add_modifier(Modifier::BOLD),
                 placeholder: Style::default().add_modifier(Modifier::DIM),
@@ -192,20 +195,26 @@ fn palette(
     title: Color,
     text: Color,
     muted: Color,
-    highlight_bg: Color,
+    _highlight: Color,
     key: Color,
 ) -> ThemePalette {
     ThemePalette {
         surface: Style::default().bg(surface),
         border: Style::default().fg(border).bg(surface),
-        title: Style::default().fg(title).bg(surface).add_modifier(Modifier::BOLD),
+        title: Style::default()
+            .fg(title)
+            .bg(surface)
+            .add_modifier(Modifier::BOLD),
         accent: Style::default().fg(text).bg(surface),
         muted: Style::default().fg(muted).bg(surface),
         highlight: Style::default()
-            .fg(text)
-            .bg(highlight_bg)
+            .fg(selection_color())
+            .bg(surface)
             .add_modifier(Modifier::BOLD),
-        key: Style::default().fg(key).bg(surface).add_modifier(Modifier::BOLD),
+        key: Style::default()
+            .fg(key)
+            .bg(surface)
+            .add_modifier(Modifier::BOLD),
         placeholder: Style::default()
             .fg(muted)
             .bg(surface)
@@ -215,4 +224,8 @@ fn palette(
 
 fn rgb(r: u8, g: u8, b: u8) -> Color {
     Color::Rgb(r, g, b)
+}
+
+fn selection_color() -> Color {
+    Color::Rgb(255, 215, 64)
 }
