@@ -191,6 +191,20 @@ impl Config {
         self.favorites.iter().any(|entry| entry == path)
     }
 
+    pub fn toggle_rotation(&mut self, path: &PathBuf) -> bool {
+        if let Some(index) = self.rotation.iter().position(|entry| entry == path) {
+            self.rotation.remove(index);
+            false
+        } else {
+            self.rotation.push(path.clone());
+            true
+        }
+    }
+
+    pub fn is_in_rotation(&self, path: &PathBuf) -> bool {
+        self.rotation.iter().any(|entry| entry == path)
+    }
+
     pub fn sort_name_for_section(&self, section: &str) -> &str {
         match section {
             "favorites" => &self.favorites_sort,
