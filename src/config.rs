@@ -187,10 +187,6 @@ impl Config {
         }
     }
 
-    pub fn is_favorite(&self, path: &PathBuf) -> bool {
-        self.favorites.iter().any(|entry| entry == path)
-    }
-
     pub fn toggle_rotation(&mut self, path: &PathBuf) -> bool {
         if let Some(index) = self.rotation.iter().position(|entry| entry == path) {
             self.rotation.remove(index);
@@ -199,10 +195,6 @@ impl Config {
             self.rotation.push(path.clone());
             true
         }
-    }
-
-    pub fn is_in_rotation(&self, path: &PathBuf) -> bool {
-        self.rotation.iter().any(|entry| entry == path)
     }
 
     pub fn sort_name_for_section(&self, section: &str) -> &str {
@@ -221,6 +213,10 @@ impl Config {
             _ => self.all_sort = value,
         }
     }
+
+    pub fn set_rotation_interval_secs(&mut self, secs: u64) {
+        self.rotation_interval_secs = secs.max(1);
+    }
     pub fn is_empty(&self) -> bool {
         self.wallpaper_paths.is_empty()
     }
@@ -230,5 +226,47 @@ fn default_sort_name(name: String) -> String {
     match name.as_str() {
         "modified" => "modified".to_string(),
         _ => "name".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use std::path::PathBuf;
+
+    fn test_config() -> Config {
+        Config {
+            wallpaper_paths: vec![],
+            theme_name: "System".to_string(),
+            favorites: vec![],
+            rotation: vec![],
+            rotation_interval_secs: 300,
+            all_sort: "name".to_string(),
+            favorites_sort: "name".to_string(),
+            rotation_sort: "name".to_string(),
+        }
+    }
+
+    #[test]
+    fn toggles_rotation_membership() {
+        let path = PathBuf::from("/tmp/wallpaper.jpg");
+        let mut config = test_config();
+
+        assert!(config.toggle_rotation(&path));
+        assert_eq!(config.rotation, vec![path.clone()]);
+
+        assert!(!config.toggle_rotation(&path));
+        assert!(config.rotation.is_empty());
+    }
+
+    #[test]
+    fn clamps_rotation_interval_to_positive_seconds() {
+        let mut config = test_config();
+
+        config.set_rotation_interval_secs(0);
+        assert_eq!(config.rotation_interval_secs, 1);
+
+        config.set_rotation_interval_secs(45);
+        assert_eq!(config.rotation_interval_secs, 45);
     }
 }
