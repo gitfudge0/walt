@@ -351,8 +351,8 @@ impl App {
             KeyCode::Char('i') => self.open_interval_editor(),
             KeyCode::Char('s') => self.toggle_sort_mode(),
             KeyCode::Char('/') => self.open_search(),
-            KeyCode::Tab => self.next_section(),
-            KeyCode::BackTab => self.previous_section(),
+            KeyCode::Tab | KeyCode::Char('l') => self.next_section(),
+            KeyCode::BackTab | KeyCode::Char('h') => self.previous_section(),
             KeyCode::Char('j') | KeyCode::Down => self.move_down(),
             KeyCode::Char('k') | KeyCode::Up => self.move_up(),
             KeyCode::Char('g') | KeyCode::Home => self.go_to_top(),
@@ -1186,7 +1186,8 @@ impl App {
             AppMode::Wallpaper => (
                 " Wallpapers ",
                 vec![
-                    ("Tab", "section"),
+                    ("Tab/l", "next section"),
+                    ("S-Tab/h", "prev section"),
                     ("/", "filter"),
                     ("f", "favorite"),
                     ("y", "rotation"),
