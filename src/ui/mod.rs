@@ -45,6 +45,11 @@ enum SectionKind {
     Rotation,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Overlay {
+    Shortcuts,
+}
+
 impl SectionKind {
     const ALL: [SectionKind; 3] = [SectionKind::All, SectionKind::Favorites, SectionKind::Rotation];
 
@@ -135,6 +140,7 @@ pub struct App {
     theme_state: ListState,
     active_section: SectionKind,
     mode: AppMode,
+    overlay: Option<Overlay>,
     preview_area: Rect,
     preview_request_id: u64,
     preview_tx: Sender<PreviewRequest>,
@@ -196,6 +202,7 @@ impl App {
             theme_state,
             active_section: SectionKind::All,
             mode,
+            overlay: None,
             preview_area: Rect::default(),
             preview_request_id: 0,
             preview_tx,
@@ -263,15 +270,19 @@ impl App {
             if event::poll(std::time::Duration::from_millis(16))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
-                        match self.mode {
-                            AppMode::Setup => self.handle_setup_key(key.code)?,
-                            AppMode::PathManage => self.handle_path_manage_key(key.code),
-                            AppMode::Search => self.handle_search_key(key.code),
-                            AppMode::IntervalEdit => self.handle_interval_key(key.code),
-                            AppMode::ThemeSelect => self.handle_theme_select_key(key.code),
-                            AppMode::Wallpaper => {
-                                if self.handle_wallpaper_key(key.code)? {
-                                    return Ok(());
+                        if self.overlay.is_some() {
+                            self.handle_overlay_key(key.code);
+                        } else {
+                            match self.mode {
+                                AppMode::Setup => self.handle_setup_key(key.code)?,
+                                AppMode::PathManage => self.handle_path_manage_key(key.code),
+                                AppMode::Search => self.handle_search_key(key.code),
+                                AppMode::IntervalEdit => self.handle_interval_key(key.code),
+                                AppMode::ThemeSelect => self.handle_theme_select_key(key.code),
+                                AppMode::Wallpaper => {
+                                    if self.handle_wallpaper_key(key.code)? {
+                                        return Ok(());
+                                    }
                                 }
                             }
                         }
@@ -343,6 +354,7 @@ impl App {
     fn handle_wallpaper_key(&mut self, key: KeyCode) -> io::Result<bool> {
         match key {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+            KeyCode::Char('?') => self.overlay = Some(Overlay::Shortcuts),
             KeyCode::Char('p') => self.mode = AppMode::PathManage,
             KeyCode::Char('r') => self.select_random_wallpaper()?,
             KeyCode::Char('t') => self.open_theme_picker(),
@@ -411,6 +423,12 @@ impl App {
             }
             KeyCode::Char(c) if c.is_ascii_digit() => self.interval_buffer.push(c),
             _ => {}
+        }
+    }
+
+    fn handle_overlay_key(&mut self, key: KeyCode) {
+        if matches!(key, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
+            self.overlay = None;
         }
     }
 
@@ -871,6 +889,10 @@ impl App {
         }
 
         self.render_help(frame, chunks[1], theme);
+
+        if self.overlay == Some(Overlay::Shortcuts) {
+            self.render_shortcuts_overlay(frame, theme);
+        }
     }
 
     fn themed_block<'a>(&self, title: &'a str, theme: ThemePalette) -> Block<'a> {
@@ -1138,70 +1160,13 @@ impl App {
     }
 
     fn render_help(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
-        let (mode_text, controls) = match self.mode {
-            AppMode::Setup => (
-                " Setup ",
-                vec![
-                    ("type", "enter path"),
-                    ("↑/↓", "navigate"),
-                    ("Tab", "select"),
-                    ("Enter", "add path"),
-                ],
-            ),
-            AppMode::PathManage => (
-                " Path Manager ",
-                vec![
-                    ("p", "wallpapers"),
-                    ("a", "add path"),
-                    ("d", "remove"),
-                    ("↑/↓", "navigate"),
-                    ("t", "theme"),
-                ],
-            ),
-            AppMode::Search => (
-                " Search ",
-                vec![
-                    ("type", "filter"),
-                    ("Enter", "confirm"),
-                    ("Esc", "cancel"),
-                ],
-            ),
-            AppMode::IntervalEdit => (
-                " Rotation Interval ",
-                vec![
-                    ("type", "seconds"),
-                    ("Enter", "save"),
-                    ("Esc", "cancel"),
-                ],
-            ),
-            AppMode::ThemeSelect => (
-                " Theme Picker ",
-                vec![
-                    ("↑/↓/j/k", "preview"),
-                    ("g/G", "top/bottom"),
-                    ("Enter", "confirm"),
-                    ("Esc/q", "cancel"),
-                ],
-            ),
-            AppMode::Wallpaper => (
-                " Wallpapers ",
-                vec![
-                    ("Tab/l", "next section"),
-                    ("S-Tab/h", "prev section"),
-                    ("/", "filter"),
-                    ("f", "favorite"),
-                    ("y", "rotation"),
-                    ("i", "interval"),
-                    ("s", "sort"),
-                    ("r", "random"),
-                    ("↑/↓/j/k", "navigate"),
-                    ("g/G", "top/bottom"),
-                    ("Enter", "apply"),
-                    ("p", "paths"),
-                    ("t", "theme"),
-                    ("q", "quit"),
-                ],
-            ),
+        let mode_text = match self.mode {
+            AppMode::Setup => " Setup ",
+            AppMode::PathManage => " Path Manager ",
+            AppMode::Search => " Search ",
+            AppMode::IntervalEdit => " Rotation Interval ",
+            AppMode::ThemeSelect => " Theme Picker ",
+            AppMode::Wallpaper => " Wallpapers ",
         };
 
         let mut spans = vec![
@@ -1221,12 +1186,15 @@ impl App {
             spans.push(Span::raw(" | "));
         }
 
-        for (key, action) in controls {
-            spans.push(Span::styled(key, theme.key));
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(action, theme.muted));
-            spans.push(Span::raw(" | "));
-        }
+        let hint = match self.mode {
+            AppMode::Setup => "Type a path and press Enter",
+            AppMode::PathManage => "a add path | d remove path",
+            AppMode::Search => "Type to filter | Enter confirm | Esc cancel",
+            AppMode::IntervalEdit => "Type seconds | Enter save | Esc cancel",
+            AppMode::ThemeSelect => "Enter confirm | Esc cancel",
+            AppMode::Wallpaper => "? shortcuts | y rotation | i interval",
+        };
+        spans.push(Span::styled(hint, theme.muted));
 
         frame.render_widget(
             Para::new(Line::from(spans))
@@ -1239,11 +1207,7 @@ impl App {
     fn render_search_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
         let popup = centered_rect(60, 5, area);
         frame.render_widget(Clear, popup);
-        let text = if self.search_buffer.is_empty() {
-            "/"
-        } else {
-            ""
-        };
+        let text = if self.search_buffer.is_empty() { "/" } else { "" };
         let input = Para::new(Line::from(vec![
             Span::styled("/", theme.key),
             Span::styled(format!("{}{}", self.search_buffer, text), theme.accent),
@@ -1268,6 +1232,88 @@ impl App {
         .block(self.themed_block(" Edit Rotation Interval ", theme))
         .alignment(Alignment::Left);
         frame.render_widget(input, popup);
+    }
+
+    fn render_shortcuts_overlay(&self, frame: &mut Frame, theme: ThemePalette) {
+        let popup = centered_rect(62, 16, frame.area());
+        let block = self.themed_block(" Shortcuts ", theme).style(theme.surface);
+        let inner = block.inner(popup);
+
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("Move", theme.title),
+                Span::raw("        "),
+                Span::styled("↑/↓ or j/k", theme.key),
+                Span::raw(" navigate"),
+            ]),
+            Line::from(vec![
+                Span::styled("Sections", theme.title),
+                Span::raw("    "),
+                Span::styled("Tab/l", theme.key),
+                Span::raw(" next  "),
+                Span::styled("S-Tab/h", theme.key),
+                Span::raw(" previous"),
+            ]),
+            Line::from(vec![
+                Span::styled("Jump", theme.title),
+                Span::raw("        "),
+                Span::styled("g/G", theme.key),
+                Span::raw(" top/bottom"),
+            ]),
+            Line::from(vec![
+                Span::styled("Apply", theme.title),
+                Span::raw("       "),
+                Span::styled("Enter", theme.key),
+                Span::raw(" set wallpaper"),
+            ]),
+            Line::from(vec![
+                Span::styled("Filter", theme.title),
+                Span::raw("      "),
+                Span::styled("/", theme.key),
+                Span::raw(" filter active section"),
+            ]),
+            Line::from(vec![
+                Span::styled("Favorite", theme.title),
+                Span::raw("    "),
+                Span::styled("f", theme.key),
+                Span::raw(" toggle favorite"),
+            ]),
+            Line::from(vec![
+                Span::styled("Rotation", theme.title),
+                Span::raw("    "),
+                Span::styled("y", theme.key),
+                Span::raw(" toggle rotation  "),
+                Span::styled("i", theme.key),
+                Span::raw(" interval"),
+            ]),
+            Line::from(vec![
+                Span::styled("Sort", theme.title),
+                Span::raw("        "),
+                Span::styled("s", theme.key),
+                Span::raw(" toggle sort  "),
+                Span::styled("r", theme.key),
+                Span::raw(" random"),
+            ]),
+            Line::from(vec![
+                Span::styled("Manage", theme.title),
+                Span::raw("      "),
+                Span::styled("p", theme.key),
+                Span::raw(" paths  "),
+                Span::styled("t", theme.key),
+                Span::raw(" theme  "),
+                Span::styled("q", theme.key),
+                Span::raw(" quit"),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("? / Esc / q", theme.key),
+                Span::raw(" close"),
+            ]),
+        ];
+
+        frame.render_widget(Clear, popup);
+        frame.render_widget(block, popup);
+        frame.render_widget(Para::new(lines).alignment(Alignment::Left), inner);
     }
 
     fn render_metadata(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
