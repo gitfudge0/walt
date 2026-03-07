@@ -4,6 +4,8 @@ Walt is a fast terminal wallpaper picker for Hyprland. Browse your library, prev
 
 ![Walt banner](assets/walt-banner.jpg)
 
+![Walt screenshot](assets/screenshot.png)
+
 ## Why Walt
 
 - Stay in the terminal while browsing and applying wallpapers
