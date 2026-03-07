@@ -221,7 +221,6 @@ impl Config {
             _ => self.all_sort = value,
         }
     }
-
     pub fn is_empty(&self) -> bool {
         self.wallpaper_paths.is_empty()
     }
