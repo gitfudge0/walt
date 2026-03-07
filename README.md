@@ -52,12 +52,15 @@ For Ghostty:
 
 ```conf
 bind = $mainMod SHIFT, D, exec, ghostty --class=walt -e ~/.local/bin/walt
+bind = $mainMod, D, exec, ~/.local/bin/walt --random
 windowrulev2 = float, class:^(com\.mitchellh\.ghostty\.walt)$
 windowrulev2 = size 900 600, class:^(com\.mitchellh\.ghostty\.walt)$
 windowrulev2 = center, class:^(com\.mitchellh\.ghostty\.walt)$
 ```
 
-`install.sh` detects your current terminal and prints matching launch instructions for Ghostty, WezTerm, or Kitty.
+`$mainMod + Shift + D` opens the Walt TUI. `$mainMod + D` applies a random wallpaper immediately.
+
+`install.sh` detects your current terminal and prints matching launch instructions for Ghostty, WezTerm, or Kitty, including the random-wallpaper bind.
 
 Make sure `hyprpaper` is running:
 
@@ -74,6 +77,14 @@ exec-once = hyprpaper
 Walt stores config in `~/.config/walt/` and automatically reads legacy settings from `~/.config/wallpaper-switcher/`.
 
 ## Usage
+
+CLI mode:
+
+```bash
+walt --random
+```
+
+This picks one random wallpaper from all configured directories combined and applies it through `hyprpaper`, without opening the TUI.
 
 In the wallpaper browser:
 

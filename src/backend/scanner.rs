@@ -67,3 +67,45 @@ pub fn scan_directory(dir: &Path) -> Vec<PathBuf> {
     });
     dirs
 }
+
+#[cfg(test)]
+mod tests {
+    use super::scan_wallpapers_from_paths;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn make_temp_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("walt-scanner-test-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn scans_wallpapers_from_all_configured_paths_as_one_list() {
+        let root = make_temp_dir();
+        let first = root.join("first");
+        let second = root.join("second");
+        fs::create_dir_all(&first).expect("create first source");
+        fs::create_dir_all(&second).expect("create second source");
+
+        let first_wallpaper = first.join("alpha.jpg");
+        let second_wallpaper = second.join("beta.png");
+        fs::write(&first_wallpaper, b"not-an-image-but-valid-extension").expect("write first");
+        fs::write(&second_wallpaper, b"not-an-image-but-valid-extension").expect("write second");
+
+        let wallpapers = scan_wallpapers_from_paths(&[first.clone(), second.clone()]);
+
+        assert_eq!(wallpapers.len(), 2);
+        assert!(wallpapers.iter().any(|wallpaper| wallpaper.path == first_wallpaper));
+        assert!(wallpapers.iter().any(|wallpaper| wallpaper.path == second_wallpaper));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+}

@@ -47,8 +47,7 @@ pub fn set_wallpaper(wallpaper_path: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to preload wallpaper: {}", e))?;
 
     if !preload_output.status.success() {
-        let stderr = String::from_utf8_lossy(&preload_output.stderr);
-        return Err(anyhow::anyhow!("Preload failed: {}", stderr));
+        return Err(command_failure("Preload failed", &preload_output));
     }
 
     // Get monitors and set wallpaper for each
@@ -65,13 +64,29 @@ pub fn set_wallpaper(wallpaper_path: &str) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("Failed to set wallpaper: {}", e))?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             eprintln!(
                 "Warning: Failed to set wallpaper for {}: {}",
-                monitor.name, stderr
+                monitor.name,
+                command_failure("wallpaper command failed", &output)
             );
         }
     }
 
     Ok(())
+}
+
+fn command_failure(context: &str, output: &std::process::Output) -> anyhow::Error {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let mut details = format!("status {}", output.status);
+
+    if !stderr.is_empty() {
+        details.push_str(&format!(", stderr: {stderr}"));
+    }
+
+    if !stdout.is_empty() {
+        details.push_str(&format!(", stdout: {stdout}"));
+    }
+
+    anyhow::anyhow!("{context}: {details}")
 }
