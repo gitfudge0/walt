@@ -33,6 +33,7 @@ enum AppMode {
     PathManage,
     Wallpaper,
     Search,
+    IntervalEdit,
     ThemeSelect,
 }
 
@@ -145,6 +146,7 @@ pub struct App {
     index_rx: Receiver<IndexResponse>,
     search_buffer: String,
     search_before_open: String,
+    interval_buffer: String,
     input_buffer: String,
     all_filter: String,
     favorites_filter: String,
@@ -205,6 +207,7 @@ impl App {
             index_rx,
             search_buffer: String::new(),
             search_before_open: String::new(),
+            interval_buffer: String::new(),
             input_buffer: String::new(),
             all_filter: String::new(),
             favorites_filter: String::new(),
@@ -263,6 +266,7 @@ impl App {
                             AppMode::Setup => self.handle_setup_key(key.code)?,
                             AppMode::PathManage => self.handle_path_manage_key(key.code),
                             AppMode::Search => self.handle_search_key(key.code),
+                            AppMode::IntervalEdit => self.handle_interval_key(key.code),
                             AppMode::ThemeSelect => self.handle_theme_select_key(key.code),
                             AppMode::Wallpaper => {
                                 if self.handle_wallpaper_key(key.code)? {
@@ -342,6 +346,8 @@ impl App {
             KeyCode::Char('r') => self.select_random_wallpaper()?,
             KeyCode::Char('t') => self.open_theme_picker(),
             KeyCode::Char('f') => self.toggle_favorite(),
+            KeyCode::Char('y') => self.toggle_rotation(),
+            KeyCode::Char('i') => self.open_interval_editor(),
             KeyCode::Char('s') => self.toggle_sort_mode(),
             KeyCode::Char('/') => self.open_search(),
             KeyCode::Tab => self.next_section(),
@@ -383,6 +389,26 @@ impl App {
                 self.ensure_section_selection();
                 self.request_preview_load();
             }
+            _ => {}
+        }
+    }
+
+    fn handle_interval_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => self.mode = AppMode::Wallpaper,
+            KeyCode::Enter => {
+                if let Ok(seconds) = self.interval_buffer.parse::<u64>() {
+                    if seconds > 0 {
+                        self.config.rotation_interval_secs = seconds;
+                        let _ = self.config.save();
+                    }
+                }
+                self.mode = AppMode::Wallpaper;
+            }
+            KeyCode::Backspace => {
+                self.interval_buffer.pop();
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() => self.interval_buffer.push(c),
             _ => {}
         }
     }
@@ -437,6 +463,7 @@ impl App {
                 }
             }
             AppMode::Search => {}
+            AppMode::IntervalEdit => {}
             AppMode::ThemeSelect => self.confirm_theme_picker(),
             AppMode::PathManage => {}
         }
@@ -475,6 +502,7 @@ impl App {
                 }
             }
             AppMode::Search => {}
+            AppMode::IntervalEdit => {}
         }
     }
 
@@ -513,6 +541,7 @@ impl App {
                 }
             }
             AppMode::Search => {}
+            AppMode::IntervalEdit => {}
         }
     }
 
@@ -535,6 +564,7 @@ impl App {
                 }
             }
             AppMode::Search => {}
+            AppMode::IntervalEdit => {}
         }
     }
 
@@ -564,6 +594,7 @@ impl App {
                 }
             }
             AppMode::Search => {}
+            AppMode::IntervalEdit => {}
         }
     }
 
@@ -601,6 +632,16 @@ impl App {
         self.ensure_section_selection();
     }
 
+    fn toggle_rotation(&mut self) {
+        let Some(path) = self.current_selected_wallpaper().map(|wallpaper| wallpaper.path.clone()) else {
+            return;
+        };
+
+        self.config.toggle_rotation(&path);
+        let _ = self.config.save();
+        self.ensure_section_selection();
+    }
+
     fn toggle_sort_mode(&mut self) {
         let next = self.sort_mode(self.active_section).toggle();
         self.config
@@ -614,6 +655,11 @@ impl App {
         self.search_buffer = self.active_filter().to_string();
         self.search_before_open = self.search_buffer.clone();
         self.mode = AppMode::Search;
+    }
+
+    fn open_interval_editor(&mut self) {
+        self.interval_buffer = self.config.rotation_interval_secs.to_string();
+        self.mode = AppMode::IntervalEdit;
     }
 
     fn section_state_mut(&mut self, section: SectionKind) -> &mut ListState {
@@ -641,11 +687,7 @@ impl App {
             .filter(|(_, wallpaper)| match section {
                 SectionKind::All => true,
                 SectionKind::Favorites => self.config.is_favorite(&wallpaper.path),
-                SectionKind::Rotation => self
-                    .config
-                    .rotation
-                    .iter()
-                    .any(|path| path == &wallpaper.path),
+                SectionKind::Rotation => self.config.is_in_rotation(&wallpaper.path),
             })
             .filter(|(_, wallpaper)| {
                 if filter.is_empty() {
@@ -810,6 +852,20 @@ impl App {
                 if self.mode == AppMode::Search {
                     self.render_search_overlay(frame, chunks[0], theme);
                 }
+            }
+            AppMode::IntervalEdit => {
+                let main_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+                    .split(chunks[0]);
+                let preview_area = self.themed_block(" Preview ", theme).inner(main_chunks[1]);
+                if preview_area != self.preview_area {
+                    self.preview_area = preview_area;
+                    self.request_preview_load();
+                }
+                self.render_library_sections(frame, main_chunks[0], theme);
+                self.render_preview(frame, main_chunks[1], theme);
+                self.render_interval_overlay(frame, chunks[0], theme);
             }
         }
 
@@ -1023,9 +1079,14 @@ impl App {
             })
             .collect::<Vec<_>>();
         let title = format!(
-            "{} [{}]",
+            "{} [{}{}]",
             section.title().trim(),
-            self.sort_mode(section).label()
+            self.sort_mode(section).label(),
+            if section == SectionKind::Rotation {
+                format!(" · {}s", self.config.rotation_interval_secs)
+            } else {
+                String::new()
+            }
         );
         let mut list_state = state.clone();
         let block = Block::default()
@@ -1097,6 +1158,14 @@ impl App {
                     ("Esc", "cancel"),
                 ],
             ),
+            AppMode::IntervalEdit => (
+                " Rotation Interval ",
+                vec![
+                    ("type", "seconds"),
+                    ("Enter", "save"),
+                    ("Esc", "cancel"),
+                ],
+            ),
             AppMode::ThemeSelect => (
                 " Theme Picker ",
                 vec![
@@ -1112,6 +1181,8 @@ impl App {
                     ("Tab", "section"),
                     ("/", "filter"),
                     ("f", "favorite"),
+                    ("y", "rotation"),
+                    ("i", "interval"),
                     ("s", "sort"),
                     ("r", "random"),
                     ("↑/↓/j/k", "navigate"),
@@ -1169,6 +1240,23 @@ impl App {
             Span::styled(format!("{}{}", self.search_buffer, text), theme.accent),
         ]))
         .block(self.themed_block(" Filter Active Section ", theme))
+        .alignment(Alignment::Left);
+        frame.render_widget(input, popup);
+    }
+
+    fn render_interval_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
+        let popup = centered_rect(60, 5, area);
+        frame.render_widget(Clear, popup);
+        let text = if self.interval_buffer.is_empty() {
+            self.config.rotation_interval_secs.to_string()
+        } else {
+            self.interval_buffer.clone()
+        };
+        let input = Para::new(Line::from(vec![
+            Span::styled("Seconds: ", theme.key),
+            Span::styled(text, theme.accent),
+        ]))
+        .block(self.themed_block(" Edit Rotation Interval ", theme))
         .alignment(Alignment::Left);
         frame.render_widget(input, popup);
     }
