@@ -90,7 +90,13 @@ In the wallpaper browser:
 
 - `↑/↓` or `j/k` to move
 - `g/G` to jump to the top or bottom
+- `Tab` / `Shift+Tab` to switch between `All`, `Favorites`, and `Rotation`
 - `Enter` to apply the selected wallpaper
+- `/` to filter the active section
+- `s` to toggle sorting for the active section between name and modification date
+- `f` to add or remove the selected wallpaper from favorites
+- `y` to add or remove the selected wallpaper from rotation
+- `i` to change the rotation interval in seconds
 - `r` to pick and apply a random wallpaper
 - `p` to manage wallpaper paths
 - `t` to open the theme picker
