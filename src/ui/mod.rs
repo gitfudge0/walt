@@ -17,6 +17,7 @@ use ratatui::{
 };
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol, Resize, StatefulImage};
 use std::{
+    collections::HashSet,
     io,
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
@@ -154,6 +155,12 @@ pub struct App {
     search_buffer: String,
     search_before_open: String,
     interval_buffer: String,
+    all_indices: Vec<usize>,
+    favorites_indices: Vec<usize>,
+    rotation_indices: Vec<usize>,
+    favorite_paths: HashSet<PathBuf>,
+    rotation_paths: HashSet<PathBuf>,
+    last_preview_target: Option<(PathBuf, Rect)>,
     input_buffer: String,
     all_filter: String,
     favorites_filter: String,
@@ -216,6 +223,12 @@ impl App {
             search_buffer: String::new(),
             search_before_open: String::new(),
             interval_buffer: String::new(),
+            all_indices: vec![],
+            favorites_indices: vec![],
+            rotation_indices: vec![],
+            favorite_paths: HashSet::new(),
+            rotation_paths: HashSet::new(),
+            last_preview_target: None,
             input_buffer: String::new(),
             all_filter: String::new(),
             favorites_filter: String::new(),
@@ -224,6 +237,7 @@ impl App {
             suggestion_state,
         };
 
+        app.rebuild_section_cache();
         app.ensure_section_selection();
 
         if !app.config.is_empty() {
@@ -648,6 +662,7 @@ impl App {
 
         self.config.toggle_favorite(&path);
         let _ = self.config.save();
+        self.rebuild_section_cache();
         self.ensure_section_selection();
     }
 
@@ -658,7 +673,9 @@ impl App {
 
         self.config.toggle_rotation(&path);
         let _ = self.config.save();
+        self.rebuild_section_cache();
         self.ensure_section_selection();
+        self.request_preview_load();
     }
 
     fn toggle_sort_mode(&mut self) {
@@ -698,17 +715,17 @@ impl App {
     }
 
     fn section_indices(&self, section: SectionKind) -> Vec<usize> {
+        let base_indices = match section {
+            SectionKind::All => &self.all_indices,
+            SectionKind::Favorites => &self.favorites_indices,
+            SectionKind::Rotation => &self.rotation_indices,
+        };
         let filter = self.filter_query(section).to_lowercase();
-        let mut indices = self
-            .wallpapers
+        let mut indices = base_indices
             .iter()
-            .enumerate()
-            .filter(|(_, wallpaper)| match section {
-                SectionKind::All => true,
-                SectionKind::Favorites => self.config.is_favorite(&wallpaper.path),
-                SectionKind::Rotation => self.config.is_in_rotation(&wallpaper.path),
-            })
-            .filter(|(_, wallpaper)| {
+            .copied()
+            .filter(|index| {
+                let wallpaper = &self.wallpapers[*index];
                 if filter.is_empty() {
                     true
                 } else {
@@ -720,7 +737,6 @@ impl App {
                             .contains(&filter)
                 }
             })
-            .map(|(index, _)| index)
             .collect::<Vec<_>>();
         let sort_mode = self.sort_mode(section);
         indices.sort_by(|left, right| {
@@ -762,6 +778,24 @@ impl App {
             SectionKind::All => self.all_filter = value,
             SectionKind::Favorites => self.favorites_filter = value,
             SectionKind::Rotation => self.rotation_filter = value,
+        }
+    }
+
+    fn rebuild_section_cache(&mut self) {
+        self.favorite_paths = self.config.favorites.iter().cloned().collect();
+        self.rotation_paths = self.config.rotation.iter().cloned().collect();
+        self.all_indices.clear();
+        self.favorites_indices.clear();
+        self.rotation_indices.clear();
+
+        for (index, wallpaper) in self.wallpapers.iter().enumerate() {
+            self.all_indices.push(index);
+            if self.favorite_paths.contains(&wallpaper.path) {
+                self.favorites_indices.push(index);
+            }
+            if self.rotation_paths.contains(&wallpaper.path) {
+                self.rotation_indices.push(index);
+            }
         }
     }
 
@@ -810,9 +844,11 @@ impl App {
     fn refresh_wallpapers(&mut self) {
         if self.config.is_empty() {
             self.wallpapers.clear();
+            self.rebuild_section_cache();
             self.mode = AppMode::Setup;
         } else {
             self.wallpapers = self.wallpaper_index.load(&self.config.wallpaper_paths);
+            self.rebuild_section_cache();
             self.path_state.select(if self.config.wallpaper_paths.is_empty() {
                 None
             } else {
@@ -1093,7 +1129,7 @@ impl App {
             .iter()
             .filter_map(|index| self.wallpapers.get(*index))
             .map(|wallpaper| {
-                let marker = if self.config.is_favorite(&wallpaper.path) {
+                let marker = if self.favorite_paths.contains(&wallpaper.path) {
                     "★ "
                 } else {
                     ""
@@ -1372,8 +1408,15 @@ impl App {
             .map(|wallpaper| wallpaper.path.clone())
         else {
             self.current_image = None;
+            self.last_preview_target = None;
             return;
         };
+
+        let target = (image_path.clone(), self.preview_area);
+        if self.last_preview_target.as_ref() == Some(&target) {
+            return;
+        }
+        self.last_preview_target = Some(target);
 
         self.preview_request_id = self.preview_request_id.wrapping_add(1);
         let _ = self.preview_tx.send(PreviewRequest {
@@ -1424,6 +1467,7 @@ impl App {
                 Ok(response) if response.request_id == self.index_request_id => {
                     if let Ok(wallpapers) = response.wallpapers {
                         self.wallpapers = wallpapers;
+                        self.rebuild_section_cache();
                         self.ensure_section_selection();
                         self.request_preview_load();
                     }
