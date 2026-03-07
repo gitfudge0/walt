@@ -92,7 +92,6 @@ In the wallpaper browser:
 - `Tab` or `l` to move to the next section
 - `Shift+Tab` or `h` to move to the previous section
 - `g/G` to jump to the top or bottom
-- `Tab` / `Shift+Tab` to switch between `All`, `Favorites`, and `Rotation`
 - `Enter` to apply the selected wallpaper
 - `/` to filter the active section
 - `s` to toggle sorting for the active section between name and modification date

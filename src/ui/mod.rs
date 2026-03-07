@@ -426,7 +426,7 @@ impl App {
             KeyCode::Enter => {
                 if let Ok(seconds) = self.interval_buffer.parse::<u64>() {
                     if seconds > 0 {
-                        self.config.rotation_interval_secs = seconds;
+                        self.config.set_rotation_interval_secs(seconds);
                         let _ = self.config.save();
                     }
                 }
