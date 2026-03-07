@@ -89,6 +89,8 @@ This picks one random wallpaper from all configured directories combined and app
 In the wallpaper browser:
 
 - `↑/↓` or `j/k` to move
+- `Tab` or `l` to move to the next section
+- `Shift+Tab` or `h` to move to the previous section
 - `g/G` to jump to the top or bottom
 - `Tab` / `Shift+Tab` to switch between `All`, `Favorites`, and `Rotation`
 - `Enter` to apply the selected wallpaper
