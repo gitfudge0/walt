@@ -72,6 +72,10 @@ pub fn uninstall_rotation_service() -> Result<()> {
     Ok(())
 }
 
+pub fn rotation_service_file_path() -> Result<PathBuf> {
+    service_file_path()
+}
+
 pub fn get_rotation_service_status() -> Result<RotationServiceStatus> {
     let config = Config::new();
     let service_file = service_file_path()?;
