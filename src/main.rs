@@ -4,18 +4,21 @@ mod config;
 mod ui;
 
 use std::env;
+use std::io::{self, BufRead, IsTerminal, Write};
 
 use anyhow::{bail, Context, Result};
 use rand::seq::SliceRandom;
 
 const ROTATION_OPTIONS: &str = "install, enable, disable, uninstall, status, interval";
 const ROTATION_USAGE: &str = "walt rotation <install|enable|disable|uninstall|status|interval>";
+const UNINSTALL_USAGE: &str = "walt uninstall [--yes]";
 
 #[derive(Debug, Eq, PartialEq)]
 enum CliCommand {
     LaunchUi,
     Help,
     Random,
+    Uninstall { yes: bool },
     RotateDaemon,
     Rotation(RotationCommand),
 }
@@ -41,6 +44,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         CliCommand::Random => return print_random_wallpaper(),
+        CliCommand::Uninstall { yes } => return run_uninstall(yes),
         CliCommand::RotateDaemon => return backend::run_rotation_daemon(),
         CliCommand::Rotation(command) => {
             match command {
@@ -82,6 +86,9 @@ fn parse_command(args: &[&str]) -> Result<CliCommand> {
         [] => Ok(CliCommand::LaunchUi),
         ["random"] => Ok(CliCommand::Random),
         ["random", ..] => bail!("Usage: walt random"),
+        ["uninstall"] => Ok(CliCommand::Uninstall { yes: false }),
+        ["uninstall", "--yes"] | ["uninstall", "-y"] => Ok(CliCommand::Uninstall { yes: true }),
+        ["uninstall", ..] => bail!("Usage: {UNINSTALL_USAGE}"),
         ["rotation"] => bail!("Missing rotation option. Valid options: {ROTATION_OPTIONS}"),
         ["rotation", "interval"] => bail!("Usage: walt rotation interval <seconds>"),
         ["rotation", "interval", seconds] => Ok(CliCommand::Rotation(RotationCommand::Interval(
@@ -136,6 +143,71 @@ fn print_random_wallpaper() -> Result<()> {
     Ok(())
 }
 
+fn run_uninstall(yes: bool) -> Result<()> {
+    let paths = backend::uninstall_paths()?;
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let stdin_is_terminal = stdin.is_terminal();
+    let stdout_is_terminal = stdout.is_terminal();
+    let mut stdin_lock = stdin.lock();
+    let mut stdout_lock = stdout.lock();
+    let confirmed = confirm_uninstall_with_io(
+        yes,
+        &paths,
+        stdin_is_terminal,
+        stdout_is_terminal,
+        &mut stdin_lock,
+        &mut stdout_lock,
+    )?;
+
+    if !confirmed {
+        println!("Walt uninstall cancelled.");
+        return Ok(());
+    }
+
+    let report = backend::uninstall_walt()?;
+    println!("{}", report.summary());
+    Ok(())
+}
+
+fn confirm_uninstall_with_io<R, W>(
+    yes: bool,
+    paths: &backend::UninstallPaths,
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+    input: &mut R,
+    output: &mut W,
+) -> Result<bool>
+where
+    R: BufRead,
+    W: Write,
+{
+    if yes {
+        return Ok(true);
+    }
+
+    if !(stdin_is_terminal && stdout_is_terminal) {
+        bail!("walt uninstall requires confirmation in an interactive terminal. Re-run with `walt uninstall --yes`.");
+    }
+
+    writeln!(output, "This will remove Walt from this system:")?;
+    writeln!(
+        output,
+        "  - rotation service: {}",
+        paths.service_file.display()
+    )?;
+    writeln!(output, "  - config: {}", paths.config_dir.display())?;
+    writeln!(output, "  - cache: {}", paths.cache_dir.display())?;
+    writeln!(output, "  - binary: {}", paths.binary_path.display())?;
+    write!(output, "Continue? [y/N]: ")?;
+    output.flush()?;
+
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    let answer = answer.trim().to_ascii_lowercase();
+    Ok(matches!(answer.as_str(), "y" | "yes"))
+}
+
 fn print_usage() {
     println!("{}", usage_text());
 }
@@ -146,10 +218,12 @@ fn usage_text() -> String {
         "",
         "Usage:",
         "  walt random",
+        "  walt uninstall [--yes]",
         "  walt rotation <command>",
         "",
         "Commands:",
         "  random                    Apply a random wallpaper from the configured list",
+        "  uninstall [--yes]         Remove Walt service, config, cache, and ~/.local/bin/walt",
         "  rotation install          Install and start the persistent rotation service",
         "  rotation enable           Enable and start the installed rotation service",
         "  rotation disable          Disable and stop the installed rotation service",
@@ -159,6 +233,7 @@ fn usage_text() -> String {
         "",
         "Examples:",
         "  walt random",
+        "  walt uninstall --yes",
         "  walt rotation install",
         "  walt rotation interval 900",
         "  walt rotation status",
@@ -196,13 +271,51 @@ fn format_interval(seconds: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_command, usage_text, CliCommand, RotationCommand};
+    use super::{
+        confirm_uninstall_with_io, parse_command, usage_text, CliCommand, RotationCommand,
+    };
+    use crate::backend::UninstallPaths;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+
+    fn uninstall_paths() -> UninstallPaths {
+        UninstallPaths {
+            service_file: PathBuf::from("/tmp/walt-rotation.service"),
+            config_dir: PathBuf::from("/tmp/config/walt"),
+            cache_dir: PathBuf::from("/tmp/cache/walt"),
+            binary_path: PathBuf::from("/tmp/.local/bin/walt"),
+        }
+    }
 
     #[test]
     fn parses_random_command() {
         assert_eq!(
             parse_command(&["random"]).expect("command"),
             CliCommand::Random
+        );
+    }
+
+    #[test]
+    fn parses_uninstall_command() {
+        assert_eq!(
+            parse_command(&["uninstall"]).expect("command"),
+            CliCommand::Uninstall { yes: false }
+        );
+    }
+
+    #[test]
+    fn parses_uninstall_yes_long_flag() {
+        assert_eq!(
+            parse_command(&["uninstall", "--yes"]).expect("command"),
+            CliCommand::Uninstall { yes: true }
+        );
+    }
+
+    #[test]
+    fn parses_uninstall_yes_short_flag() {
+        assert_eq!(
+            parse_command(&["uninstall", "-y"]).expect("command"),
+            CliCommand::Uninstall { yes: true }
         );
     }
 
@@ -276,6 +389,12 @@ mod tests {
     }
 
     #[test]
+    fn rejects_uninstall_with_extra_arguments() {
+        let error = parse_command(&["uninstall", "extra"]).expect_err("extra args should fail");
+        assert_eq!(error.to_string(), "Usage: walt uninstall [--yes]");
+    }
+
+    #[test]
     fn rejects_rotation_option_with_extra_arguments() {
         let error =
             parse_command(&["rotation", "install", "extra"]).expect_err("extra args should fail");
@@ -308,10 +427,71 @@ mod tests {
         assert!(usage.contains("Usage:"));
         assert!(usage.contains("Commands:"));
         assert!(usage.contains("Examples:"));
+        assert!(usage.contains("walt uninstall [--yes]"));
         assert!(usage.contains("rotation interval <secs>"));
         assert!(!usage.contains("--random"));
         assert!(!usage.contains("--install-service"));
         assert!(!usage.contains("--service-status"));
         assert!(!usage.contains("--rotate-daemon"));
+    }
+
+    #[test]
+    fn accepts_uninstall_confirmation() {
+        let mut input = Cursor::new("yes\n");
+        let mut output = Vec::new();
+
+        let confirmed = confirm_uninstall_with_io(
+            false,
+            &uninstall_paths(),
+            true,
+            true,
+            &mut input,
+            &mut output,
+        )
+        .expect("confirmation");
+
+        assert!(confirmed);
+        let text = String::from_utf8(output).expect("utf8");
+        assert!(text.contains("This will remove Walt from this system:"));
+        assert!(text.contains("Continue? [y/N]: "));
+    }
+
+    #[test]
+    fn declines_uninstall_confirmation() {
+        let mut input = Cursor::new("n\n");
+        let mut output = Vec::new();
+
+        let confirmed = confirm_uninstall_with_io(
+            false,
+            &uninstall_paths(),
+            true,
+            true,
+            &mut input,
+            &mut output,
+        )
+        .expect("confirmation");
+
+        assert!(!confirmed);
+    }
+
+    #[test]
+    fn rejects_non_interactive_uninstall_without_yes() {
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let error = confirm_uninstall_with_io(
+            false,
+            &uninstall_paths(),
+            false,
+            false,
+            &mut input,
+            &mut output,
+        )
+        .expect_err("non-interactive uninstall should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "walt uninstall requires confirmation in an interactive terminal. Re-run with `walt uninstall --yes`."
+        );
     }
 }

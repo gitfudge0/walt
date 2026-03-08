@@ -1,20 +1,35 @@
 # Walt
 
-Walt is a fast terminal wallpaper picker for Hyprland. Browse your library, preview wallpapers in place, switch themes, and apply a new background without leaving the keyboard.
+Walt is a terminal wallpaper picker for Hyprland. It lets you browse, preview, apply, randomize, and rotate wallpapers without leaving the keyboard, using `hyprpaper` to set the background. The TUI stays focused on fast navigation through large wallpaper directories while still giving you themes and rotation controls when you need them.
 
 ![Walt banner](assets/walt-banner.jpg)
 
-## Why Walt
+## At a glance
 
-- Stay in the terminal while browsing and applying wallpapers
-- Preview wallpapers before committing to them
-- Keep large wallpaper directories manageable with fast navigation and random selection
-- Match the app to your setup with built-in themes, including a `System` theme that follows your terminal
-- Use it comfortably on multi-monitor Hyprland setups through `hyprpaper`
+- Browse and apply wallpapers from the terminal
+- Preview images in place before switching
+- Navigate large wallpaper libraries quickly
+- Use built-in themes, including `System`
+- Apply a random wallpaper with a single command
+- Install an optional background rotation service
+- Work with multi-monitor Hyprland setups through `hyprpaper`
 
 ![Walt screenshot](assets/screenshot.png)
 
-## Install
+## Quick Start
+
+### Requirements
+
+- `rust` and `cargo`
+- `hyprpaper`
+- `hyprctl`
+- an image-capable terminal:
+  - Ghostty
+  - Kitty
+  - WezTerm
+  - iTerm2
+
+### Install
 
 Quick install:
 
@@ -37,18 +52,15 @@ cargo build --release
 install -Dm755 target/release/walt ~/.local/bin/
 ```
 
-## Requirements
+### First run
 
-- `rust` and `cargo`
-- `hyprpaper`
-- `hyprctl`
-- a terminal with image protocol support
-  - Ghostty
-  - Kitty
-  - WezTerm
-  - iTerm2
+1. Launch `walt`.
+2. Paste the path to your wallpaper directory.
+3. Press `Enter`.
 
-## Hyprland setup
+Walt stores its config in `~/.config/walt/`. If you have older settings in `~/.config/wallpaper-switcher/`, Walt will read them automatically.
+
+### Hyprland example
 
 For Ghostty:
 
@@ -62,7 +74,7 @@ windowrulev2 = center, class:^(com\.mitchellh\.ghostty\.walt)$
 
 `$mainMod + Shift + D` opens the Walt TUI. `$mainMod + D` applies a random wallpaper immediately.
 
-`install.sh` detects your current terminal and prints matching launch instructions for Ghostty, WezTerm, or Kitty, including the random-wallpaper bind.
+`install.sh` detects Ghostty, WezTerm, or Kitty and prints matching launch instructions, including the random-wallpaper bind.
 
 Make sure `hyprpaper` is running:
 
@@ -70,37 +82,43 @@ Make sure `hyprpaper` is running:
 exec-once = hyprpaper
 ```
 
-## First run
+## CLI Commands
 
-1. Copy the path to your wallpaper directory.
-2. Launch Walt.
-3. Paste the directory path into the app and press `Enter`.
+### Open the TUI
 
-Walt stores config in `~/.config/walt/` and automatically reads legacy settings from `~/.config/wallpaper-switcher/`.
+```bash
+walt
+```
 
-## Usage
+Launch the wallpaper browser.
 
-CLI mode:
+### Apply a random wallpaper
 
 ```bash
 walt random
 ```
 
-This picks one random wallpaper from all configured directories combined and applies it through `hyprpaper`, without opening the TUI.
+This picks one random wallpaper from all configured directories and applies it without opening the TUI.
 
-To enable persistent auto-rotation, install the user service manually:
+### Manage the rotation service
 
 ```bash
 walt rotation install
-```
-
-Check whether it is running with:
-
-```bash
 walt rotation status
+walt rotation interval 900
+walt rotation disable
+walt rotation enable
+walt rotation uninstall
 ```
 
-Example output:
+- `install` installs and starts the user service
+- `status` shows the current service state
+- `interval 900` sets the rotation interval in seconds
+- `disable` stops the installed service
+- `enable` starts it again
+- `uninstall` removes it completely
+
+Example `status` output:
 
 ```text
 Rotation Service
@@ -112,63 +130,61 @@ Interval: 300s (5m)
 Entries:  12 wallpapers
 ```
 
-Set the rotation interval from the CLI with:
+Walt does not auto-rotate wallpapers while the TUI is open unless you install the background service.
+
+### Uninstall
 
 ```bash
-walt rotation interval 900
+walt uninstall
 ```
 
-Temporarily stop or restart the installed rotation service with:
+Prompts before removing the rotation service, config, cache, and installed `~/.local/bin/walt` binary.
+
+For non-interactive use:
 
 ```bash
-walt rotation disable
-walt rotation enable
+walt uninstall --yes
 ```
 
-Remove the installed service completely with:
+## Keyboard Controls
 
-```bash
-walt rotation uninstall
-```
+### Browser
 
-In the wallpaper browser:
+Walt opens with the current wallpaper selected in the `All` list when it is already indexed.
 
-- `↑/↓` or `j/k` to move
-- `Tab` or `l` to switch between the `All` and `Rotation` sections
-- `Shift+Tab` or `h` to switch to the previous section
-- `g/G` to jump to the top or bottom
-- Walt opens with the current wallpaper selected in the `All` list when it is indexed
-- `Enter` to apply the selected wallpaper
-- `/` to filter the active section
-- `s` to toggle sorting for the active section between name and modification date
-- `r` to add or remove the selected wallpaper from rotation
-- `Ctrl+r` to pick and apply a random wallpaper
-- `R` to open the rotation actions popup
-- `i` to change the interval used by the installed rotation service
-- `p` to manage wallpaper paths
-- `t` to open the theme picker
-- `?` to open the keybindings popup
-- `q` or `Esc` to quit
+- `↑/↓` or `j/k` move
+- `Tab` or `l` switch between `All` and `Rotation`
+- `Shift+Tab` or `h` switch to the previous section
+- `g/G` jump to the top or bottom
+- `Enter` apply the selected wallpaper
+- `/` filter the active section
+- `s` toggle sort for the active section between name and modification date
+- `r` add or remove the selected wallpaper from rotation
+- `Ctrl+r` pick and apply a random wallpaper
+- `R` open the rotation actions popup
+- `i` change the interval used by the installed rotation service
+- `p` manage wallpaper paths
+- `t` open the theme picker
+- `?` open the keybindings popup
+- `q` or `Esc` quit
 
-Walt does not auto-rotate wallpapers on its own while the TUI is open. Rotation only happens if you explicitly install the background service.
+### Path manager
 
-In the path manager:
+- `↑/↓` or `j/k` move
+- `a` add a path
+- `d` remove the selected path
+- `p`, `q`, or `Esc` return
+- `t` open the theme picker
 
-- `↑/↓` or `j/k` to move
-- `a` to add a path
-- `d` to remove the selected path
-- `p`, `q`, or `Esc` to return
-- `t` to open the theme picker
+### Theme picker
 
-In the theme picker:
-
-- `↑/↓` or `j/k` to preview themes
-- `Enter` to confirm
-- `Esc` or `q` to cancel
+- `↑/↓` or `j/k` preview themes
+- `Enter` confirm
+- `Esc` or `q` cancel
 
 ## Themes
 
-Included themes:
+Walt includes these themes:
 
 - `System`
 - `Catppuccin Mocha`
@@ -182,7 +198,7 @@ Included themes:
 - `Everforest Dark`
 - `Rosé Pine`
 
-`System` uses your terminal defaults. The other themes render with opaque surfaces for a cleaner in-app look.
+`System` uses your terminal defaults. The named themes use opaque surfaces for a cleaner in-app look.
 
 ## Build
 
