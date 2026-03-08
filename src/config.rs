@@ -14,11 +14,9 @@ const STATE_FILE: &str = "state.json";
 pub struct Config {
     pub wallpaper_paths: Vec<PathBuf>,
     pub theme_name: String,
-    pub favorites: Vec<PathBuf>,
     pub rotation: Vec<PathBuf>,
     pub rotation_interval_secs: u64,
     pub all_sort: String,
-    pub favorites_sort: String,
     pub rotation_sort: String,
 }
 
@@ -26,11 +24,9 @@ pub struct Config {
 struct ConfigFile {
     wallpaper_paths: Vec<PathBuf>,
     theme_name: String,
-    favorites: Vec<PathBuf>,
     rotation: Vec<PathBuf>,
     rotation_interval_secs: u64,
     all_sort: String,
-    favorites_sort: String,
     rotation_sort: String,
 }
 
@@ -69,11 +65,9 @@ impl Config {
         Self {
             wallpaper_paths,
             theme_name,
-            favorites: vec![],
             rotation: vec![],
             rotation_interval_secs: 300,
             all_sort: "name".to_string(),
-            favorites_sort: "name".to_string(),
             rotation_sort: "name".to_string(),
         }
     }
@@ -95,7 +89,6 @@ impl Config {
             } else {
                 state.theme_name
             },
-            favorites: state.favorites,
             rotation: state.rotation,
             rotation_interval_secs: if state.rotation_interval_secs == 0 {
                 300
@@ -103,7 +96,6 @@ impl Config {
                 state.rotation_interval_secs
             },
             all_sort: default_sort_name(state.all_sort),
-            favorites_sort: default_sort_name(state.favorites_sort),
             rotation_sort: default_sort_name(state.rotation_sort),
         }
     }
@@ -138,11 +130,9 @@ impl Config {
         let state = ConfigFile {
             wallpaper_paths: self.wallpaper_paths.clone(),
             theme_name: self.theme_name.clone(),
-            favorites: self.favorites.clone(),
             rotation: self.rotation.clone(),
             rotation_interval_secs: self.rotation_interval_secs,
             all_sort: default_sort_name(self.all_sort.clone()),
-            favorites_sort: default_sort_name(self.favorites_sort.clone()),
             rotation_sort: default_sort_name(self.rotation_sort.clone()),
         };
         fs::write(
@@ -173,22 +163,11 @@ impl Config {
 
     pub fn remove_path(&mut self, path: &PathBuf) {
         self.wallpaper_paths.retain(|entry| entry != path);
-        self.favorites.retain(|entry| entry != path);
         self.rotation.retain(|entry| entry != path);
     }
 
     pub fn set_theme<S: Into<String>>(&mut self, theme_name: S) {
         self.theme_name = theme_name.into();
-    }
-
-    pub fn toggle_favorite(&mut self, path: &PathBuf) -> bool {
-        if let Some(index) = self.favorites.iter().position(|entry| entry == path) {
-            self.favorites.remove(index);
-            false
-        } else {
-            self.favorites.push(path.clone());
-            true
-        }
     }
 
     pub fn toggle_rotation(&mut self, path: &PathBuf) -> bool {
@@ -207,7 +186,6 @@ impl Config {
 
     pub fn sort_name_for_section(&self, section: &str) -> &str {
         match section {
-            "favorites" => &self.favorites_sort,
             "rotation" => &self.rotation_sort,
             _ => &self.all_sort,
         }
@@ -216,7 +194,6 @@ impl Config {
     pub fn set_sort_name_for_section(&mut self, section: &str, value: &str) {
         let value = default_sort_name(value.to_string());
         match section {
-            "favorites" => self.favorites_sort = value,
             "rotation" => self.rotation_sort = value,
             _ => self.all_sort = value,
         }
@@ -246,19 +223,64 @@ fn default_sort_name(name: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::Config;
-    use std::path::PathBuf;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn test_config() -> Config {
         Config {
             wallpaper_paths: vec![],
             theme_name: "System".to_string(),
-            favorites: vec![],
             rotation: vec![],
             rotation_interval_secs: 300,
             all_sort: "name".to_string(),
-            favorites_sort: "name".to_string(),
             rotation_sort: "name".to_string(),
         }
+    }
+
+    #[test]
+    fn loads_legacy_state_file_with_favorites_fields() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "walt-config-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        let wallpaper_dir = temp_root.join("wallpapers");
+        fs::create_dir_all(&wallpaper_dir).expect("create wallpaper dir");
+
+        let state_file = temp_root.join("state.json");
+        fs::write(
+            &state_file,
+            format!(
+                r#"{{
+  "wallpaper_paths": ["{}"],
+  "theme_name": "Nord",
+  "favorites": ["/tmp/old-favorite.jpg"],
+  "rotation": ["/tmp/rotate.jpg"],
+  "rotation_interval_secs": 120,
+  "all_sort": "modified",
+  "favorites_sort": "name",
+  "rotation_sort": "modified"
+}}"#,
+                wallpaper_dir.display()
+            ),
+        )
+        .expect("write state file");
+
+        let config = Config::from_state_file(&state_file);
+
+        assert_eq!(config.wallpaper_paths, vec![wallpaper_dir.clone()]);
+        assert_eq!(config.theme_name, "Nord");
+        assert_eq!(config.rotation, vec![PathBuf::from("/tmp/rotate.jpg")]);
+        assert_eq!(config.rotation_interval_secs, 120);
+        assert_eq!(config.all_sort, "modified");
+        assert_eq!(config.rotation_sort, "modified");
+
+        fs::remove_dir_all(&temp_root).expect("cleanup temp root");
     }
 
     #[test]

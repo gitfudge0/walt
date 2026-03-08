@@ -52,21 +52,15 @@ enum AppMode {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SectionKind {
     All,
-    Favorites,
     Rotation,
 }
 
 impl SectionKind {
-    const ALL: [SectionKind; 3] = [
-        SectionKind::All,
-        SectionKind::Favorites,
-        SectionKind::Rotation,
-    ];
+    const ALL: [SectionKind; 2] = [SectionKind::All, SectionKind::Rotation];
 
     fn title(self) -> &'static str {
         match self {
             Self::All => " All ",
-            Self::Favorites => " Favorites ",
             Self::Rotation => " Rotation ",
         }
     }
@@ -74,7 +68,6 @@ impl SectionKind {
     fn key(self) -> &'static str {
         match self {
             Self::All => "all",
-            Self::Favorites => "favorites",
             Self::Rotation => "rotation",
         }
     }
@@ -183,7 +176,6 @@ pub struct App {
     wallpapers: Vec<IndexedWallpaper>,
     path_state: ListState,
     all_state: ListState,
-    favorites_state: ListState,
     rotation_state: ListState,
     theme_state: ListState,
     rotation_menu_state: ListState,
@@ -204,17 +196,14 @@ pub struct App {
     search_before_open: String,
     interval_buffer: String,
     all_indices: Vec<usize>,
-    favorites_indices: Vec<usize>,
     rotation_indices: Vec<usize>,
     active_wallpaper_paths: HashSet<PathBuf>,
-    favorite_paths: HashSet<PathBuf>,
     rotation_paths: HashSet<PathBuf>,
     last_preview_target: Option<(PathBuf, Rect)>,
     rotation_service_state: Option<RotationServiceStatus>,
     rotation_status_text: String,
     input_buffer: String,
     all_filter: String,
-    favorites_filter: String,
     rotation_filter: String,
     dir_suggestions: Vec<PathBuf>,
     suggestion_state: ListState,
@@ -257,7 +246,6 @@ impl App {
             wallpapers,
             path_state: ListState::default(),
             all_state: ListState::default(),
-            favorites_state: ListState::default(),
             rotation_state: ListState::default(),
             theme_state,
             rotation_menu_state,
@@ -278,17 +266,14 @@ impl App {
             search_before_open: String::new(),
             interval_buffer: String::new(),
             all_indices: vec![],
-            favorites_indices: vec![],
             rotation_indices: vec![],
             active_wallpaper_paths: HashSet::new(),
-            favorite_paths: HashSet::new(),
             rotation_paths: HashSet::new(),
             last_preview_target: None,
             rotation_service_state: None,
             rotation_status_text: String::new(),
             input_buffer: String::new(),
             all_filter: String::new(),
-            favorites_filter: String::new(),
             rotation_filter: String::new(),
             dir_suggestions: vec![],
             suggestion_state,
@@ -297,6 +282,7 @@ impl App {
         app.rebuild_section_cache();
         app.ensure_section_selection();
         app.refresh_active_wallpapers();
+        app.select_active_wallpaper_in_all();
         app.refresh_rotation_status();
 
         if !app.config.is_empty() {
@@ -431,7 +417,6 @@ impl App {
                 self.select_random_wallpaper()?
             }
             (KeyCode::Char('t'), KeyModifiers::NONE) => self.open_theme_picker(),
-            (KeyCode::Char('f'), KeyModifiers::NONE) => self.toggle_favorite(),
             (KeyCode::Char('i'), KeyModifiers::NONE) => self.open_interval_editor(),
             (KeyCode::Char('R'), KeyModifiers::SHIFT) => self.open_rotation_menu(),
             (KeyCode::Char('s'), KeyModifiers::NONE) => self.toggle_sort_mode(),
@@ -771,20 +756,6 @@ impl App {
         self.request_preview_load();
     }
 
-    fn toggle_favorite(&mut self) {
-        let Some(path) = self
-            .current_selected_wallpaper()
-            .map(|wallpaper| wallpaper.path.clone())
-        else {
-            return;
-        };
-
-        self.config.toggle_favorite(&path);
-        let _ = self.config.save();
-        self.rebuild_section_cache();
-        self.ensure_section_selection();
-    }
-
     fn toggle_rotation(&mut self) {
         let Some(path) = self
             .current_selected_wallpaper()
@@ -904,7 +875,6 @@ impl App {
     fn section_state_mut(&mut self, section: SectionKind) -> &mut ListState {
         match section {
             SectionKind::All => &mut self.all_state,
-            SectionKind::Favorites => &mut self.favorites_state,
             SectionKind::Rotation => &mut self.rotation_state,
         }
     }
@@ -912,7 +882,6 @@ impl App {
     fn section_state(&self, section: SectionKind) -> &ListState {
         match section {
             SectionKind::All => &self.all_state,
-            SectionKind::Favorites => &self.favorites_state,
             SectionKind::Rotation => &self.rotation_state,
         }
     }
@@ -920,7 +889,6 @@ impl App {
     fn section_indices(&self, section: SectionKind) -> Vec<usize> {
         let base_indices = match section {
             SectionKind::All => &self.all_indices,
-            SectionKind::Favorites => &self.favorites_indices,
             SectionKind::Rotation => &self.rotation_indices,
         };
         let filter = self.filter_query(section).to_lowercase();
@@ -967,7 +935,6 @@ impl App {
     fn filter_query(&self, section: SectionKind) -> &str {
         match section {
             SectionKind::All => &self.all_filter,
-            SectionKind::Favorites => &self.favorites_filter,
             SectionKind::Rotation => &self.rotation_filter,
         }
     }
@@ -979,23 +946,17 @@ impl App {
     fn set_active_filter(&mut self, value: String) {
         match self.active_section {
             SectionKind::All => self.all_filter = value,
-            SectionKind::Favorites => self.favorites_filter = value,
             SectionKind::Rotation => self.rotation_filter = value,
         }
     }
 
     fn rebuild_section_cache(&mut self) {
-        self.favorite_paths = self.config.favorites.iter().cloned().collect();
         self.rotation_paths = self.config.rotation.iter().cloned().collect();
         self.all_indices.clear();
-        self.favorites_indices.clear();
         self.rotation_indices.clear();
 
         for (index, wallpaper) in self.wallpapers.iter().enumerate() {
             self.all_indices.push(index);
-            if self.favorite_paths.contains(&wallpaper.path) {
-                self.favorites_indices.push(index);
-            }
             if self.rotation_paths.contains(&wallpaper.path) {
                 self.rotation_indices.push(index);
             }
@@ -1020,6 +981,19 @@ impl App {
         let selected = self.section_state(self.active_section).selected()?;
         let wallpaper_index = *indices.get(selected)?;
         self.wallpapers.get(wallpaper_index)
+    }
+
+    fn select_active_wallpaper_in_all(&mut self) {
+        let all_indices = self.section_indices(SectionKind::All);
+        let Some(selected) = first_active_visible_index(
+            &all_indices,
+            &self.wallpapers,
+            &self.active_wallpaper_paths,
+        ) else {
+            return;
+        };
+
+        self.all_state.select(Some(selected));
     }
 
     fn update_suggestions(&mut self) {
@@ -1059,6 +1033,7 @@ impl App {
                     Some(0)
                 });
             self.ensure_section_selection();
+            self.select_active_wallpaper_in_all();
             if self.current_selected_wallpaper().is_some() {
                 self.request_preview_load();
             }
@@ -1299,11 +1274,7 @@ impl App {
     fn render_library_sections(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
         let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(48),
-                Constraint::Percentage(26),
-                Constraint::Percentage(26),
-            ])
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
             .split(area);
 
         self.render_section(
@@ -1317,14 +1288,6 @@ impl App {
         self.render_section(
             frame,
             layout[1],
-            SectionKind::Favorites,
-            theme,
-            self.section_indices(SectionKind::Favorites),
-            &self.favorites_state,
-        );
-        self.render_section(
-            frame,
-            layout[2],
             SectionKind::Rotation,
             theme,
             self.section_indices(SectionKind::Rotation),
@@ -1352,9 +1315,6 @@ impl App {
                 SectionKind::All if self.filter_query(section).is_empty() => {
                     "No wallpapers indexed"
                 }
-                SectionKind::Favorites if self.filter_query(section).is_empty() => {
-                    "No favorites yet"
-                }
                 SectionKind::Rotation if self.filter_query(section).is_empty() => {
                     "Rotation list is empty"
                 }
@@ -1379,10 +1339,7 @@ impl App {
                     .map(|wallpaper| (visible_index, wallpaper))
             })
             .map(|(visible_index, wallpaper)| {
-                let marker = wallpaper_marker_prefix(
-                    self.favorite_paths.contains(&wallpaper.path),
-                    self.is_active_wallpaper(&wallpaper.path),
-                );
+                let marker = wallpaper_marker_prefix(self.is_active_wallpaper(&wallpaper.path));
                 let style = if selected == Some(visible_index) {
                     theme.highlight
                 } else {
@@ -1576,16 +1533,15 @@ impl App {
         let pairs = [
             (("Move", "↑/↓ or j/k"), ("Sections", "Tab/l, S-Tab/h")),
             (("Apply", "Enter"), ("Random", "Ctrl+r")),
-            (("Favorite", "f"), ("Rotation", "r")),
-            (("Rotation Menu", "R"), ("Interval", "i")),
-            (("Filter", "/"), ("Sort", "s")),
-            (("Paths", "p"), ("Theme", "t")),
-            (("Keybindings", "?"), ("Quit", "q / Esc")),
+            (("Rotation", "r"), ("Rotation Menu", "R")),
+            (("Interval", "i"), ("Filter", "/")),
+            (("Sort", "s"), ("Paths", "p")),
+            (("Theme", "t"), ("Keybindings", "?")),
+            (("Quit", "q / Esc"), ("Close", "? / Esc")),
         ];
         let left_label_width = pairs
             .iter()
             .map(|(left, _)| left.0.len())
-            .chain(std::iter::once("Close".len()))
             .max()
             .unwrap_or(0);
         let right_label_width = pairs
@@ -1599,7 +1555,7 @@ impl App {
             .max()
             .unwrap_or(0);
 
-        let mut lines = pairs
+        let lines = pairs
             .iter()
             .map(|(left, right)| {
                 Line::from(vec![
@@ -1613,12 +1569,6 @@ impl App {
                 ])
             })
             .collect::<Vec<_>>();
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled(format!("{:<left_label_width$}", "Close"), theme.key),
-            Span::raw("  "),
-            Span::styled("? / Esc", theme.accent),
-        ]));
 
         let body = Para::new(lines)
             .block(self.themed_block(" Keybindings ", theme))
@@ -1761,6 +1711,7 @@ impl App {
                         self.wallpapers = wallpapers;
                         self.rebuild_section_cache();
                         self.ensure_section_selection();
+                        self.select_active_wallpaper_in_all();
                         self.request_preview_load();
                     }
                 }
@@ -1882,6 +1833,19 @@ fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, popup_width, popup_height)
 }
 
+fn first_active_visible_index(
+    indices: &[usize],
+    wallpapers: &[IndexedWallpaper],
+    active_wallpaper_paths: &HashSet<PathBuf>,
+) -> Option<usize> {
+    indices.iter().position(|index| {
+        wallpapers
+            .get(*index)
+            .map(|wallpaper| active_wallpaper_paths.contains(&wallpaper.path))
+            .unwrap_or(false)
+    })
+}
+
 fn format_file_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
@@ -1903,36 +1867,76 @@ fn format_timestamp(unix_secs: u64) -> String {
         .unwrap_or_else(|| unix_secs.to_string())
 }
 
-fn wallpaper_marker_prefix(is_favorite: bool, is_active: bool) -> String {
-    match (is_favorite, is_active) {
-        (true, true) => "★ ● ".to_string(),
-        (true, false) => "★ ".to_string(),
-        (false, true) => "● ".to_string(),
-        (false, false) => String::new(),
+fn wallpaper_marker_prefix(is_active: bool) -> String {
+    if is_active {
+        "● ".to_string()
+    } else {
+        String::new()
     }
 }
 
 #[cfg(test)]
 mod marker_tests {
-    use super::wallpaper_marker_prefix;
+    use super::{first_active_visible_index, wallpaper_marker_prefix};
+    use crate::cache::IndexedWallpaper;
+    use std::{collections::HashSet, path::PathBuf};
 
-    #[test]
-    fn marker_prefix_for_plain_wallpaper() {
-        assert_eq!(wallpaper_marker_prefix(false, false), "");
+    fn wallpaper(name: &str) -> IndexedWallpaper {
+        IndexedWallpaper {
+            path: PathBuf::from(format!("/wallpapers/{name}.jpg")),
+            name: name.to_string(),
+            directory: PathBuf::from("/wallpapers"),
+            extension: "jpg".to_string(),
+            modified_unix_secs: 0,
+            file_size: 0,
+            width: None,
+            height: None,
+        }
     }
 
     #[test]
-    fn marker_prefix_for_favorite_wallpaper() {
-        assert_eq!(wallpaper_marker_prefix(true, false), "★ ");
+    fn marker_prefix_for_plain_wallpaper() {
+        assert_eq!(wallpaper_marker_prefix(false), "");
     }
 
     #[test]
     fn marker_prefix_for_active_wallpaper() {
-        assert_eq!(wallpaper_marker_prefix(false, true), "● ");
+        assert_eq!(wallpaper_marker_prefix(true), "● ");
     }
 
     #[test]
-    fn marker_prefix_for_favorite_and_active_wallpaper() {
-        assert_eq!(wallpaper_marker_prefix(true, true), "★ ● ");
+    fn selects_first_active_wallpaper_in_all() {
+        let wallpapers = vec![wallpaper("alpha"), wallpaper("beta"), wallpaper("gamma")];
+        let indices = vec![0, 1, 2];
+        let active_paths = HashSet::from([wallpapers[1].path.clone()]);
+
+        assert_eq!(
+            first_active_visible_index(&indices, &wallpapers, &active_paths),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn selects_first_matching_active_wallpaper_when_multiple_are_active() {
+        let wallpapers = vec![wallpaper("alpha"), wallpaper("beta"), wallpaper("gamma")];
+        let indices = vec![2, 1, 0];
+        let active_paths = HashSet::from([wallpapers[0].path.clone(), wallpapers[2].path.clone()]);
+
+        assert_eq!(
+            first_active_visible_index(&indices, &wallpapers, &active_paths),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn returns_none_when_active_wallpaper_is_not_indexed() {
+        let wallpapers = vec![wallpaper("alpha"), wallpaper("beta")];
+        let indices = vec![0, 1];
+        let active_paths = HashSet::from([PathBuf::from("/wallpapers/missing.jpg")]);
+
+        assert_eq!(
+            first_active_visible_index(&indices, &wallpapers, &active_paths),
+            None
+        );
     }
 }
