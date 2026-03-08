@@ -4,8 +4,6 @@ Walt is a fast terminal wallpaper picker for Hyprland. Browse your library, prev
 
 ![Walt banner](assets/walt-banner.jpg)
 
-![Walt screenshot](assets/screenshot.png)
-
 ## Why Walt
 
 - Stay in the terminal while browsing and applying wallpapers
@@ -13,6 +11,8 @@ Walt is a fast terminal wallpaper picker for Hyprland. Browse your library, prev
 - Keep large wallpaper directories manageable with fast navigation and random selection
 - Match the app to your setup with built-in themes, including a `System` theme that follows your terminal
 - Use it comfortably on multi-monitor Hyprland setups through `hyprpaper`
+
+![Walt screenshot](assets/screenshot.png)
 
 ## Install
 
@@ -134,13 +134,13 @@ walt rotation uninstall
 In the wallpaper browser:
 
 - `↑/↓` or `j/k` to move
-- `Tab` or `l` to move to the next section
-- `Shift+Tab` or `h` to move to the previous section
+- `Tab` or `l` to switch between the `All` and `Rotation` sections
+- `Shift+Tab` or `h` to switch to the previous section
 - `g/G` to jump to the top or bottom
+- Walt opens with the current wallpaper selected in the `All` list when it is indexed
 - `Enter` to apply the selected wallpaper
 - `/` to filter the active section
 - `s` to toggle sorting for the active section between name and modification date
-- `f` to add or remove the selected wallpaper from favorites
 - `r` to add or remove the selected wallpaper from rotation
 - `Ctrl+r` to pick and apply a random wallpaper
 - `R` to open the rotation actions popup
