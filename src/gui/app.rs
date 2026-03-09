@@ -15,10 +15,11 @@ use eframe::egui::{
 use crate::{
     backend::{
         apply_random_plan, disable_rotation_service, enable_rotation_service,
-        get_active_wallpapers, get_monitors, get_rotation_service_status, install_rotation_service,
-        plan_random_assignments, restart_rotation_service_if_active, rotation_service_badge,
-        rotation_service_status, set_wallpaper, set_wallpaper_for_monitor, uninstall_paths,
-        uninstall_rotation_service, uninstall_walt, RandomMode, RandomPlan, RotationServiceStatus,
+        format_rotation_service_status, get_active_wallpapers, get_monitors,
+        get_rotation_service_status, install_rotation_service, plan_random_assignments,
+        restart_rotation_service_if_active, rotation_service_badge, set_wallpaper,
+        set_wallpaper_for_monitor, uninstall_paths, uninstall_rotation_service, uninstall_walt,
+        RandomMode, RandomPlan, RotationServiceStatus,
     },
     cache::{IndexedWallpaper, ThumbnailCache, ThumbnailProfile, WallpaperIndex},
     config::Config,
@@ -99,6 +100,23 @@ struct IndexResponse {
     wallpapers: anyhow::Result<Vec<IndexedWallpaper>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BackendStateSnapshot {
+    active_wallpaper_paths: HashSet<PathBuf>,
+    rotation_service_state: Option<RotationServiceStatus>,
+    rotation_status_text: String,
+}
+
+struct BackendStateRequest {
+    request_id: u64,
+    fallback: BackendStateSnapshot,
+}
+
+struct BackendStateResponse {
+    request_id: u64,
+    snapshot: Option<BackendStateSnapshot>,
+}
+
 pub struct GuiApp {
     config: Config,
     theme: ThemeKind,
@@ -121,6 +139,12 @@ pub struct GuiApp {
     index_request_id: u64,
     index_tx: Sender<IndexRequest>,
     index_rx: Receiver<IndexResponse>,
+    backend_state_request_id: u64,
+    backend_state_tx: Sender<BackendStateRequest>,
+    backend_state_rx: Receiver<BackendStateResponse>,
+    backend_state_refresh_interval: Duration,
+    next_backend_state_refresh_at: Instant,
+    backend_state_request_in_flight: bool,
     rotation_service_state: Option<RotationServiceStatus>,
     rotation_status_text: String,
     display_targets: Vec<DisplayTarget>,
@@ -160,6 +184,8 @@ impl GuiApp {
         let thumbnail_cache = ThumbnailCache::new().ok();
         let (preview_tx, preview_rx) = spawn_preview_worker(thumbnail_cache);
         let (index_tx, index_rx) = spawn_index_worker(wallpaper_index);
+        let (backend_state_tx, backend_state_rx) = spawn_backend_state_worker();
+        let backend_state_refresh_interval = Duration::from_secs(2);
 
         let mut app = Self {
             config,
@@ -183,6 +209,12 @@ impl GuiApp {
             index_request_id: 0,
             index_tx,
             index_rx,
+            backend_state_request_id: 0,
+            backend_state_tx,
+            backend_state_rx,
+            backend_state_refresh_interval,
+            next_backend_state_refresh_at: Instant::now() + backend_state_refresh_interval,
+            backend_state_request_in_flight: false,
             rotation_service_state: None,
             rotation_status_text: String::new(),
             display_targets: vec![],
@@ -492,10 +524,79 @@ impl GuiApp {
     }
 
     fn refresh_rotation_status(&mut self) {
-        self.rotation_service_state = get_rotation_service_status().ok();
-        self.rotation_status_text = rotation_service_status().unwrap_or_else(|error| {
-            format!("Rotation Service\nStatus:   error\nError:    {error}")
-        });
+        match get_rotation_service_status() {
+            Ok(status) => {
+                self.rotation_status_text = format_rotation_service_status(&status);
+                self.rotation_service_state = Some(status);
+            }
+            Err(error) => {
+                self.rotation_service_state = None;
+                self.rotation_status_text =
+                    format!("Rotation Service\nStatus:   error\nError:    {error}");
+            }
+        }
+    }
+
+    fn current_backend_state_snapshot(&self) -> BackendStateSnapshot {
+        BackendStateSnapshot {
+            active_wallpaper_paths: self.active_wallpaper_paths.clone(),
+            rotation_service_state: self.rotation_service_state.clone(),
+            rotation_status_text: self.rotation_status_text.clone(),
+        }
+    }
+
+    fn apply_backend_state_snapshot(&mut self, snapshot: BackendStateSnapshot) -> bool {
+        let changed = self.active_wallpaper_paths != snapshot.active_wallpaper_paths
+            || self.rotation_service_state != snapshot.rotation_service_state
+            || self.rotation_status_text != snapshot.rotation_status_text;
+
+        if changed {
+            self.active_wallpaper_paths = snapshot.active_wallpaper_paths;
+            self.rotation_service_state = snapshot.rotation_service_state;
+            self.rotation_status_text = snapshot.rotation_status_text;
+        }
+
+        changed
+    }
+
+    fn maybe_request_backend_state_refresh(&mut self) {
+        let now = Instant::now();
+        if now < self.next_backend_state_refresh_at || self.backend_state_request_in_flight {
+            return;
+        }
+
+        self.backend_state_request_id = self.backend_state_request_id.wrapping_add(1);
+        if self
+            .backend_state_tx
+            .send(BackendStateRequest {
+                request_id: self.backend_state_request_id,
+                fallback: self.current_backend_state_snapshot(),
+            })
+            .is_ok()
+        {
+            self.backend_state_request_in_flight = true;
+            self.next_backend_state_refresh_at = now + self.backend_state_refresh_interval;
+        }
+    }
+
+    fn drain_backend_state_updates(&mut self, ctx: &egui::Context) {
+        loop {
+            match self.backend_state_rx.try_recv() {
+                Ok(response) => {
+                    if response.request_id != self.backend_state_request_id {
+                        continue;
+                    }
+
+                    self.backend_state_request_in_flight = false;
+                    if let Some(snapshot) = response.snapshot {
+                        if self.apply_backend_state_snapshot(snapshot) {
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
     }
 
     fn request_preview_load(&mut self) {
@@ -953,7 +1054,11 @@ impl GuiApp {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(GuiTypography::rich(GuiTextRole::AppEyebrow, "WALT", palette));
+                    ui.label(GuiTypography::rich(
+                        GuiTextRole::AppEyebrow,
+                        "WALT",
+                        palette,
+                    ));
                     ui.add(
                         egui::Button::new(GuiTypography::rich_color(
                             GuiTextRole::MetaLabel,
@@ -1219,7 +1324,7 @@ impl GuiApp {
                 return;
             }
 
-            let Some(selected) = self.current_selected_wallpaper() else {
+            let Some(selected) = self.current_selected_wallpaper().cloned() else {
                 section_heading(ui, "OVERVIEW", palette);
                 ui.add_space(18.0);
                 ui.label(GuiTypography::rich(
@@ -1259,7 +1364,7 @@ impl GuiApp {
                         |ui| {
                             if let Some(texture) = texture {
                                 let size = fit_size(texture.size_vec2(), rect.size());
-                                ui.add(egui::Image::new(texture).fit_to_exact_size(size));
+                                ui.add(egui::Image::new(&texture).fit_to_exact_size(size));
                             } else {
                                 ui.vertical_centered(|ui| {
                                     ui.spinner();
@@ -1276,13 +1381,13 @@ impl GuiApp {
         });
     }
 
-    fn current_preview_texture(&self) -> Option<&TextureHandle> {
+    fn current_preview_texture(&mut self) -> Option<TextureHandle> {
         let desired = self.desired_preview_key.as_ref()?;
         let current = self.current_preview_key.as_ref()?;
         if desired != current {
             return None;
         }
-        self.texture_cache.get(current)
+        self.texture_cache.get_cloned(current)
     }
 
     fn render_metadata(&mut self, ui: &mut Ui) {
@@ -1923,19 +2028,45 @@ impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_index_updates(ctx);
         self.drain_preview_updates(ctx);
+        self.drain_backend_state_updates(ctx);
         self.expire_toasts();
         self.handle_shortcuts(ctx);
+        self.maybe_request_backend_state_refresh();
 
+        let now = Instant::now();
         if let Some(deadline) = self.uninstall_close_deadline {
-            if Instant::now() >= deadline {
+            if now >= deadline {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 return;
             }
-            ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
         }
 
+        let mut next_repaint_after = None;
+        if let Some(deadline) = self.uninstall_close_deadline {
+            next_repaint_after = Some(deadline.saturating_duration_since(now));
+        }
+
+        let backend_poll_after = if self.backend_state_request_in_flight {
+            Duration::from_millis(250)
+        } else {
+            self.next_backend_state_refresh_at
+                .saturating_duration_since(now)
+        };
+        next_repaint_after = Some(match next_repaint_after {
+            Some(current) => current.min(backend_poll_after),
+            None => backend_poll_after,
+        });
+
         if !self.toasts.is_empty() {
-            ctx.request_repaint_after(Duration::from_millis(250));
+            let toast_after = Duration::from_millis(250);
+            next_repaint_after = Some(match next_repaint_after {
+                Some(current) => current.min(toast_after),
+                None => toast_after,
+            });
+        }
+
+        if let Some(duration) = next_repaint_after {
+            ctx.request_repaint_after(duration);
         }
 
         egui::TopBottomPanel::top("toolbar")
@@ -2001,6 +2132,44 @@ fn spawn_index_worker(index: WallpaperIndex) -> (Sender<IndexRequest>, Receiver<
             let _ = response_tx.send(IndexResponse {
                 request_id: request.request_id,
                 wallpapers,
+            });
+        }
+    });
+
+    (request_tx, response_rx)
+}
+
+fn spawn_backend_state_worker() -> (Sender<BackendStateRequest>, Receiver<BackendStateResponse>) {
+    let (request_tx, request_rx) = mpsc::channel::<BackendStateRequest>();
+    let (response_tx, response_rx) = mpsc::channel::<BackendStateResponse>();
+
+    std::thread::spawn(move || {
+        while let Ok(mut request) = request_rx.recv() {
+            while let Ok(next_request) = request_rx.try_recv() {
+                request = next_request;
+            }
+
+            let active_wallpapers =
+                get_active_wallpapers().map(|paths| paths.into_iter().collect::<HashSet<_>>());
+            let rotation_status = get_rotation_service_status();
+
+            let mut snapshot = request.fallback;
+            let mut has_success = false;
+
+            if let Ok(paths) = active_wallpapers {
+                snapshot.active_wallpaper_paths = paths;
+                has_success = true;
+            }
+
+            if let Ok(status) = rotation_status {
+                snapshot.rotation_status_text = format_rotation_service_status(&status);
+                snapshot.rotation_service_state = Some(status);
+                has_success = true;
+            }
+
+            let _ = response_tx.send(BackendStateResponse {
+                request_id: request.request_id,
+                snapshot: has_success.then_some(snapshot),
             });
         }
     });
@@ -2204,5 +2373,134 @@ fn format_interval(seconds: u64) -> String {
         parts.remove(0)
     } else {
         format!("{seconds}s ({})", parts.join(" "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BackendStateSnapshot, GuiApp, RotationServiceStatus, SectionKind};
+    use crate::{config::Config, theme::ThemeKind};
+    use std::{
+        collections::HashSet,
+        path::PathBuf,
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+
+    fn test_config() -> Config {
+        Config {
+            wallpaper_paths: vec![],
+            theme_name: "System".to_string(),
+            rotation: vec![],
+            rotate_all_wallpapers: false,
+            rotation_same_wallpaper_on_all_displays: true,
+            rotation_interval_secs: 300,
+            all_sort: "name".to_string(),
+            rotation_sort: "name".to_string(),
+        }
+    }
+
+    fn test_app() -> GuiApp {
+        let (preview_tx, _) = mpsc::channel();
+        let (_, preview_rx) = mpsc::channel();
+        let (index_tx, _) = mpsc::channel();
+        let (_, index_rx) = mpsc::channel();
+        let (backend_state_tx, _) = mpsc::channel();
+        let (_, backend_state_rx) = mpsc::channel();
+
+        GuiApp {
+            config: test_config(),
+            theme: ThemeKind::System,
+            wallpapers: vec![],
+            active_section: SectionKind::All,
+            all_indices: vec![],
+            rotation_indices: vec![],
+            selected_all: Some(0),
+            selected_rotation: Some(0),
+            all_filter: String::new(),
+            rotation_filter: String::new(),
+            active_wallpaper_paths: HashSet::new(),
+            rotation_paths: HashSet::new(),
+            texture_cache: super::PreviewTextures::new(),
+            desired_preview_key: None,
+            current_preview_key: None,
+            preview_request_id: 0,
+            preview_tx,
+            preview_rx,
+            index_request_id: 0,
+            index_tx,
+            index_rx,
+            backend_state_request_id: 0,
+            backend_state_tx,
+            backend_state_rx,
+            backend_state_refresh_interval: Duration::from_secs(2),
+            next_backend_state_refresh_at: Instant::now(),
+            backend_state_request_in_flight: false,
+            rotation_service_state: None,
+            rotation_status_text: String::new(),
+            display_targets: vec![],
+            display_target_selection: None,
+            random_targets: vec![],
+            random_target_selection: None,
+            pending_wallpaper_path: None,
+            pending_random_candidates: vec![],
+            show_paths_dialog: false,
+            show_rotation_dialog: false,
+            show_help_dialog: false,
+            show_uninstall_dialog: false,
+            show_display_picker: false,
+            show_random_dialog: false,
+            manual_path_input: String::new(),
+            interval_buffer: String::new(),
+            uninstall_confirmed: false,
+            uninstall_summary: None,
+            uninstall_close_deadline: None,
+            focus_search: false,
+            toasts: vec![],
+            next_toast_id: 0,
+        }
+    }
+
+    #[test]
+    fn apply_backend_state_snapshot_reports_changes_without_changing_selection() {
+        let mut app = test_app();
+        let mut active_paths = HashSet::new();
+        active_paths.insert(PathBuf::from("/tmp/active.png"));
+        let status = RotationServiceStatus {
+            installed: true,
+            enabled: "enabled".to_string(),
+            active: "active".to_string(),
+            rotates_all_wallpapers: false,
+            same_wallpaper_on_all_displays: true,
+            interval_secs: 300,
+            rotation_entries: 1,
+            service_file: PathBuf::from("/tmp/walt-rotation.service"),
+        };
+
+        let changed = app.apply_backend_state_snapshot(BackendStateSnapshot {
+            active_wallpaper_paths: active_paths.clone(),
+            rotation_service_state: Some(status.clone()),
+            rotation_status_text: "running".to_string(),
+        });
+
+        assert!(changed);
+        assert_eq!(app.active_wallpaper_paths, active_paths);
+        assert_eq!(app.rotation_service_state, Some(status));
+        assert_eq!(app.rotation_status_text, "running");
+        assert_eq!(app.selected_all, Some(0));
+        assert_eq!(app.selected_rotation, Some(0));
+    }
+
+    #[test]
+    fn apply_backend_state_snapshot_is_noop_for_identical_state() {
+        let mut app = test_app();
+        let snapshot = BackendStateSnapshot {
+            active_wallpaper_paths: HashSet::new(),
+            rotation_service_state: None,
+            rotation_status_text: String::new(),
+        };
+
+        assert!(!app.apply_backend_state_snapshot(snapshot.clone()));
+        assert!(!app.apply_backend_state_snapshot(snapshot));
     }
 }
