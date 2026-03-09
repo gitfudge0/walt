@@ -15,6 +15,7 @@ pub struct Config {
     pub wallpaper_paths: Vec<PathBuf>,
     pub theme_name: String,
     pub rotation: Vec<PathBuf>,
+    pub rotate_all_wallpapers: bool,
     pub rotation_interval_secs: u64,
     pub all_sort: String,
     pub rotation_sort: String,
@@ -25,6 +26,8 @@ struct ConfigFile {
     wallpaper_paths: Vec<PathBuf>,
     theme_name: String,
     rotation: Vec<PathBuf>,
+    #[serde(default)]
+    rotate_all_wallpapers: bool,
     rotation_interval_secs: u64,
     all_sort: String,
     rotation_sort: String,
@@ -66,6 +69,7 @@ impl Config {
             wallpaper_paths,
             theme_name,
             rotation: vec![],
+            rotate_all_wallpapers: false,
             rotation_interval_secs: 300,
             all_sort: "name".to_string(),
             rotation_sort: "name".to_string(),
@@ -90,6 +94,7 @@ impl Config {
                 state.theme_name
             },
             rotation: state.rotation,
+            rotate_all_wallpapers: state.rotate_all_wallpapers,
             rotation_interval_secs: if state.rotation_interval_secs == 0 {
                 300
             } else {
@@ -131,6 +136,7 @@ impl Config {
             wallpaper_paths: self.wallpaper_paths.clone(),
             theme_name: self.theme_name.clone(),
             rotation: self.rotation.clone(),
+            rotate_all_wallpapers: self.rotate_all_wallpapers,
             rotation_interval_secs: self.rotation_interval_secs,
             all_sort: default_sort_name(self.all_sort.clone()),
             rotation_sort: default_sort_name(self.rotation_sort.clone()),
@@ -184,6 +190,21 @@ impl Config {
         self.rotation.iter().any(|entry| entry == path)
     }
 
+    pub fn uses_all_wallpapers_for_rotation(&self) -> bool {
+        self.rotate_all_wallpapers
+    }
+
+    pub fn set_rotate_all_wallpapers(&mut self, enabled: bool) -> anyhow::Result<()> {
+        self.rotate_all_wallpapers = enabled;
+        self.save()
+    }
+
+    pub fn toggle_rotate_all_wallpapers(&mut self) -> anyhow::Result<bool> {
+        let enabled = !self.rotate_all_wallpapers;
+        self.set_rotate_all_wallpapers(enabled)?;
+        Ok(enabled)
+    }
+
     pub fn sort_name_for_section(&self, section: &str) -> &str {
         match section {
             "rotation" => &self.rotation_sort,
@@ -234,6 +255,7 @@ mod tests {
             wallpaper_paths: vec![],
             theme_name: "System".to_string(),
             rotation: vec![],
+            rotate_all_wallpapers: false,
             rotation_interval_secs: 300,
             all_sort: "name".to_string(),
             rotation_sort: "name".to_string(),
@@ -276,6 +298,7 @@ mod tests {
         assert_eq!(config.wallpaper_paths, vec![wallpaper_dir.clone()]);
         assert_eq!(config.theme_name, "Nord");
         assert_eq!(config.rotation, vec![PathBuf::from("/tmp/rotate.jpg")]);
+        assert!(!config.rotate_all_wallpapers);
         assert_eq!(config.rotation_interval_secs, 120);
         assert_eq!(config.all_sort, "modified");
         assert_eq!(config.rotation_sort, "modified");
@@ -293,6 +316,71 @@ mod tests {
 
         assert!(!config.toggle_rotation(&path));
         assert!(config.rotation.is_empty());
+    }
+
+    #[test]
+    fn toggles_rotate_all_without_clearing_rotation() {
+        let mut config = test_config();
+        config.rotation = vec![PathBuf::from("/tmp/alpha.jpg")];
+        config.rotate_all_wallpapers = false;
+
+        config.rotate_all_wallpapers = true;
+
+        assert!(config.uses_all_wallpapers_for_rotation());
+        assert_eq!(config.rotation, vec![PathBuf::from("/tmp/alpha.jpg")]);
+    }
+
+    #[test]
+    fn saves_and_reloads_rotate_all_wallpapers() {
+        use std::{
+            env,
+            ffi::OsString,
+            sync::{Mutex, OnceLock},
+        };
+
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+        struct XdgConfigHomeGuard {
+            previous: Option<OsString>,
+        }
+
+        impl Drop for XdgConfigHomeGuard {
+            fn drop(&mut self) {
+                match self.previous.take() {
+                    Some(value) => env::set_var("XDG_CONFIG_HOME", value),
+                    None => env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+        }
+
+        let _lock = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock");
+        let temp_root = std::env::temp_dir().join(format!(
+            "walt-config-save-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_root).expect("create temp config root");
+        let previous = env::var_os("XDG_CONFIG_HOME");
+        let _guard = XdgConfigHomeGuard { previous };
+        env::set_var("XDG_CONFIG_HOME", &temp_root);
+
+        let mut config = test_config();
+        config.rotation = vec![PathBuf::from("/tmp/alpha.jpg")];
+        config.rotate_all_wallpapers = true;
+        config.save().expect("save config");
+
+        let saved = temp_root.join("walt").join("state.json");
+        let loaded = Config::from_state_file(&saved);
+
+        assert!(loaded.rotate_all_wallpapers);
+        assert_eq!(loaded.rotation, vec![PathBuf::from("/tmp/alpha.jpg")]);
+
+        fs::remove_dir_all(&temp_root).expect("cleanup temp root");
     }
 
     #[test]

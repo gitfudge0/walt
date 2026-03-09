@@ -15,7 +15,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     symbols::border,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph as Para},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph as Para, Wrap},
     Frame, Terminal,
 };
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol, Resize, StatefulImage};
@@ -29,9 +29,9 @@ use std::{
 
 use crate::backend::{
     disable_rotation_service, enable_rotation_service, get_active_wallpapers,
-    get_rotation_service_status, install_rotation_service, rotation_service_badge,
-    rotation_service_status, scan_directory, set_wallpaper, uninstall_rotation_service,
-    RotationServiceStatus,
+    get_rotation_service_status, install_rotation_service, restart_rotation_service_if_active,
+    rotation_service_badge, rotation_service_status, scan_directory, set_wallpaper,
+    uninstall_rotation_service, RotationServiceStatus,
 };
 use crate::cache::{IndexedWallpaper, ThumbnailCache, WallpaperIndex};
 use crate::config::Config;
@@ -83,17 +83,23 @@ enum SortMode {
 enum RotationMenuAction {
     InstallOrUninstall,
     EnableOrDisable,
+    ToggleWallpaperScope,
     SetInterval,
 }
 
 impl RotationMenuAction {
-    const ALL: [RotationMenuAction; 3] = [
+    const ALL: [RotationMenuAction; 4] = [
         RotationMenuAction::InstallOrUninstall,
         RotationMenuAction::EnableOrDisable,
+        RotationMenuAction::ToggleWallpaperScope,
         RotationMenuAction::SetInterval,
     ];
 
-    fn label(self, status: Option<&RotationServiceStatus>) -> &'static str {
+    fn label(
+        self,
+        status: Option<&RotationServiceStatus>,
+        rotates_all_wallpapers: bool,
+    ) -> &'static str {
         match self {
             Self::InstallOrUninstall => {
                 if status.map(|status| status.installed).unwrap_or(false) {
@@ -110,6 +116,13 @@ impl RotationMenuAction {
                     "Disable service"
                 } else {
                     "Enable service"
+                }
+            }
+            Self::ToggleWallpaperScope => {
+                if rotates_all_wallpapers {
+                    "Use selected wallpapers"
+                } else {
+                    "Rotate all wallpapers"
                 }
             }
             Self::SetInterval => "Change interval",
@@ -475,6 +488,7 @@ impl App {
             KeyCode::Enter => {
                 if let Ok(seconds) = self.interval_buffer.parse::<u64>() {
                     if self.config.set_rotation_interval_secs(seconds).is_ok() {
+                        self.restart_rotation_service_if_active();
                         self.refresh_rotation_status();
                         self.mode = self.interval_return_mode;
                     }
@@ -854,6 +868,7 @@ impl App {
                     self.run_rotation_service_action(|| enable_rotation_service());
                 }
             }
+            RotationMenuAction::ToggleWallpaperScope => self.toggle_rotate_all_wallpapers(),
             RotationMenuAction::SetInterval => self.open_interval_editor(),
         }
     }
@@ -887,6 +902,13 @@ impl App {
     }
 
     fn section_indices(&self, section: SectionKind) -> Vec<usize> {
+        if is_informational_rotation_section(
+            section,
+            self.config.uses_all_wallpapers_for_rotation(),
+        ) {
+            return vec![];
+        }
+
         let base_indices = match section {
             SectionKind::All => &self.all_indices,
             SectionKind::Rotation => &self.rotation_indices,
@@ -966,13 +988,16 @@ impl App {
     fn ensure_section_selection(&mut self) {
         for section in SectionKind::ALL {
             let len = self.section_indices(section).len();
+            let is_informational = is_informational_rotation_section(
+                section,
+                self.config.uses_all_wallpapers_for_rotation(),
+            );
             let state = self.section_state_mut(section);
-            if len == 0 {
-                state.select(None);
-            } else {
-                let selected = state.selected().unwrap_or(0).min(len - 1);
-                state.select(Some(selected));
-            }
+            state.select(normalized_section_selection(
+                state.selected(),
+                len,
+                is_informational,
+            ));
         }
     }
 
@@ -1274,7 +1299,7 @@ impl App {
     fn render_library_sections(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
         let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .constraints([Constraint::Min(12), Constraint::Length(8)])
             .split(area);
 
         self.render_section(
@@ -1310,6 +1335,22 @@ impl App {
             border_theme.title = theme.highlight;
         }
 
+        if let Some((headline, subline)) =
+            rotation_section_message(section, self.config.uses_all_wallpapers_for_rotation())
+        {
+            frame.render_widget(
+                Para::new(vec![
+                    Line::from(Span::styled(headline, theme.key)),
+                    Line::from(Span::styled(subline, theme.muted)),
+                ])
+                .block(self.themed_block(&self.section_title(section), border_theme))
+                .wrap(Wrap { trim: true })
+                .alignment(Alignment::Center),
+                area,
+            );
+            return;
+        }
+
         if indices.is_empty() {
             let message = match section {
                 SectionKind::All if self.filter_query(section).is_empty() => {
@@ -1322,7 +1363,7 @@ impl App {
             };
             frame.render_widget(
                 Para::new(Line::from(Span::styled(message, theme.muted)))
-                    .block(self.themed_block(section.title(), border_theme))
+                    .block(self.themed_block(&self.section_title(section), border_theme))
                     .alignment(Alignment::Center),
                 area,
             );
@@ -1348,30 +1389,12 @@ impl App {
                 ListItem::new(format!("{marker}{}", wallpaper.name)).style(style)
             })
             .collect::<Vec<_>>();
-        let title = format!(
-            "{} [{}{}]",
-            section.title().trim(),
-            if section == SectionKind::Rotation {
-                self.rotation_service_state
-                    .as_ref()
-                    .map(rotation_service_badge)
-                    .unwrap_or("unknown")
-                    .to_string()
-            } else {
-                self.sort_mode(section).label().to_string()
-            },
-            if section == SectionKind::Rotation {
-                format!(" · {}s", self.config.rotation_interval_secs)
-            } else {
-                String::new()
-            }
-        );
         let mut list_state = state.clone();
         let block = Block::default()
             .borders(Borders::ALL)
             .border_set(border::ROUNDED)
             .border_style(border_theme.border)
-            .title(title)
+            .title(self.section_title(section))
             .title_style(border_theme.title);
         let list = List::new(items)
             .block(block)
@@ -1427,7 +1450,7 @@ impl App {
                 ("/", "filter"),
                 ("r", "rotate"),
                 ("Ctrl+r", "random"),
-                ("R", "rotation"),
+                ("R", "rotation popup"),
                 ("p", "paths"),
             ],
         };
@@ -1482,7 +1505,7 @@ impl App {
     }
 
     fn render_rotation_menu_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
-        let popup = centered_rect(72, 16, area);
+        let popup = centered_rect(72, 18, area);
         frame.render_widget(Clear, popup);
         frame.render_widget(Block::default().style(theme.surface), popup);
         let block = self
@@ -1506,7 +1529,11 @@ impl App {
                 } else {
                     theme.accent
                 };
-                ListItem::new(action.label(self.rotation_service_state.as_ref())).style(style)
+                ListItem::new(action.label(
+                    self.rotation_service_state.as_ref(),
+                    self.config.uses_all_wallpapers_for_rotation(),
+                ))
+                .style(style)
             })
             .collect::<Vec<_>>();
 
@@ -1533,7 +1560,7 @@ impl App {
         let pairs = [
             (("Move", "↑/↓ or j/k"), ("Sections", "Tab/l, S-Tab/h")),
             (("Apply", "Enter"), ("Random", "Ctrl+r")),
-            (("Rotation", "r"), ("Rotation Menu", "R")),
+            (("Rotation", "r"), ("Rotation Popup", "R")),
             (("Interval", "i"), ("Filter", "/")),
             (("Sort", "s"), ("Paths", "p")),
             (("Theme", "t"), ("Keybindings", "?")),
@@ -1733,6 +1760,52 @@ impl App {
         }
         Ok(())
     }
+
+    fn toggle_rotate_all_wallpapers(&mut self) {
+        match self.config.toggle_rotate_all_wallpapers() {
+            Ok(_) => {
+                self.rebuild_section_cache();
+                self.ensure_section_selection();
+                self.restart_rotation_service_if_active();
+                self.refresh_rotation_status();
+                self.request_preview_load();
+            }
+            Err(error) => {
+                self.rotation_service_state = None;
+                self.rotation_status_text =
+                    format!("Rotation Service\nStatus:   error\nError:    {error}");
+            }
+        }
+    }
+
+    fn section_title(&self, section: SectionKind) -> String {
+        format!(
+            "{} [{}{}]",
+            section.title().trim(),
+            if section == SectionKind::Rotation {
+                self.rotation_service_state
+                    .as_ref()
+                    .map(rotation_service_badge)
+                    .unwrap_or("unknown")
+                    .to_string()
+            } else {
+                self.sort_mode(section).label().to_string()
+            },
+            if section == SectionKind::Rotation {
+                format!(" · {}s", self.config.rotation_interval_secs)
+            } else {
+                String::new()
+            }
+        )
+    }
+
+    fn restart_rotation_service_if_active(&mut self) {
+        if let Err(error) = restart_rotation_service_if_active() {
+            self.rotation_service_state = None;
+            self.rotation_status_text =
+                format!("Rotation Service\nStatus:   error\nError:    {error}");
+        }
+    }
 }
 
 fn spawn_index_worker(index: WallpaperIndex) -> (Sender<IndexRequest>, Receiver<IndexResponse>) {
@@ -1833,6 +1906,39 @@ fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, popup_width, popup_height)
 }
 
+fn is_informational_rotation_section(
+    section: SectionKind,
+    uses_all_wallpapers_for_rotation: bool,
+) -> bool {
+    section == SectionKind::Rotation && uses_all_wallpapers_for_rotation
+}
+
+fn normalized_section_selection(
+    selected: Option<usize>,
+    len: usize,
+    is_informational: bool,
+) -> Option<usize> {
+    if is_informational || len == 0 {
+        None
+    } else {
+        Some(selected.unwrap_or(0).min(len - 1))
+    }
+}
+
+fn rotation_section_message(
+    section: SectionKind,
+    uses_all_wallpapers_for_rotation: bool,
+) -> Option<(&'static str, &'static str)> {
+    if is_informational_rotation_section(section, uses_all_wallpapers_for_rotation) {
+        Some((
+            "Rotating all wallpapers",
+            "Manual rotation list is preserved",
+        ))
+    } else {
+        None
+    }
+}
+
 fn first_active_visible_index(
     indices: &[usize],
     wallpapers: &[IndexedWallpaper],
@@ -1877,7 +1983,10 @@ fn wallpaper_marker_prefix(is_active: bool) -> String {
 
 #[cfg(test)]
 mod marker_tests {
-    use super::{first_active_visible_index, wallpaper_marker_prefix};
+    use super::{
+        first_active_visible_index, normalized_section_selection, rotation_section_message,
+        wallpaper_marker_prefix, RotationMenuAction, RotationServiceStatus,
+    };
     use crate::cache::IndexedWallpaper;
     use std::{collections::HashSet, path::PathBuf};
 
@@ -1937,6 +2046,58 @@ mod marker_tests {
         assert_eq!(
             first_active_visible_index(&indices, &wallpapers, &active_paths),
             None
+        );
+    }
+
+    #[test]
+    fn returns_rotation_all_message_when_all_mode_is_enabled() {
+        assert_eq!(
+            rotation_section_message(super::SectionKind::Rotation, true),
+            Some((
+                "Rotating all wallpapers",
+                "Manual rotation list is preserved"
+            ))
+        );
+    }
+
+    #[test]
+    fn does_not_return_rotation_all_message_in_manual_mode() {
+        assert_eq!(
+            rotation_section_message(super::SectionKind::Rotation, false),
+            None
+        );
+    }
+
+    #[test]
+    fn clears_rotation_selection_for_informational_sections() {
+        assert_eq!(normalized_section_selection(Some(2), 3, true), None);
+    }
+
+    #[test]
+    fn keeps_rotation_selection_for_normal_sections() {
+        assert_eq!(normalized_section_selection(Some(2), 3, false), Some(2));
+        assert_eq!(normalized_section_selection(None, 3, false), Some(0));
+    }
+
+    #[test]
+    fn labels_rotation_menu_toggle_action_from_current_mode() {
+        let status = Some(&RotationServiceStatus {
+            installed: true,
+            enabled: "enabled".to_string(),
+            active: "active".to_string(),
+            rotates_all_wallpapers: false,
+            interval_secs: 300,
+            rotation_entries: 3,
+            service_file: PathBuf::from("/tmp/walt-rotation.service"),
+        });
+
+        assert_eq!(
+            RotationMenuAction::ToggleWallpaperScope.label(status, false),
+            "Rotate all wallpapers"
+        );
+        assert_eq!(
+            RotationMenuAction::ToggleWallpaperScope.label(status, true),
+            "Use selected wallpapers"
         );
     }
 }

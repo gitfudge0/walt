@@ -37,6 +37,7 @@ pub struct RotationServiceStatus {
     pub installed: bool,
     pub enabled: String,
     pub active: String,
+    pub rotates_all_wallpapers: bool,
     pub interval_secs: u64,
     pub rotation_entries: usize,
     pub service_file: PathBuf,
@@ -60,6 +61,20 @@ pub fn enable_rotation_service() -> Result<()> {
 
 pub fn disable_rotation_service() -> Result<()> {
     run_systemctl_checked(&["disable", "--now", SERVICE_FILE], BENIGN_DISABLE_ERRORS)
+}
+
+pub fn restart_rotation_service_if_active() -> Result<()> {
+    let service_path = service_file_path()?;
+    if !service_path.exists() {
+        return Ok(());
+    }
+
+    let active = read_systemctl_state(&["is-active", SERVICE_FILE], "inactive", "activity")?;
+    if active != "active" {
+        return Ok(());
+    }
+
+    run_systemctl(&["restart", SERVICE_FILE])
 }
 
 pub fn uninstall_rotation_service() -> Result<()> {
@@ -95,6 +110,7 @@ pub fn get_rotation_service_status() -> Result<RotationServiceStatus> {
         installed,
         enabled,
         active,
+        rotates_all_wallpapers: config.uses_all_wallpapers_for_rotation(),
         interval_secs: config.rotation_interval_secs,
         rotation_entries: config.rotation.len(),
         service_file,
@@ -132,11 +148,11 @@ pub fn run_rotation_daemon() -> Result<()> {
 }
 
 fn rotation_candidates(index: &WallpaperIndex, config: &Config) -> Vec<IndexedWallpaper> {
-    let mut wallpapers = index
+    let wallpapers = index
         .refresh(&config.wallpaper_paths)
         .unwrap_or_else(|_| index.load(&config.wallpaper_paths));
+    let mut wallpapers = filter_wallpapers_for_rotation(wallpapers, config);
 
-    wallpapers.retain(|wallpaper| config.is_in_rotation(&wallpaper.path));
     let sort_mode = match config.rotation_sort.as_str() {
         "modified" => SortMode::Modified,
         _ => SortMode::Name,
@@ -154,6 +170,18 @@ fn rotation_candidates(index: &WallpaperIndex, config: &Config) -> Vec<IndexedWa
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase())),
     });
 
+    wallpapers
+}
+
+fn filter_wallpapers_for_rotation(
+    mut wallpapers: Vec<IndexedWallpaper>,
+    config: &Config,
+) -> Vec<IndexedWallpaper> {
+    if config.uses_all_wallpapers_for_rotation() {
+        return wallpapers;
+    }
+
+    wallpapers.retain(|wallpaper| config.is_in_rotation(&wallpaper.path));
     wallpapers
 }
 
@@ -255,12 +283,14 @@ Status:   {summary}\n\
 Loaded:   {loaded}\n\
 Enabled:  {}\n\
 Active:   {}\n\
+Mode:     {}\n\
 Interval: {}\n\
 Entries:  {}",
         status.enabled,
         status.active,
+        rotation_mode_label(status.rotates_all_wallpapers),
         format_interval(status.interval_secs),
-        pluralize_wallpapers(status.rotation_entries)
+        rotation_entries_label(status)
     )
 }
 
@@ -286,6 +316,22 @@ pub fn rotation_service_badge(status: &RotationServiceStatus) -> &'static str {
         "active"
     } else {
         "disabled"
+    }
+}
+
+fn rotation_mode_label(rotates_all_wallpapers: bool) -> &'static str {
+    if rotates_all_wallpapers {
+        "all wallpapers"
+    } else {
+        "selected wallpapers"
+    }
+}
+
+fn rotation_entries_label(status: &RotationServiceStatus) -> String {
+    if status.rotates_all_wallpapers {
+        "all wallpapers".to_string()
+    } else {
+        pluralize_wallpapers(status.rotation_entries)
     }
 }
 
@@ -370,10 +416,12 @@ fn config_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_rotation_service_status, is_tolerated_systemctl_failure, next_wallpaper,
-        service_file_contents, RotationServiceStatus,
+        filter_wallpapers_for_rotation, format_rotation_service_status,
+        is_tolerated_systemctl_failure, next_wallpaper, service_file_contents,
+        RotationServiceStatus,
     };
     use crate::cache::IndexedWallpaper;
+    use crate::config::Config;
     use std::path::PathBuf;
 
     fn wallpaper(name: &str) -> IndexedWallpaper {
@@ -389,11 +437,46 @@ mod tests {
         }
     }
 
+    fn config(rotation: Vec<&str>, rotate_all_wallpapers: bool) -> Config {
+        Config {
+            wallpaper_paths: vec![],
+            theme_name: "System".to_string(),
+            rotation: rotation
+                .into_iter()
+                .map(|name| PathBuf::from(format!("/tmp/{name}.png")))
+                .collect(),
+            rotate_all_wallpapers,
+            rotation_interval_secs: 300,
+            all_sort: "name".to_string(),
+            rotation_sort: "name".to_string(),
+        }
+    }
+
     #[test]
     fn wraps_to_first_wallpaper_when_last_is_end_of_list() {
         let wallpapers = vec![wallpaper("alpha"), wallpaper("beta")];
         let next = next_wallpaper(&wallpapers, Some(&wallpapers[1].path)).expect("next wallpaper");
         assert_eq!(next.name, "alpha");
+    }
+
+    #[test]
+    fn keeps_only_selected_wallpapers_when_rotate_all_is_off() {
+        let wallpapers = vec![wallpaper("alpha"), wallpaper("beta"), wallpaper("gamma")];
+        let filtered = filter_wallpapers_for_rotation(wallpapers, &config(vec!["beta"], false));
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "beta");
+    }
+
+    #[test]
+    fn keeps_all_wallpapers_when_rotate_all_is_on() {
+        let wallpapers = vec![wallpaper("alpha"), wallpaper("beta"), wallpaper("gamma")];
+        let filtered = filter_wallpapers_for_rotation(wallpapers, &config(vec!["beta"], true));
+
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered[0].name, "alpha");
+        assert_eq!(filtered[1].name, "beta");
+        assert_eq!(filtered[2].name, "gamma");
     }
 
     #[test]
@@ -434,6 +517,7 @@ mod tests {
             installed: true,
             enabled: "enabled".to_string(),
             active: "active".to_string(),
+            rotates_all_wallpapers: false,
             interval_secs: 300,
             rotation_entries: 4,
             service_file: PathBuf::from("/tmp/walt-rotation.service"),
@@ -444,6 +528,7 @@ mod tests {
         assert!(text.contains("Loaded:   loaded (/tmp/walt-rotation.service)"));
         assert!(text.contains("Enabled:  enabled"));
         assert!(text.contains("Active:   active"));
+        assert!(text.contains("Mode:     selected wallpapers"));
         assert!(text.contains("Interval: 300s (5m)"));
         assert!(text.contains("Entries:  4 wallpapers"));
     }
@@ -454,6 +539,7 @@ mod tests {
             installed: false,
             enabled: "not installed".to_string(),
             active: "inactive".to_string(),
+            rotates_all_wallpapers: false,
             interval_secs: 45,
             rotation_entries: 1,
             service_file: PathBuf::from("/tmp/walt-rotation.service"),
@@ -463,7 +549,24 @@ mod tests {
         assert!(text.contains("Loaded:   not found (/tmp/walt-rotation.service)"));
         assert!(text.contains("Enabled:  not installed"));
         assert!(text.contains("Active:   inactive"));
+        assert!(text.contains("Mode:     selected wallpapers"));
         assert!(text.contains("Interval: 45s"));
         assert!(text.contains("Entries:  1 wallpaper"));
+    }
+
+    #[test]
+    fn formats_rotation_status_for_rotate_all_mode() {
+        let text = format_rotation_service_status(&RotationServiceStatus {
+            installed: true,
+            enabled: "enabled".to_string(),
+            active: "active".to_string(),
+            rotates_all_wallpapers: true,
+            interval_secs: 300,
+            rotation_entries: 4,
+            service_file: PathBuf::from("/tmp/walt-rotation.service"),
+        });
+
+        assert!(text.contains("Mode:     all wallpapers"));
+        assert!(text.contains("Entries:  all wallpapers"));
     }
 }
