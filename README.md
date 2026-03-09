@@ -1,14 +1,15 @@
 # Walt
 
-Walt is a terminal wallpaper picker for Hyprland. It lets you browse, preview, apply, randomize, and rotate wallpapers without leaving the keyboard, using `hyprpaper` to set the background. The TUI stays focused on fast navigation through large wallpaper directories while still giving you themes and rotation controls when you need them.
+Walt is a wallpaper manager for Hyprland with both a terminal UI and a native desktop GUI. It lets you browse, preview, apply, randomize, and rotate wallpapers using `hyprpaper`, while keeping the TUI fast for keyboard-heavy workflows and the GUI focused on preview-driven browsing.
 
 ![Walt banner](assets/walt-banner.jpg)
 
 ## At a glance
 
-- Browse and apply wallpapers from the terminal
+- Browse and apply wallpapers from the terminal or the desktop GUI
 - Preview images in place before switching
 - Navigate large wallpaper libraries quickly
+- Open a native `walt gui` window with live wallpaper state and multi-display actions
 - Use built-in themes, including `System`
 - Apply a random wallpaper with a single command
 - Install an optional background rotation service
@@ -99,7 +100,22 @@ Launch the wallpaper browser.
 walt gui
 ```
 
-Launch the desktop GUI.
+Launch the native desktop GUI.
+
+## GUI
+
+Walt ships with a native `egui` desktop interface alongside the original TUI. The GUI keeps the same core capabilities as the terminal app:
+
+- wallpaper browsing and large preview
+- multi-display apply flows
+- random wallpaper actions
+- rotation service controls
+- wallpaper path management
+- uninstall flow
+
+![Walt GUI screenshot](assets/screenshot-gui.png)
+
+If you do not have a graphical session available, `walt gui` exits with a clear error and you can still use `walt` for the terminal interface.
 
 ### Apply random wallpapers
 
