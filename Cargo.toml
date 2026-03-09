@@ -1,6 +1,6 @@
 [package]
 name = "walt"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 
 [dependencies]
@@ -9,7 +9,11 @@ crossterm = "0.28"
 ratatui-image = { version = "5.0", features = ["crossterm"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = [
+  "jpeg",
+  "png",
+  "webp",
+] }
 dirs = "5.0"
 walkdir = "2.5"
 anyhow = "1.0"

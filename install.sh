@@ -106,6 +106,13 @@ require_cmd() {
   fi
 }
 
+cleanup_tmp_dir() {
+  local tmp_dir="$1"
+  if [[ -n "$tmp_dir" && -d "$tmp_dir" ]]; then
+    rm -rf -- "$tmp_dir"
+  fi
+}
+
 prepare_source_tree() {
   if [[ -f "./Cargo.toml" ]] && grep -q '^name = "walt"' "./Cargo.toml"; then
     pwd
@@ -117,11 +124,18 @@ prepare_source_tree() {
 
   local tmp_dir
   tmp_dir="$(mktemp -d)"
-  trap 'rm -rf "$tmp_dir"' EXIT
+  trap "cleanup_tmp_dir '$tmp_dir'" EXIT
 
-  echo "Downloading Walt source from ${DEFAULT_REF}..."
+  echo "Downloading Walt source from ${DEFAULT_REF}..." >&2
   curl -fsSL "$ARCHIVE_URL" | tar -xz -C "$tmp_dir"
-  printf '%s\n' "${tmp_dir}/${REPO_NAME}-${DEFAULT_REF}"
+
+  local source_dir="${tmp_dir}/${REPO_NAME}-${DEFAULT_REF}"
+  if [[ ! -f "${source_dir}/Cargo.toml" ]]; then
+    echo "Downloaded archive did not contain ${source_dir}/Cargo.toml" >&2
+    exit 1
+  fi
+
+  printf '%s\n' "$source_dir"
 }
 
 install_walt() {
