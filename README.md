@@ -126,11 +126,13 @@ Status:   running
 Loaded:   loaded (~/.config/systemd/user/walt-rotation.service)
 Enabled:  enabled
 Active:   active
+Mode:     selected wallpapers
 Interval: 300s (5m)
 Entries:  12 wallpapers
 ```
 
 Walt does not auto-rotate wallpapers while the TUI is open unless you install the background service.
+When rotate-all mode is enabled from the TUI, `Entries` changes to `all wallpapers`.
 
 ### Uninstall
 
@@ -159,14 +161,16 @@ Walt opens with the current wallpaper selected in the `All` list when it is alre
 - `Enter` apply the selected wallpaper
 - `/` filter the active section
 - `s` toggle sort for the active section between name and modification date
-- `r` add or remove the selected wallpaper from rotation
+- `r` add or remove the selected wallpaper from the manual rotation list
 - `Ctrl+r` pick and apply a random wallpaper
-- `R` open the rotation actions popup
+- `R` open the rotation popup for service actions and rotate-all mode
 - `i` change the interval used by the installed rotation service
 - `p` manage wallpaper paths
 - `t` open the theme picker
 - `?` open the keybindings popup
 - `q` or `Esc` quit
+
+`walt rotation enable` and `walt rotation disable` still control only the background service. The rotate-all mode is available only from the `R` popup.
 
 ### Path manager
 
