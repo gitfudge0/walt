@@ -4,14 +4,26 @@ Walt is a wallpaper manager for Hyprland with both a terminal UI and a native de
 
 ![Walt banner](assets/walt-banner.jpg)
 
-## At a glance
-
 - Browse and apply wallpapers from the terminal or native GUI
 - Preview wallpapers before switching
 - Manage multi-display wallpaper assignment
 - Apply random wallpapers from the app or CLI
 - Control a background rotation service
 - Manage wallpaper directories and themes
+
+### Get started
+
+Install Walt quickly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gitfudge0/walt/main/install.sh | bash
+```
+
+Start using the app with:
+
+```bash
+walt
+```
 
 ## Choose an Interface
 
