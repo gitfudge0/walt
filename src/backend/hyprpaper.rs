@@ -63,6 +63,18 @@ pub fn set_wallpaper_for_monitor(monitor_name: &str, wallpaper_path: &str) -> an
     apply_wallpaper_to_monitor(monitor_name, wallpaper_path)
 }
 
+pub fn set_wallpapers_for_monitors(assignments: &[(String, PathBuf)]) -> anyhow::Result<()> {
+    for wallpaper_path in unique_wallpaper_paths(assignments) {
+        preload_wallpaper(&wallpaper_path.to_string_lossy())?;
+    }
+
+    for (monitor_name, wallpaper_path) in assignments {
+        apply_wallpaper_to_monitor(monitor_name, &wallpaper_path.to_string_lossy())?;
+    }
+
+    Ok(())
+}
+
 pub fn get_active_wallpapers() -> anyhow::Result<Vec<PathBuf>> {
     let output = Command::new("hyprctl")
         .args(["hyprpaper", "listactive"])
@@ -139,6 +151,19 @@ fn preload_wallpaper(wallpaper_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn unique_wallpaper_paths(assignments: &[(String, PathBuf)]) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut unique_paths = Vec::new();
+
+    for (_, wallpaper_path) in assignments {
+        if seen.insert(wallpaper_path.clone()) {
+            unique_paths.push(wallpaper_path.clone());
+        }
+    }
+
+    unique_paths
+}
+
 fn apply_wallpaper_to_monitor(monitor_name: &str, wallpaper_path: &str) -> anyhow::Result<()> {
     let arg = format!("{monitor_name},{wallpaper_path}");
     let output = Command::new("hyprctl")
@@ -155,7 +180,7 @@ fn apply_wallpaper_to_monitor(monitor_name: &str, wallpaper_path: &str) -> anyho
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_active_wallpapers, parse_monitors, Monitor};
+    use super::{parse_active_wallpapers, parse_monitors, unique_wallpaper_paths, Monitor};
     use std::path::PathBuf;
 
     #[test]
@@ -209,6 +234,36 @@ mod tests {
                 name: "HDMI-A-1".to_string()
             }]
         );
+    }
+
+    #[test]
+    fn keeps_unique_preload_paths_in_assignment_order() {
+        let unique = unique_wallpaper_paths(&[
+            (
+                "HDMI-A-1".to_string(),
+                PathBuf::from("/wallpapers/alpha.jpg"),
+            ),
+            ("DP-1".to_string(), PathBuf::from("/wallpapers/beta.jpg")),
+            ("DP-2".to_string(), PathBuf::from("/wallpapers/alpha.jpg")),
+        ]);
+
+        assert_eq!(
+            unique,
+            vec![
+                PathBuf::from("/wallpapers/alpha.jpg"),
+                PathBuf::from("/wallpapers/beta.jpg")
+            ]
+        );
+    }
+
+    #[test]
+    fn supports_single_monitor_assignment_batches() {
+        let unique = unique_wallpaper_paths(&[(
+            "HDMI-A-1".to_string(),
+            PathBuf::from("/wallpapers/alpha.jpg"),
+        )]);
+
+        assert_eq!(unique, vec![PathBuf::from("/wallpapers/alpha.jpg")]);
     }
 
     #[test]

@@ -16,21 +16,40 @@ pub struct Config {
     pub theme_name: String,
     pub rotation: Vec<PathBuf>,
     pub rotate_all_wallpapers: bool,
+    pub rotation_same_wallpaper_on_all_displays: bool,
     pub rotation_interval_secs: u64,
     pub all_sort: String,
     pub rotation_sort: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ConfigFile {
     wallpaper_paths: Vec<PathBuf>,
     theme_name: String,
     rotation: Vec<PathBuf>,
     #[serde(default)]
     rotate_all_wallpapers: bool,
+    #[serde(default = "default_rotation_same_wallpaper_on_all_displays")]
+    rotation_same_wallpaper_on_all_displays: bool,
     rotation_interval_secs: u64,
     all_sort: String,
     rotation_sort: String,
+}
+
+impl Default for ConfigFile {
+    fn default() -> Self {
+        Self {
+            wallpaper_paths: vec![],
+            theme_name: String::new(),
+            rotation: vec![],
+            rotate_all_wallpapers: false,
+            rotation_same_wallpaper_on_all_displays:
+                default_rotation_same_wallpaper_on_all_displays(),
+            rotation_interval_secs: 0,
+            all_sort: String::new(),
+            rotation_sort: String::new(),
+        }
+    }
 }
 
 impl Config {
@@ -70,6 +89,8 @@ impl Config {
             theme_name,
             rotation: vec![],
             rotate_all_wallpapers: false,
+            rotation_same_wallpaper_on_all_displays:
+                default_rotation_same_wallpaper_on_all_displays(),
             rotation_interval_secs: 300,
             all_sort: "name".to_string(),
             rotation_sort: "name".to_string(),
@@ -95,6 +116,7 @@ impl Config {
             },
             rotation: state.rotation,
             rotate_all_wallpapers: state.rotate_all_wallpapers,
+            rotation_same_wallpaper_on_all_displays: state.rotation_same_wallpaper_on_all_displays,
             rotation_interval_secs: if state.rotation_interval_secs == 0 {
                 300
             } else {
@@ -137,6 +159,7 @@ impl Config {
             theme_name: self.theme_name.clone(),
             rotation: self.rotation.clone(),
             rotate_all_wallpapers: self.rotate_all_wallpapers,
+            rotation_same_wallpaper_on_all_displays: self.rotation_same_wallpaper_on_all_displays,
             rotation_interval_secs: self.rotation_interval_secs,
             all_sort: default_sort_name(self.all_sort.clone()),
             rotation_sort: default_sort_name(self.rotation_sort.clone()),
@@ -194,6 +217,10 @@ impl Config {
         self.rotate_all_wallpapers
     }
 
+    pub fn uses_same_wallpaper_on_all_displays_for_rotation(&self) -> bool {
+        self.rotation_same_wallpaper_on_all_displays
+    }
+
     pub fn set_rotate_all_wallpapers(&mut self, enabled: bool) -> anyhow::Result<()> {
         self.rotate_all_wallpapers = enabled;
         self.save()
@@ -202,6 +229,20 @@ impl Config {
     pub fn toggle_rotate_all_wallpapers(&mut self) -> anyhow::Result<bool> {
         let enabled = !self.rotate_all_wallpapers;
         self.set_rotate_all_wallpapers(enabled)?;
+        Ok(enabled)
+    }
+
+    pub fn set_rotation_same_wallpaper_on_all_displays(
+        &mut self,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        self.rotation_same_wallpaper_on_all_displays = enabled;
+        self.save()
+    }
+
+    pub fn toggle_rotation_same_wallpaper_on_all_displays(&mut self) -> anyhow::Result<bool> {
+        let enabled = !self.rotation_same_wallpaper_on_all_displays;
+        self.set_rotation_same_wallpaper_on_all_displays(enabled)?;
         Ok(enabled)
     }
 
@@ -241,6 +282,10 @@ fn default_sort_name(name: String) -> String {
     }
 }
 
+fn default_rotation_same_wallpaper_on_all_displays() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::Config;
@@ -256,6 +301,7 @@ mod tests {
             theme_name: "System".to_string(),
             rotation: vec![],
             rotate_all_wallpapers: false,
+            rotation_same_wallpaper_on_all_displays: true,
             rotation_interval_secs: 300,
             all_sort: "name".to_string(),
             rotation_sort: "name".to_string(),
@@ -299,6 +345,7 @@ mod tests {
         assert_eq!(config.theme_name, "Nord");
         assert_eq!(config.rotation, vec![PathBuf::from("/tmp/rotate.jpg")]);
         assert!(!config.rotate_all_wallpapers);
+        assert!(config.uses_same_wallpaper_on_all_displays_for_rotation());
         assert_eq!(config.rotation_interval_secs, 120);
         assert_eq!(config.all_sort, "modified");
         assert_eq!(config.rotation_sort, "modified");
@@ -328,6 +375,16 @@ mod tests {
 
         assert!(config.uses_all_wallpapers_for_rotation());
         assert_eq!(config.rotation, vec![PathBuf::from("/tmp/alpha.jpg")]);
+    }
+
+    #[test]
+    fn toggles_rotation_display_mode() {
+        let mut config = test_config();
+        config.rotation_same_wallpaper_on_all_displays = true;
+
+        config.rotation_same_wallpaper_on_all_displays = false;
+
+        assert!(!config.uses_same_wallpaper_on_all_displays_for_rotation());
     }
 
     #[test]
@@ -372,12 +429,14 @@ mod tests {
         let mut config = test_config();
         config.rotation = vec![PathBuf::from("/tmp/alpha.jpg")];
         config.rotate_all_wallpapers = true;
+        config.rotation_same_wallpaper_on_all_displays = false;
         config.save().expect("save config");
 
         let saved = temp_root.join("walt").join("state.json");
         let loaded = Config::from_state_file(&saved);
 
         assert!(loaded.rotate_all_wallpapers);
+        assert!(!loaded.uses_same_wallpaper_on_all_displays_for_rotation());
         assert_eq!(loaded.rotation, vec![PathBuf::from("/tmp/alpha.jpg")]);
 
         fs::remove_dir_all(&temp_root).expect("cleanup temp root");

@@ -8,7 +8,7 @@ use crate::{
     config::Config,
 };
 
-use super::set_wallpaper;
+use super::{get_monitors, set_wallpaper, set_wallpapers_for_monitors, Monitor};
 
 const CONFIG_DIR: &str = "walt";
 const ROTATION_STATE_FILE: &str = "rotation-state.json";
@@ -38,6 +38,7 @@ pub struct RotationServiceStatus {
     pub enabled: String,
     pub active: String,
     pub rotates_all_wallpapers: bool,
+    pub same_wallpaper_on_all_displays: bool,
     pub interval_secs: u64,
     pub rotation_entries: usize,
     pub service_file: PathBuf,
@@ -111,6 +112,7 @@ pub fn get_rotation_service_status() -> Result<RotationServiceStatus> {
         enabled,
         active,
         rotates_all_wallpapers: config.uses_all_wallpapers_for_rotation(),
+        same_wallpaper_on_all_displays: config.uses_same_wallpaper_on_all_displays_for_rotation(),
         interval_secs: config.rotation_interval_secs,
         rotation_entries: config.rotation.len(),
         service_file,
@@ -137,11 +139,20 @@ pub fn run_rotation_daemon() -> Result<()> {
         }
 
         let mut state = load_rotation_state()?;
-        let next = next_wallpaper(&candidates, state.last_wallpaper.as_ref())
-            .cloned()
-            .context("Could not determine next rotation wallpaper")?;
-        set_wallpaper(&next.path.to_string_lossy())?;
-        state.last_wallpaper = Some(next.path.clone());
+        if config.uses_same_wallpaper_on_all_displays_for_rotation() {
+            let next = next_wallpaper(&candidates, state.last_wallpaper.as_ref())
+                .cloned()
+                .context("Could not determine next rotation wallpaper")?;
+            set_wallpaper(&next.path.to_string_lossy())?;
+            state.last_wallpaper = Some(next.path.clone());
+        } else {
+            let monitors = get_monitors();
+            let selection =
+                next_wallpaper_assignments(&monitors, &candidates, state.last_wallpaper.as_ref())
+                    .context("Could not determine next rotation wallpapers")?;
+            set_wallpapers_for_monitors(&selection.assignments)?;
+            state.last_wallpaper = Some(selection.last_wallpaper);
+        }
         save_rotation_state(&state)?;
         thread::sleep(interval);
     }
@@ -203,6 +214,41 @@ fn next_wallpaper<'a>(
         .unwrap_or(0);
 
     wallpapers.get(next_index)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RotationAssignmentSelection {
+    assignments: Vec<(String, PathBuf)>,
+    last_wallpaper: PathBuf,
+}
+
+fn next_wallpaper_assignments(
+    monitors: &[Monitor],
+    wallpapers: &[IndexedWallpaper],
+    last_wallpaper: Option<&PathBuf>,
+) -> Option<RotationAssignmentSelection> {
+    if monitors.is_empty() || wallpapers.is_empty() {
+        return None;
+    }
+
+    let start_index = wallpapers
+        .iter()
+        .position(|wallpaper| Some(&wallpaper.path) == last_wallpaper)
+        .map(|index| (index + 1) % wallpapers.len())
+        .unwrap_or(0);
+
+    let mut assignments = Vec::with_capacity(monitors.len());
+    for (offset, monitor) in monitors.iter().enumerate() {
+        let wallpaper = &wallpapers[(start_index + offset) % wallpapers.len()];
+        assignments.push((monitor.name.clone(), wallpaper.path.clone()));
+    }
+
+    let last_wallpaper = assignments.last()?.1.clone();
+
+    Some(RotationAssignmentSelection {
+        assignments,
+        last_wallpaper,
+    })
 }
 
 fn run_systemctl(args: &[&str]) -> Result<()> {
@@ -284,11 +330,13 @@ Loaded:   {loaded}\n\
 Enabled:  {}\n\
 Active:   {}\n\
 Mode:     {}\n\
+Displays: {}\n\
 Interval: {}\n\
 Entries:  {}",
         status.enabled,
         status.active,
         rotation_mode_label(status.rotates_all_wallpapers),
+        rotation_display_mode_label(status.same_wallpaper_on_all_displays),
         format_interval(status.interval_secs),
         rotation_entries_label(status)
     )
@@ -324,6 +372,14 @@ fn rotation_mode_label(rotates_all_wallpapers: bool) -> &'static str {
         "all wallpapers"
     } else {
         "selected wallpapers"
+    }
+}
+
+fn rotation_display_mode_label(same_wallpaper_on_all_displays: bool) -> &'static str {
+    if same_wallpaper_on_all_displays {
+        "same on all displays"
+    } else {
+        "different per display"
     }
 }
 
@@ -417,8 +473,8 @@ fn config_dir() -> Result<PathBuf> {
 mod tests {
     use super::{
         filter_wallpapers_for_rotation, format_rotation_service_status,
-        is_tolerated_systemctl_failure, next_wallpaper, service_file_contents,
-        RotationServiceStatus,
+        is_tolerated_systemctl_failure, next_wallpaper, next_wallpaper_assignments,
+        service_file_contents, Monitor, RotationServiceStatus,
     };
     use crate::cache::IndexedWallpaper;
     use crate::config::Config;
@@ -446,10 +502,20 @@ mod tests {
                 .map(|name| PathBuf::from(format!("/tmp/{name}.png")))
                 .collect(),
             rotate_all_wallpapers,
+            rotation_same_wallpaper_on_all_displays: true,
             rotation_interval_secs: 300,
             all_sort: "name".to_string(),
             rotation_sort: "name".to_string(),
         }
+    }
+
+    fn monitors(names: &[&str]) -> Vec<Monitor> {
+        names
+            .iter()
+            .map(|name| Monitor {
+                name: (*name).to_string(),
+            })
+            .collect()
     }
 
     #[test]
@@ -477,6 +543,53 @@ mod tests {
         assert_eq!(filtered[0].name, "alpha");
         assert_eq!(filtered[1].name, "beta");
         assert_eq!(filtered[2].name, "gamma");
+    }
+
+    #[test]
+    fn selects_consecutive_wallpapers_for_multiple_displays() {
+        let wallpapers = vec![wallpaper("alpha"), wallpaper("beta"), wallpaper("gamma")];
+        let selection = next_wallpaper_assignments(
+            &monitors(&["eDP-1", "DP-1"]),
+            &wallpapers,
+            Some(&wallpapers[0].path),
+        )
+        .expect("selection");
+
+        assert_eq!(
+            selection.assignments,
+            vec![
+                ("eDP-1".to_string(), PathBuf::from("/tmp/beta.png")),
+                ("DP-1".to_string(), PathBuf::from("/tmp/gamma.png")),
+            ]
+        );
+        assert_eq!(selection.last_wallpaper, PathBuf::from("/tmp/gamma.png"));
+    }
+
+    #[test]
+    fn repeats_wallpapers_only_after_sequence_wraps_for_multiple_displays() {
+        let wallpapers = vec![wallpaper("alpha"), wallpaper("beta")];
+        let selection = next_wallpaper_assignments(
+            &monitors(&["eDP-1", "DP-1", "HDMI-A-1"]),
+            &wallpapers,
+            None,
+        )
+        .expect("selection");
+
+        assert_eq!(
+            selection.assignments,
+            vec![
+                ("eDP-1".to_string(), PathBuf::from("/tmp/alpha.png")),
+                ("DP-1".to_string(), PathBuf::from("/tmp/beta.png")),
+                ("HDMI-A-1".to_string(), PathBuf::from("/tmp/alpha.png")),
+            ]
+        );
+        assert_eq!(selection.last_wallpaper, PathBuf::from("/tmp/alpha.png"));
+    }
+
+    #[test]
+    fn returns_none_for_multi_display_assignments_without_monitors() {
+        let wallpapers = vec![wallpaper("alpha")];
+        assert!(next_wallpaper_assignments(&[], &wallpapers, None).is_none());
     }
 
     #[test]
@@ -518,6 +631,7 @@ mod tests {
             enabled: "enabled".to_string(),
             active: "active".to_string(),
             rotates_all_wallpapers: false,
+            same_wallpaper_on_all_displays: true,
             interval_secs: 300,
             rotation_entries: 4,
             service_file: PathBuf::from("/tmp/walt-rotation.service"),
@@ -529,6 +643,7 @@ mod tests {
         assert!(text.contains("Enabled:  enabled"));
         assert!(text.contains("Active:   active"));
         assert!(text.contains("Mode:     selected wallpapers"));
+        assert!(text.contains("Displays: same on all displays"));
         assert!(text.contains("Interval: 300s (5m)"));
         assert!(text.contains("Entries:  4 wallpapers"));
     }
@@ -540,6 +655,7 @@ mod tests {
             enabled: "not installed".to_string(),
             active: "inactive".to_string(),
             rotates_all_wallpapers: false,
+            same_wallpaper_on_all_displays: true,
             interval_secs: 45,
             rotation_entries: 1,
             service_file: PathBuf::from("/tmp/walt-rotation.service"),
@@ -550,6 +666,7 @@ mod tests {
         assert!(text.contains("Enabled:  not installed"));
         assert!(text.contains("Active:   inactive"));
         assert!(text.contains("Mode:     selected wallpapers"));
+        assert!(text.contains("Displays: same on all displays"));
         assert!(text.contains("Interval: 45s"));
         assert!(text.contains("Entries:  1 wallpaper"));
     }
@@ -561,12 +678,14 @@ mod tests {
             enabled: "enabled".to_string(),
             active: "active".to_string(),
             rotates_all_wallpapers: true,
+            same_wallpaper_on_all_displays: false,
             interval_secs: 300,
             rotation_entries: 4,
             service_file: PathBuf::from("/tmp/walt-rotation.service"),
         });
 
         assert!(text.contains("Mode:     all wallpapers"));
+        assert!(text.contains("Displays: different per display"));
         assert!(text.contains("Entries:  all wallpapers"));
     }
 }

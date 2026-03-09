@@ -1,7 +1,6 @@
 mod theme;
 
 use chrono::{Local, TimeZone};
-use rand::Rng;
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     crossterm::{
@@ -32,10 +31,11 @@ use std::{
 };
 
 use crate::backend::{
-    disable_rotation_service, enable_rotation_service, get_active_wallpapers, get_monitors,
-    get_rotation_service_status, install_rotation_service, restart_rotation_service_if_active,
-    rotation_service_badge, rotation_service_status, scan_directory, set_wallpaper,
-    set_wallpaper_for_monitor, uninstall_rotation_service, Monitor, RotationServiceStatus,
+    apply_random_plan, disable_rotation_service, enable_rotation_service, get_active_wallpapers,
+    get_monitors, get_rotation_service_status, install_rotation_service, plan_random_assignments,
+    restart_rotation_service_if_active, rotation_service_badge, rotation_service_status,
+    scan_directory, set_wallpaper, set_wallpaper_for_monitor, uninstall_rotation_service, Monitor,
+    RandomMode, RandomPlan, RotationServiceStatus,
 };
 use crate::cache::{IndexedWallpaper, ThumbnailCache, WallpaperIndex};
 use crate::config::Config;
@@ -47,6 +47,7 @@ enum AppMode {
     PathManage,
     Wallpaper,
     DisplaySelect,
+    RandomMenu,
     Search,
     IntervalEdit,
     RotationMenu,
@@ -89,6 +90,7 @@ enum RotationMenuAction {
     InstallOrUninstall,
     EnableOrDisable,
     ToggleWallpaperScope,
+    ToggleDisplayMode,
     SetInterval,
 }
 
@@ -114,11 +116,44 @@ enum WallpaperApplyAction {
     OpenDisplayPicker(Vec<String>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RandomMenuAction {
+    DifferentAll,
+    SameAll,
+    DisplayIndex(usize, String),
+}
+
+impl RandomMenuAction {
+    fn label(&self) -> String {
+        match self {
+            Self::DifferentAll => "Different on all displays".to_string(),
+            Self::SameAll => "Same on all displays".to_string(),
+            Self::DisplayIndex(index, name) => format!("Display {index}: {name}"),
+        }
+    }
+
+    fn mode(&self) -> RandomMode {
+        match self {
+            Self::DifferentAll => RandomMode::DifferentAll,
+            Self::SameAll => RandomMode::SameAll,
+            Self::DisplayIndex(index, _) => RandomMode::DisplayIndex(*index),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RandomApplyAction {
+    ErrorNoMonitors,
+    ApplyToSingleDisplay,
+    OpenRandomMenu(Vec<String>),
+}
+
 impl RotationMenuAction {
-    const ALL: [RotationMenuAction; 4] = [
+    const ALL: [RotationMenuAction; 5] = [
         RotationMenuAction::InstallOrUninstall,
         RotationMenuAction::EnableOrDisable,
         RotationMenuAction::ToggleWallpaperScope,
+        RotationMenuAction::ToggleDisplayMode,
         RotationMenuAction::SetInterval,
     ];
 
@@ -126,6 +161,7 @@ impl RotationMenuAction {
         self,
         status: Option<&RotationServiceStatus>,
         rotates_all_wallpapers: bool,
+        same_wallpaper_on_all_displays: bool,
     ) -> &'static str {
         match self {
             Self::InstallOrUninstall => {
@@ -150,6 +186,13 @@ impl RotationMenuAction {
                     "Use selected wallpapers"
                 } else {
                     "Rotate all wallpapers"
+                }
+            }
+            Self::ToggleDisplayMode => {
+                if same_wallpaper_on_all_displays {
+                    "Use different wallpapers per display"
+                } else {
+                    "Use same wallpaper on all displays"
                 }
             }
             Self::SetInterval => "Change interval",
@@ -220,6 +263,7 @@ pub struct App {
     theme_state: ListState,
     rotation_menu_state: ListState,
     display_select_state: ListState,
+    random_menu_state: ListState,
     active_section: SectionKind,
     mode: AppMode,
     interval_return_mode: AppMode,
@@ -241,7 +285,9 @@ pub struct App {
     active_wallpaper_paths: HashSet<PathBuf>,
     rotation_paths: HashSet<PathBuf>,
     display_targets: Vec<DisplayTarget>,
+    random_targets: Vec<RandomMenuAction>,
     pending_wallpaper_path: Option<PathBuf>,
+    pending_random_candidates: Vec<PathBuf>,
     last_preview_target: Option<(PathBuf, Rect)>,
     rotation_service_state: Option<RotationServiceStatus>,
     rotation_status_text: String,
@@ -272,6 +318,8 @@ impl App {
         let mut rotation_menu_state = ListState::default();
         rotation_menu_state.select(Some(0));
         let display_select_state = ListState::default();
+        let mut random_menu_state = ListState::default();
+        random_menu_state.select(Some(0));
 
         let mode = if config.is_empty() {
             AppMode::Setup
@@ -294,6 +342,7 @@ impl App {
             theme_state,
             rotation_menu_state,
             display_select_state,
+            random_menu_state,
             active_section: SectionKind::All,
             mode,
             interval_return_mode: AppMode::Wallpaper,
@@ -315,7 +364,9 @@ impl App {
             active_wallpaper_paths: HashSet::new(),
             rotation_paths: HashSet::new(),
             display_targets: vec![],
+            random_targets: vec![],
             pending_wallpaper_path: None,
+            pending_random_candidates: vec![],
             last_preview_target: None,
             rotation_service_state: None,
             rotation_status_text: String::new(),
@@ -400,6 +451,7 @@ impl App {
                             AppMode::Setup => self.handle_setup_key(key.code)?,
                             AppMode::PathManage => self.handle_path_manage_key(key.code),
                             AppMode::DisplaySelect => self.handle_display_select_key(key.code),
+                            AppMode::RandomMenu => self.handle_random_menu_key(key.code),
                             AppMode::Search => self.handle_search_key(key.code),
                             AppMode::IntervalEdit => self.handle_interval_key(key.code),
                             AppMode::RotationMenu => self.handle_rotation_menu_key(key.code),
@@ -487,7 +539,7 @@ impl App {
             (KeyCode::Char('p'), KeyModifiers::NONE) => self.mode = AppMode::PathManage,
             (KeyCode::Char('r'), KeyModifiers::NONE) => self.toggle_rotation(),
             (KeyCode::Char('r'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.select_random_wallpaper()?
+                self.trigger_random_wallpaper()?
             }
             (KeyCode::Char('t'), KeyModifiers::NONE) => self.open_theme_picker(),
             (KeyCode::Char('i'), KeyModifiers::NONE) => self.open_interval_editor(),
@@ -606,6 +658,22 @@ impl App {
         }
     }
 
+    fn handle_random_menu_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc | KeyCode::Char('q') => self.close_random_menu(),
+            KeyCode::Char('j') | KeyCode::Down => self.move_down(),
+            KeyCode::Char('k') | KeyCode::Up => self.move_up(),
+            KeyCode::Char('g') | KeyCode::Home => self.go_to_top(),
+            KeyCode::Char('G') | KeyCode::End => self.go_to_bottom(),
+            KeyCode::Enter => {
+                if let Err(error) = self.apply_random_menu_selection() {
+                    eprintln!("Failed to apply random wallpaper: {error}");
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_theme_select_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::Esc | KeyCode::Char('q') => self.cancel_theme_picker(),
@@ -656,6 +724,7 @@ impl App {
                 }
             }
             AppMode::DisplaySelect => {}
+            AppMode::RandomMenu => {}
             AppMode::Search => {}
             AppMode::IntervalEdit => {}
             AppMode::RotationMenu => {}
@@ -702,6 +771,13 @@ impl App {
                 if len > 0 {
                     let index = self.display_select_state.selected().unwrap_or(0);
                     self.display_select_state.select(Some((index + 1) % len));
+                }
+            }
+            AppMode::RandomMenu => {
+                let len = self.random_targets.len();
+                if len > 0 {
+                    let index = self.random_menu_state.selected().unwrap_or(0);
+                    self.random_menu_state.select(Some((index + 1) % len));
                 }
             }
             AppMode::Search => {}
@@ -767,6 +843,17 @@ impl App {
                     }));
                 }
             }
+            AppMode::RandomMenu => {
+                let len = self.random_targets.len();
+                if len > 0 {
+                    let index = self.random_menu_state.selected().unwrap_or(0);
+                    self.random_menu_state.select(Some(if index == 0 {
+                        len - 1
+                    } else {
+                        index - 1
+                    }));
+                }
+            }
             AppMode::Search => {}
             AppMode::IntervalEdit => {}
             AppMode::RotationMenu => {
@@ -807,6 +894,11 @@ impl App {
                     self.display_select_state.select(Some(0));
                 }
             }
+            AppMode::RandomMenu => {
+                if !self.random_targets.is_empty() {
+                    self.random_menu_state.select(Some(0));
+                }
+            }
             AppMode::Search => {}
             AppMode::IntervalEdit => {}
             AppMode::RotationMenu => self.rotation_menu_state.select(Some(0)),
@@ -845,6 +937,12 @@ impl App {
                 if !self.display_targets.is_empty() {
                     self.display_select_state
                         .select(Some(self.display_targets.len() - 1));
+                }
+            }
+            AppMode::RandomMenu => {
+                if !self.random_targets.is_empty() {
+                    self.random_menu_state
+                        .select(Some(self.random_targets.len() - 1));
                 }
             }
             AppMode::Search => {}
@@ -926,6 +1024,20 @@ impl App {
         self.mode = AppMode::RotationMenu;
     }
 
+    fn open_random_menu(&mut self, monitor_names: Vec<String>, candidates: Vec<PathBuf>) {
+        self.random_targets = random_menu_actions(&monitor_names);
+        self.random_menu_state.select(Some(0));
+        self.pending_random_candidates = candidates;
+        self.mode = AppMode::RandomMenu;
+    }
+
+    fn close_random_menu(&mut self) {
+        self.random_targets.clear();
+        self.random_menu_state.select(None);
+        self.pending_random_candidates.clear();
+        self.mode = AppMode::Wallpaper;
+    }
+
     fn open_display_picker(&mut self, monitor_names: Vec<String>, wallpaper_path: PathBuf) {
         self.display_targets = display_targets_from_names(&monitor_names);
         self.display_select_state
@@ -995,6 +1107,7 @@ impl App {
                 }
             }
             RotationMenuAction::ToggleWallpaperScope => self.toggle_rotate_all_wallpapers(),
+            RotationMenuAction::ToggleDisplayMode => self.toggle_rotation_display_mode(),
             RotationMenuAction::SetInterval => self.open_interval_editor(),
         }
     }
@@ -1192,22 +1305,101 @@ impl App {
         }
     }
 
-    fn select_random_wallpaper(&mut self) -> io::Result<()> {
-        let indices = self.section_indices(self.active_section);
-        if indices.is_empty() {
+    fn trigger_random_wallpaper(&mut self) -> io::Result<()> {
+        let candidates = self.visible_wallpaper_paths();
+        if candidates.is_empty() {
             return Ok(());
         }
 
-        let random_index = rand::thread_rng().gen_range(0..indices.len());
-        self.section_state_mut(self.active_section)
-            .select(Some(random_index));
-        self.request_preview_load();
-
-        if let Err(error) = self.apply_wallpaper() {
-            eprintln!("Failed to apply random wallpaper: {error}");
+        match random_apply_action(&get_monitors()) {
+            RandomApplyAction::ErrorNoMonitors => {
+                eprintln!("Failed to apply random wallpaper: No monitors found")
+            }
+            RandomApplyAction::ApplyToSingleDisplay => {
+                if let Err(error) =
+                    self.apply_random_wallpaper_mode(RandomMode::DisplayIndex(0), &candidates)
+                {
+                    eprintln!("Failed to apply random wallpaper: {error}");
+                }
+            }
+            RandomApplyAction::OpenRandomMenu(monitor_names) => {
+                self.open_random_menu(monitor_names, candidates);
+            }
         }
 
         Ok(())
+    }
+
+    fn apply_random_menu_selection(&mut self) -> anyhow::Result<()> {
+        let Some(index) = self.random_menu_state.selected() else {
+            return Ok(());
+        };
+        let Some(action) = self.random_targets.get(index).cloned() else {
+            return Ok(());
+        };
+
+        self.apply_random_wallpaper_mode(action.mode(), &self.pending_random_candidates.clone())?;
+        self.close_random_menu();
+        Ok(())
+    }
+
+    fn apply_random_wallpaper_mode(
+        &mut self,
+        mode: RandomMode,
+        candidates: &[PathBuf],
+    ) -> anyhow::Result<()> {
+        let monitors = get_monitors();
+        let plan = plan_random_assignments(&monitors, candidates, mode)?;
+        apply_random_plan(&plan)?;
+        self.refresh_active_wallpapers();
+        self.sync_selection_with_random_plan(&plan);
+
+        if let Some(assignment) = plan.assignments.first() {
+            if matches!(plan.mode, RandomMode::DifferentAll) {
+                println!("Applied different random wallpapers across displays.");
+            } else {
+                println!(
+                    "Random wallpaper applied: {}",
+                    assignment.wallpaper_path.display()
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn visible_wallpaper_paths(&self) -> Vec<PathBuf> {
+        self.section_indices(self.active_section)
+            .into_iter()
+            .filter_map(|index| self.wallpapers.get(index))
+            .map(|wallpaper| wallpaper.path.clone())
+            .collect()
+    }
+
+    fn sync_selection_with_random_plan(&mut self, plan: &RandomPlan) {
+        let mut unique_paths = HashSet::new();
+        for assignment in &plan.assignments {
+            unique_paths.insert(assignment.wallpaper_path.clone());
+        }
+
+        if unique_paths.len() != 1 {
+            return;
+        }
+
+        let Some(path) = unique_paths.into_iter().next() else {
+            return;
+        };
+        let indices = self.section_indices(self.active_section);
+        if let Some(selected) = indices.iter().position(|index| {
+            self.wallpapers
+                .get(*index)
+                .map(|wallpaper| wallpaper.path == path)
+                .unwrap_or(false)
+        }) {
+            self.section_state_mut(self.active_section)
+                .select(Some(selected));
+            self.request_preview_load();
+        }
     }
 
     fn ui(&mut self, frame: &mut Frame) {
@@ -1224,6 +1416,7 @@ impl App {
             AppMode::ThemeSelect => self.render_theme_picker(frame, chunks[0], theme),
             AppMode::Wallpaper
             | AppMode::DisplaySelect
+            | AppMode::RandomMenu
             | AppMode::Search
             | AppMode::IntervalEdit
             | AppMode::RotationMenu
@@ -1249,6 +1442,7 @@ impl App {
                     AppMode::DisplaySelect => {
                         self.render_display_select_overlay(frame, chunks[0], theme)
                     }
+                    AppMode::RandomMenu => self.render_random_menu_overlay(frame, chunks[0], theme),
                     AppMode::Search => self.render_search_overlay(frame, chunks[0], theme),
                     AppMode::IntervalEdit => self.render_interval_overlay(frame, chunks[0], theme),
                     AppMode::RotationMenu => {
@@ -1575,6 +1769,9 @@ impl App {
                 }
             }
             AppMode::PathManage => vec![("a", "add"), ("d", "remove"), ("p", "back")],
+            AppMode::RandomMenu => {
+                vec![("↑/↓", "choose"), ("Enter", "apply"), ("Esc", "close")]
+            }
             AppMode::Search => vec![("Type", "filter"), ("Enter", "confirm"), ("Esc", "cancel")],
             AppMode::IntervalEdit => {
                 vec![("Type", "seconds"), ("Enter", "save"), ("Esc", "cancel")]
@@ -1595,7 +1792,7 @@ impl App {
                 ("/", "filter"),
                 ("r", "rotate"),
                 ("R", "rotation options"),
-                ("Ctrl+r", "random"),
+                ("Ctrl+r", "random/options"),
                 ("p", "paths"),
             ],
         };
@@ -1647,7 +1844,7 @@ impl App {
     }
 
     fn render_display_select_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
-        let popup_height = (self.display_targets.len() as u16 + 6).max(8);
+        let popup_height = (self.display_targets.len() as u16 + 6).max(7);
         let popup = centered_rect(60, popup_height, area);
         frame.render_widget(Clear, popup);
         frame.render_widget(Block::default().style(theme.surface), popup);
@@ -1660,7 +1857,7 @@ impl App {
 
         let sections = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(2), Constraint::Min(0)])
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
             .split(inner);
 
         let help = Para::new(vec![
@@ -1669,6 +1866,7 @@ impl App {
                 theme.muted,
             )),
             Line::from(Span::styled("Esc cancels without applying.", theme.key)),
+            popup_divider_line(sections[0].width, theme),
         ])
         .alignment(Alignment::Left);
         frame.render_widget(help, sections[0]);
@@ -1689,7 +1887,57 @@ impl App {
             .collect::<Vec<_>>();
         let mut state = self.display_select_state.clone();
         let list = List::new(items)
-            .block(self.themed_block(" Displays ", theme))
+            .style(theme.surface)
+            .highlight_style(theme.highlight)
+            .highlight_symbol("› ");
+        frame.render_stateful_widget(list, sections[1], &mut state);
+    }
+
+    fn render_random_menu_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
+        let popup_height = (self.random_targets.len() as u16 + 6).max(7);
+        let popup = centered_rect(60, popup_height, area);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(Block::default().style(theme.surface), popup);
+
+        let block = self
+            .themed_block(" Random Options ", theme)
+            .style(theme.surface);
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(inner);
+
+        let help = Para::new(vec![
+            Line::from(Span::styled(
+                "Choose a random wallpaper strategy.",
+                theme.muted,
+            )),
+            Line::from(Span::styled("Esc closes without applying.", theme.key)),
+            popup_divider_line(sections[0].width, theme),
+        ])
+        .alignment(Alignment::Left);
+        frame.render_widget(help, sections[0]);
+
+        let selected = self.random_menu_state.selected();
+        let items = self
+            .random_targets
+            .iter()
+            .enumerate()
+            .map(|(index, action)| {
+                let style = if selected == Some(index) {
+                    theme.highlight
+                } else {
+                    theme.accent
+                };
+                ListItem::new(action.label()).style(style)
+            })
+            .collect::<Vec<_>>();
+        let mut state = self.random_menu_state.clone();
+        let list = List::new(items)
+            .style(theme.surface)
             .highlight_style(theme.highlight)
             .highlight_symbol("› ");
         frame.render_stateful_widget(list, sections[1], &mut state);
@@ -1720,42 +1968,55 @@ impl App {
                 } else {
                     theme.accent
                 };
-                ListItem::new(action.label(
-                    self.rotation_service_state.as_ref(),
-                    self.config.uses_all_wallpapers_for_rotation(),
-                ))
+                ListItem::new(
+                    action.label(
+                        self.rotation_service_state.as_ref(),
+                        self.config.uses_all_wallpapers_for_rotation(),
+                        self.config
+                            .uses_same_wallpaper_on_all_displays_for_rotation(),
+                    ),
+                )
                 .style(style)
             })
             .collect::<Vec<_>>();
 
+        let status_height = status_lines.len() as u16;
         let sections = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(7), Constraint::Min(0)])
+            .constraints([
+                Constraint::Length(status_height),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
             .split(inner);
 
         let status = Para::new(status_lines)
-            .block(self.themed_block(" Service Status ", theme))
+            .style(theme.surface)
             .alignment(Alignment::Left);
         frame.render_widget(status, sections[0]);
+        frame.render_widget(
+            Para::new(popup_divider_line(sections[1].width, theme)).style(theme.surface),
+            sections[1],
+        );
 
         let mut state = self.rotation_menu_state.clone();
         let actions = List::new(items)
-            .block(self.themed_block(" Actions ", theme))
+            .style(theme.surface)
             .highlight_style(theme.highlight)
             .highlight_symbol("› ");
-        frame.render_stateful_widget(actions, sections[1], &mut state);
+        frame.render_stateful_widget(actions, sections[2], &mut state);
     }
 
     fn render_keybindings_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
-        let popup = centered_rect(72, 12, area);
+        let popup = centered_rect(72, 13, area);
         let pairs = [
             (("Move", "↑/↓ or j/k"), ("Sections", "Tab/l, S-Tab/h")),
             (("Apply", "Enter / popup"), ("All Displays", "A")),
-            (("Rotation", "r"), ("Rotation Options", "R")),
-            (("Interval", "i"), ("Filter", "/")),
-            (("Sort", "s"), ("Paths", "p")),
-            (("Theme", "t"), ("Keybindings", "?")),
-            (("Quit", "q / Esc"), ("Close", "? / Esc")),
+            (("Random", "Ctrl+r / popup"), ("Rotation", "r")),
+            (("Rotation Options", "R"), ("Interval", "i")),
+            (("Sort", "s"), ("Filter", "/")),
+            (("Paths", "p"), ("Theme", "t")),
+            (("Keybindings", "?"), ("Quit", "q / Esc")),
         ];
         let left_label_width = pairs
             .iter()
@@ -2045,6 +2306,20 @@ impl App {
         }
     }
 
+    fn toggle_rotation_display_mode(&mut self) {
+        match self.config.toggle_rotation_same_wallpaper_on_all_displays() {
+            Ok(_) => {
+                self.restart_rotation_service_if_active();
+                self.refresh_rotation_status();
+            }
+            Err(error) => {
+                self.rotation_service_state = None;
+                self.rotation_status_text =
+                    format!("Rotation Service\nStatus:   error\nError:    {error}");
+            }
+        }
+    }
+
     fn section_title(&self, section: SectionKind) -> String {
         format!(
             "{} [{}{}]",
@@ -2235,6 +2510,30 @@ fn default_display_target_selection(targets: &[DisplayTarget]) -> Option<usize> 
         .position(|target| matches!(target, DisplayTarget::Monitor(_)))
 }
 
+fn random_apply_action(monitors: &[Monitor]) -> RandomApplyAction {
+    match monitors {
+        [] => RandomApplyAction::ErrorNoMonitors,
+        [_monitor] => RandomApplyAction::ApplyToSingleDisplay,
+        _ => RandomApplyAction::OpenRandomMenu(
+            monitors
+                .iter()
+                .map(|monitor| monitor.name.clone())
+                .collect(),
+        ),
+    }
+}
+
+fn random_menu_actions(monitor_names: &[String]) -> Vec<RandomMenuAction> {
+    let mut actions = vec![RandomMenuAction::DifferentAll, RandomMenuAction::SameAll];
+    actions.extend(
+        monitor_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| RandomMenuAction::DisplayIndex(index, name.clone())),
+    );
+    actions
+}
+
 fn help_line(controls: &[(&str, &str)], theme: ThemePalette) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
 
@@ -2249,6 +2548,11 @@ fn help_line(controls: &[(&str, &str)], theme: ThemePalette) -> Line<'static> {
     }
 
     Line::from(spans)
+}
+
+fn popup_divider_line(width: u16, theme: ThemePalette) -> Line<'static> {
+    let divider_width = width.saturating_sub(1).max(1) as usize;
+    Line::from(Span::styled("─".repeat(divider_width), theme.border))
 }
 
 fn first_active_visible_index(
@@ -2297,8 +2601,9 @@ fn wallpaper_marker_prefix(is_active: bool) -> String {
 mod marker_tests {
     use super::{
         default_display_target_selection, display_targets_from_names, first_active_visible_index,
-        normalized_section_selection, rotation_section_message, wallpaper_apply_action,
-        wallpaper_marker_prefix, DisplayTarget, RotationMenuAction, RotationServiceStatus,
+        normalized_section_selection, random_apply_action, random_menu_actions,
+        rotation_section_message, wallpaper_apply_action, wallpaper_marker_prefix, DisplayTarget,
+        RandomApplyAction, RandomMenuAction, RotationMenuAction, RotationServiceStatus,
         WallpaperApplyAction,
     };
     use crate::backend::Monitor;
@@ -2409,6 +2714,46 @@ mod marker_tests {
     }
 
     #[test]
+    fn random_menu_actions_include_all_modes_in_order() {
+        let actions = random_menu_actions(&["HDMI-A-1".to_string(), "DP-1".to_string()]);
+
+        assert_eq!(
+            actions,
+            vec![
+                RandomMenuAction::DifferentAll,
+                RandomMenuAction::SameAll,
+                RandomMenuAction::DisplayIndex(0, "HDMI-A-1".to_string()),
+                RandomMenuAction::DisplayIndex(1, "DP-1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn random_apply_action_applies_directly_for_one_monitor() {
+        assert_eq!(
+            random_apply_action(&[Monitor {
+                name: "HDMI-A-1".to_string()
+            }]),
+            RandomApplyAction::ApplyToSingleDisplay
+        );
+    }
+
+    #[test]
+    fn random_apply_action_opens_menu_for_multiple_monitors() {
+        assert_eq!(
+            random_apply_action(&[
+                Monitor {
+                    name: "HDMI-A-1".to_string()
+                },
+                Monitor {
+                    name: "DP-1".to_string()
+                }
+            ]),
+            RandomApplyAction::OpenRandomMenu(vec!["HDMI-A-1".to_string(), "DP-1".to_string()])
+        );
+    }
+
+    #[test]
     fn wallpaper_apply_action_errors_without_monitors() {
         assert_eq!(
             wallpaper_apply_action(&[]),
@@ -2462,18 +2807,27 @@ mod marker_tests {
             enabled: "enabled".to_string(),
             active: "active".to_string(),
             rotates_all_wallpapers: false,
+            same_wallpaper_on_all_displays: true,
             interval_secs: 300,
             rotation_entries: 3,
             service_file: PathBuf::from("/tmp/walt-rotation.service"),
         });
 
         assert_eq!(
-            RotationMenuAction::ToggleWallpaperScope.label(status, false),
+            RotationMenuAction::ToggleWallpaperScope.label(status, false, true),
             "Rotate all wallpapers"
         );
         assert_eq!(
-            RotationMenuAction::ToggleWallpaperScope.label(status, true),
+            RotationMenuAction::ToggleWallpaperScope.label(status, true, true),
             "Use selected wallpapers"
+        );
+        assert_eq!(
+            RotationMenuAction::ToggleDisplayMode.label(status, false, true),
+            "Use different wallpapers per display"
+        );
+        assert_eq!(
+            RotationMenuAction::ToggleDisplayMode.label(status, false, false),
+            "Use same wallpaper on all displays"
         );
     }
 }
