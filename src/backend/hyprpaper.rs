@@ -1,6 +1,6 @@
 use std::{collections::HashSet, path::PathBuf, process::Command};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Monitor {
     pub name: String,
 }
@@ -40,39 +40,27 @@ fn parse_monitors(json_str: &str) -> Vec<Monitor> {
 }
 
 pub fn set_wallpaper(wallpaper_path: &str) -> anyhow::Result<()> {
-    // Preload first to avoid flicker
-    let preload_output = Command::new("hyprctl")
-        .args(["hyprpaper", "preload", wallpaper_path])
-        .output()
-        .map_err(|e| anyhow::anyhow!("Failed to preload wallpaper: {}", e))?;
-
-    if !preload_output.status.success() {
-        return Err(command_failure("Preload failed", &preload_output));
-    }
-
-    // Get monitors and set wallpaper for each
+    preload_wallpaper(wallpaper_path)?;
     let monitors = get_monitors();
     if monitors.is_empty() {
         return Err(anyhow::anyhow!("No monitors found"));
     }
 
     for monitor in monitors {
-        let arg = format!("{},{}", monitor.name, wallpaper_path);
-        let output = Command::new("hyprctl")
-            .args(["hyprpaper", "wallpaper", &arg])
-            .output()
-            .map_err(|e| anyhow::anyhow!("Failed to set wallpaper: {}", e))?;
-
-        if !output.status.success() {
+        if let Err(error) = apply_wallpaper_to_monitor(&monitor.name, wallpaper_path) {
             eprintln!(
                 "Warning: Failed to set wallpaper for {}: {}",
-                monitor.name,
-                command_failure("wallpaper command failed", &output)
+                monitor.name, error
             );
         }
     }
 
     Ok(())
+}
+
+pub fn set_wallpaper_for_monitor(monitor_name: &str, wallpaper_path: &str) -> anyhow::Result<()> {
+    preload_wallpaper(wallpaper_path)?;
+    apply_wallpaper_to_monitor(monitor_name, wallpaper_path)
 }
 
 pub fn get_active_wallpapers() -> anyhow::Result<Vec<PathBuf>> {
@@ -138,10 +126,90 @@ fn command_failure(context: &str, output: &std::process::Output) -> anyhow::Erro
     anyhow::anyhow!("{context}: {details}")
 }
 
+fn preload_wallpaper(wallpaper_path: &str) -> anyhow::Result<()> {
+    let preload_output = Command::new("hyprctl")
+        .args(["hyprpaper", "preload", wallpaper_path])
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to preload wallpaper: {}", e))?;
+
+    if !preload_output.status.success() {
+        return Err(command_failure("Preload failed", &preload_output));
+    }
+
+    Ok(())
+}
+
+fn apply_wallpaper_to_monitor(monitor_name: &str, wallpaper_path: &str) -> anyhow::Result<()> {
+    let arg = format!("{monitor_name},{wallpaper_path}");
+    let output = Command::new("hyprctl")
+        .args(["hyprpaper", "wallpaper", &arg])
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to set wallpaper: {}", e))?;
+
+    if !output.status.success() {
+        return Err(command_failure("wallpaper command failed", &output));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_active_wallpapers;
+    use super::{parse_active_wallpapers, parse_monitors, Monitor};
     use std::path::PathBuf;
+
+    #[test]
+    fn parses_one_monitor() {
+        let monitors = parse_monitors(r#"[{"name":"HDMI-A-1","width":1920,"height":1080}]"#);
+
+        assert_eq!(
+            monitors,
+            vec![Monitor {
+                name: "HDMI-A-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_multiple_monitors() {
+        let monitors = parse_monitors(
+            r#"[
+                {"name":"HDMI-A-1","width":1920,"height":1080},
+                {"name":"DP-1","width":2560,"height":1440}
+            ]"#,
+        );
+
+        assert_eq!(
+            monitors,
+            vec![
+                Monitor {
+                    name: "HDMI-A-1".to_string()
+                },
+                Monitor {
+                    name: "DP-1".to_string()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_invalid_monitor_entries() {
+        let monitors = parse_monitors(
+            r#"[
+                {"name":"HDMI-A-1","width":1920,"height":1080},
+                {"name":"DP-1","width":2560},
+                {"name":"DP-2","height":1440},
+                {"width":1280,"height":720}
+            ]"#,
+        );
+
+        assert_eq!(
+            monitors,
+            vec![Monitor {
+                name: "HDMI-A-1".to_string()
+            }]
+        );
+    }
 
     #[test]
     fn parses_one_active_wallpaper() {

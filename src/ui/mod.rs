@@ -7,10 +7,14 @@ use ratatui::{
     crossterm::{
         event::{
             self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-            KeyModifiers,
+            KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+            PushKeyboardEnhancementFlags,
         },
         execute,
-        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+        terminal::{
+            disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+            LeaveAlternateScreen,
+        },
     },
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     symbols::border,
@@ -28,10 +32,10 @@ use std::{
 };
 
 use crate::backend::{
-    disable_rotation_service, enable_rotation_service, get_active_wallpapers,
+    disable_rotation_service, enable_rotation_service, get_active_wallpapers, get_monitors,
     get_rotation_service_status, install_rotation_service, restart_rotation_service_if_active,
     rotation_service_badge, rotation_service_status, scan_directory, set_wallpaper,
-    uninstall_rotation_service, RotationServiceStatus,
+    set_wallpaper_for_monitor, uninstall_rotation_service, Monitor, RotationServiceStatus,
 };
 use crate::cache::{IndexedWallpaper, ThumbnailCache, WallpaperIndex};
 use crate::config::Config;
@@ -42,6 +46,7 @@ enum AppMode {
     Setup,
     PathManage,
     Wallpaper,
+    DisplaySelect,
     Search,
     IntervalEdit,
     RotationMenu,
@@ -85,6 +90,28 @@ enum RotationMenuAction {
     EnableOrDisable,
     ToggleWallpaperScope,
     SetInterval,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DisplayTarget {
+    Monitor(String),
+    AllDisplays,
+}
+
+impl DisplayTarget {
+    fn label(&self) -> &str {
+        match self {
+            Self::Monitor(name) => name,
+            Self::AllDisplays => "All displays",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WallpaperApplyAction {
+    ErrorNoMonitors,
+    ApplyToSingleDisplay(String),
+    OpenDisplayPicker(Vec<String>),
 }
 
 impl RotationMenuAction {
@@ -192,6 +219,7 @@ pub struct App {
     rotation_state: ListState,
     theme_state: ListState,
     rotation_menu_state: ListState,
+    display_select_state: ListState,
     active_section: SectionKind,
     mode: AppMode,
     interval_return_mode: AppMode,
@@ -212,6 +240,8 @@ pub struct App {
     rotation_indices: Vec<usize>,
     active_wallpaper_paths: HashSet<PathBuf>,
     rotation_paths: HashSet<PathBuf>,
+    display_targets: Vec<DisplayTarget>,
+    pending_wallpaper_path: Option<PathBuf>,
     last_preview_target: Option<(PathBuf, Rect)>,
     rotation_service_state: Option<RotationServiceStatus>,
     rotation_status_text: String,
@@ -241,6 +271,7 @@ impl App {
         theme_state.select(Some(theme.index()));
         let mut rotation_menu_state = ListState::default();
         rotation_menu_state.select(Some(0));
+        let display_select_state = ListState::default();
 
         let mode = if config.is_empty() {
             AppMode::Setup
@@ -262,6 +293,7 @@ impl App {
             rotation_state: ListState::default(),
             theme_state,
             rotation_menu_state,
+            display_select_state,
             active_section: SectionKind::All,
             mode,
             interval_return_mode: AppMode::Wallpaper,
@@ -282,6 +314,8 @@ impl App {
             rotation_indices: vec![],
             active_wallpaper_paths: HashSet::new(),
             rotation_paths: HashSet::new(),
+            display_targets: vec![],
+            pending_wallpaper_path: None,
             last_preview_target: None,
             rotation_service_state: None,
             rotation_status_text: String::new(),
@@ -312,6 +346,17 @@ impl App {
     pub fn run(&mut self) -> anyhow::Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
+        let keyboard_enhancement_enabled = matches!(supports_keyboard_enhancement(), Ok(true))
+            && execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
+            )
+            .is_ok();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
@@ -319,11 +364,20 @@ impl App {
         let res = self.run_app(&mut terminal);
 
         disable_raw_mode()?;
-        execute!(
-            terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        )?;
+        if keyboard_enhancement_enabled {
+            execute!(
+                terminal.backend_mut(),
+                PopKeyboardEnhancementFlags,
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            )?;
+        } else {
+            execute!(
+                terminal.backend_mut(),
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            )?;
+        }
         terminal.show_cursor()?;
 
         if let Err(err) = res {
@@ -345,6 +399,7 @@ impl App {
                         match self.mode {
                             AppMode::Setup => self.handle_setup_key(key.code)?,
                             AppMode::PathManage => self.handle_path_manage_key(key.code),
+                            AppMode::DisplaySelect => self.handle_display_select_key(key.code),
                             AppMode::Search => self.handle_search_key(key.code),
                             AppMode::IntervalEdit => self.handle_interval_key(key.code),
                             AppMode::RotationMenu => self.handle_rotation_menu_key(key.code),
@@ -364,6 +419,11 @@ impl App {
 
     fn handle_setup_key(&mut self, key: KeyCode) -> io::Result<()> {
         match key {
+            KeyCode::Esc => {
+                if self.is_adding_path() {
+                    self.cancel_path_add();
+                }
+            }
             KeyCode::Up => self.move_up(),
             KeyCode::Down => self.move_down(),
             KeyCode::Home => self.go_to_top(),
@@ -445,6 +505,11 @@ impl App {
             (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, _) => self.move_up(),
             (KeyCode::Char('g'), KeyModifiers::NONE) | (KeyCode::Home, _) => self.go_to_top(),
             (KeyCode::Char('G'), KeyModifiers::SHIFT) | (KeyCode::End, _) => self.go_to_bottom(),
+            (KeyCode::Char('A'), KeyModifiers::SHIFT) => {
+                if let Err(error) = self.apply_wallpaper() {
+                    eprintln!("Failed to apply: {error}");
+                }
+            }
             (KeyCode::Enter, _) => self.handle_enter()?,
             _ => {}
         }
@@ -525,6 +590,22 @@ impl App {
         }
     }
 
+    fn handle_display_select_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc | KeyCode::Char('q') => self.close_display_picker(),
+            KeyCode::Char('j') | KeyCode::Down => self.move_down(),
+            KeyCode::Char('k') | KeyCode::Up => self.move_up(),
+            KeyCode::Char('g') | KeyCode::Home => self.go_to_top(),
+            KeyCode::Char('G') | KeyCode::End => self.go_to_bottom(),
+            KeyCode::Enter => {
+                if let Err(error) = self.apply_display_selection() {
+                    eprintln!("Failed to apply: {error}");
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_theme_select_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::Esc | KeyCode::Char('q') => self.cancel_theme_picker(),
@@ -570,10 +651,11 @@ impl App {
                 }
             }
             AppMode::Wallpaper => {
-                if let Err(error) = self.apply_wallpaper() {
+                if let Err(error) = self.apply_wallpaper_on_enter() {
                     eprintln!("Failed to apply: {error}");
                 }
             }
+            AppMode::DisplaySelect => {}
             AppMode::Search => {}
             AppMode::IntervalEdit => {}
             AppMode::RotationMenu => {}
@@ -613,6 +695,13 @@ impl App {
                     let index = state.selected().unwrap_or(0);
                     state.select(Some((index + 1) % len));
                     self.request_preview_load();
+                }
+            }
+            AppMode::DisplaySelect => {
+                let len = self.display_targets.len();
+                if len > 0 {
+                    let index = self.display_select_state.selected().unwrap_or(0);
+                    self.display_select_state.select(Some((index + 1) % len));
                 }
             }
             AppMode::Search => {}
@@ -667,6 +756,17 @@ impl App {
                     self.request_preview_load();
                 }
             }
+            AppMode::DisplaySelect => {
+                let len = self.display_targets.len();
+                if len > 0 {
+                    let index = self.display_select_state.selected().unwrap_or(0);
+                    self.display_select_state.select(Some(if index == 0 {
+                        len - 1
+                    } else {
+                        index - 1
+                    }));
+                }
+            }
             AppMode::Search => {}
             AppMode::IntervalEdit => {}
             AppMode::RotationMenu => {
@@ -702,6 +802,11 @@ impl App {
                     self.request_preview_load();
                 }
             }
+            AppMode::DisplaySelect => {
+                if !self.display_targets.is_empty() {
+                    self.display_select_state.select(Some(0));
+                }
+            }
             AppMode::Search => {}
             AppMode::IntervalEdit => {}
             AppMode::RotationMenu => self.rotation_menu_state.select(Some(0)),
@@ -734,6 +839,12 @@ impl App {
                     self.section_state_mut(self.active_section)
                         .select(Some(len - 1));
                     self.request_preview_load();
+                }
+            }
+            AppMode::DisplaySelect => {
+                if !self.display_targets.is_empty() {
+                    self.display_select_state
+                        .select(Some(self.display_targets.len() - 1));
                 }
             }
             AppMode::Search => {}
@@ -813,6 +924,21 @@ impl App {
         self.rotation_menu_state.select(Some(0));
         self.refresh_rotation_status();
         self.mode = AppMode::RotationMenu;
+    }
+
+    fn open_display_picker(&mut self, monitor_names: Vec<String>, wallpaper_path: PathBuf) {
+        self.display_targets = display_targets_from_names(&monitor_names);
+        self.display_select_state
+            .select(default_display_target_selection(&self.display_targets));
+        self.pending_wallpaper_path = Some(wallpaper_path);
+        self.mode = AppMode::DisplaySelect;
+    }
+
+    fn close_display_picker(&mut self) {
+        self.display_targets.clear();
+        self.display_select_state.select(None);
+        self.pending_wallpaper_path = None;
+        self.mode = AppMode::Wallpaper;
     }
 
     fn refresh_active_wallpapers(&mut self) {
@@ -1089,7 +1215,7 @@ impl App {
         frame.render_widget(Block::default().style(theme.surface), frame.area());
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(3)])
+            .constraints([Constraint::Min(0), Constraint::Length(4)])
             .split(frame.area());
 
         match self.mode {
@@ -1097,6 +1223,7 @@ impl App {
             AppMode::PathManage => self.render_path_manage(frame, chunks[0], theme),
             AppMode::ThemeSelect => self.render_theme_picker(frame, chunks[0], theme),
             AppMode::Wallpaper
+            | AppMode::DisplaySelect
             | AppMode::Search
             | AppMode::IntervalEdit
             | AppMode::RotationMenu
@@ -1119,6 +1246,9 @@ impl App {
                 self.render_metadata(frame, right_chunks[1], theme);
 
                 match self.mode {
+                    AppMode::DisplaySelect => {
+                        self.render_display_select_overlay(frame, chunks[0], theme)
+                    }
                     AppMode::Search => self.render_search_overlay(frame, chunks[0], theme),
                     AppMode::IntervalEdit => self.render_interval_overlay(frame, chunks[0], theme),
                     AppMode::RotationMenu => {
@@ -1146,7 +1276,7 @@ impl App {
     }
 
     fn render_setup(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
-        let block = self.themed_block(" First Setup - Enter Wallpaper Directory ", theme);
+        let block = self.themed_block(self.setup_title(), theme);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -1432,11 +1562,25 @@ impl App {
 
     fn render_help(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
         let controls = match self.mode {
-            AppMode::Setup => vec![("Type", "path"), ("Enter", "add"), ("Tab", "suggestion")],
+            AppMode::Setup => {
+                if self.is_adding_path() {
+                    vec![
+                        ("Type", "path"),
+                        ("Enter", "add"),
+                        ("Tab", "suggestion"),
+                        ("Esc", "cancel"),
+                    ]
+                } else {
+                    vec![("Type", "path"), ("Enter", "add"), ("Tab", "suggestion")]
+                }
+            }
             AppMode::PathManage => vec![("a", "add"), ("d", "remove"), ("p", "back")],
             AppMode::Search => vec![("Type", "filter"), ("Enter", "confirm"), ("Esc", "cancel")],
             AppMode::IntervalEdit => {
                 vec![("Type", "seconds"), ("Enter", "save"), ("Esc", "cancel")]
+            }
+            AppMode::DisplaySelect => {
+                vec![("↑/↓", "choose"), ("Enter", "apply"), ("Esc", "cancel")]
             }
             AppMode::RotationMenu => vec![("↑/↓", "choose"), ("Enter", "run"), ("Esc", "close")],
             AppMode::Keybindings => vec![("?", "close"), ("Esc", "close")],
@@ -1446,26 +1590,24 @@ impl App {
             AppMode::Wallpaper => vec![
                 ("?", "keybindings"),
                 ("↑/↓", "move"),
-                ("Enter", "apply"),
+                ("Enter", "apply/select"),
+                ("A", "all displays"),
                 ("/", "filter"),
                 ("r", "rotate"),
+                ("R", "rotation options"),
                 ("Ctrl+r", "random"),
-                ("R", "rotation popup"),
                 ("p", "paths"),
             ],
         };
 
-        let mut spans = vec![Span::raw(" ")];
-
-        for (key, action) in controls {
-            spans.push(Span::styled(key, theme.key));
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(action, theme.muted));
-            spans.push(Span::raw(" | "));
-        }
+        let midpoint = controls.len().div_ceil(2);
+        let lines = controls
+            .chunks(midpoint)
+            .map(|row| help_line(row, theme))
+            .collect::<Vec<_>>();
 
         frame.render_widget(
-            Para::new(Line::from(spans))
+            Para::new(lines)
                 .block(self.themed_block(" Help ", theme))
                 .alignment(Alignment::Center),
             area,
@@ -1504,12 +1646,61 @@ impl App {
         self.render_popup(frame, popup, theme, input);
     }
 
+    fn render_display_select_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
+        let popup_height = (self.display_targets.len() as u16 + 6).max(8);
+        let popup = centered_rect(60, popup_height, area);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(Block::default().style(theme.surface), popup);
+
+        let block = self
+            .themed_block(" Apply Wallpaper To ", theme)
+            .style(theme.surface);
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(0)])
+            .split(inner);
+
+        let help = Para::new(vec![
+            Line::from(Span::styled(
+                "Choose one display or use All displays.",
+                theme.muted,
+            )),
+            Line::from(Span::styled("Esc cancels without applying.", theme.key)),
+        ])
+        .alignment(Alignment::Left);
+        frame.render_widget(help, sections[0]);
+
+        let selected = self.display_select_state.selected();
+        let items = self
+            .display_targets
+            .iter()
+            .enumerate()
+            .map(|(index, target)| {
+                let style = if selected == Some(index) {
+                    theme.highlight
+                } else {
+                    theme.accent
+                };
+                ListItem::new(target.label()).style(style)
+            })
+            .collect::<Vec<_>>();
+        let mut state = self.display_select_state.clone();
+        let list = List::new(items)
+            .block(self.themed_block(" Displays ", theme))
+            .highlight_style(theme.highlight)
+            .highlight_symbol("› ");
+        frame.render_stateful_widget(list, sections[1], &mut state);
+    }
+
     fn render_rotation_menu_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
         let popup = centered_rect(72, 18, area);
         frame.render_widget(Clear, popup);
         frame.render_widget(Block::default().style(theme.surface), popup);
         let block = self
-            .themed_block(" Rotation Actions ", theme)
+            .themed_block(" Rotation Options ", theme)
             .style(theme.surface);
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
@@ -1559,8 +1750,8 @@ impl App {
         let popup = centered_rect(72, 12, area);
         let pairs = [
             (("Move", "↑/↓ or j/k"), ("Sections", "Tab/l, S-Tab/h")),
-            (("Apply", "Enter"), ("Random", "Ctrl+r")),
-            (("Rotation", "r"), ("Rotation Popup", "R")),
+            (("Apply", "Enter / popup"), ("All Displays", "A")),
+            (("Rotation", "r"), ("Rotation Options", "R")),
             (("Interval", "i"), ("Filter", "/")),
             (("Sort", "s"), ("Paths", "p")),
             (("Theme", "t"), ("Keybindings", "?")),
@@ -1753,12 +1944,88 @@ impl App {
             .current_selected_wallpaper()
             .map(|wallpaper| wallpaper.path.clone())
         {
-            let path_str = path.to_string_lossy().to_string();
-            set_wallpaper(&path_str)?;
-            self.refresh_active_wallpapers();
-            println!("Wallpaper set to: {path_str}");
+            self.apply_wallpaper_to_all_displays(&path)?;
         }
         Ok(())
+    }
+
+    fn apply_wallpaper_on_enter(&mut self) -> anyhow::Result<()> {
+        let Some(path) = self
+            .current_selected_wallpaper()
+            .map(|wallpaper| wallpaper.path.clone())
+        else {
+            return Ok(());
+        };
+
+        match wallpaper_apply_action(&get_monitors()) {
+            WallpaperApplyAction::ErrorNoMonitors => Err(anyhow::anyhow!("No monitors found")),
+            WallpaperApplyAction::ApplyToSingleDisplay(monitor_name) => {
+                self.apply_wallpaper_to_single_display(&monitor_name, &path)
+            }
+            WallpaperApplyAction::OpenDisplayPicker(monitor_names) => {
+                self.open_display_picker(monitor_names, path);
+                Ok(())
+            }
+        }
+    }
+
+    fn apply_display_selection(&mut self) -> anyhow::Result<()> {
+        let Some(path) = self.pending_wallpaper_path.clone() else {
+            return Ok(());
+        };
+        let Some(index) = self.display_select_state.selected() else {
+            return Ok(());
+        };
+        let Some(target) = self.display_targets.get(index).cloned() else {
+            return Ok(());
+        };
+
+        match target {
+            DisplayTarget::Monitor(name) => self.apply_wallpaper_to_single_display(&name, &path)?,
+            DisplayTarget::AllDisplays => self.apply_wallpaper_to_all_displays(&path)?,
+        }
+
+        self.close_display_picker();
+        Ok(())
+    }
+
+    fn apply_wallpaper_to_single_display(
+        &mut self,
+        monitor_name: &str,
+        wallpaper_path: &PathBuf,
+    ) -> anyhow::Result<()> {
+        let path_str = wallpaper_path.to_string_lossy().to_string();
+        set_wallpaper_for_monitor(monitor_name, &path_str)?;
+        self.refresh_active_wallpapers();
+        println!("Wallpaper set on {monitor_name}: {path_str}");
+        Ok(())
+    }
+
+    fn apply_wallpaper_to_all_displays(&mut self, wallpaper_path: &PathBuf) -> anyhow::Result<()> {
+        let path_str = wallpaper_path.to_string_lossy().to_string();
+        set_wallpaper(&path_str)?;
+        self.refresh_active_wallpapers();
+        println!("Wallpaper set to: {path_str}");
+        Ok(())
+    }
+
+    fn is_adding_path(&self) -> bool {
+        !self.config.wallpaper_paths.is_empty()
+    }
+
+    fn setup_title(&self) -> &'static str {
+        if self.is_adding_path() {
+            " Add Wallpaper Directory "
+        } else {
+            " First Setup - Enter Wallpaper Directory "
+        }
+    }
+
+    fn cancel_path_add(&mut self) {
+        self.input_buffer.clear();
+        self.dir_suggestions.clear();
+        self.suggestion_state.select(Some(0));
+        self.mode = AppMode::PathManage;
     }
 
     fn toggle_rotate_all_wallpapers(&mut self) {
@@ -1939,6 +2206,51 @@ fn rotation_section_message(
     }
 }
 
+fn wallpaper_apply_action(monitors: &[Monitor]) -> WallpaperApplyAction {
+    match monitors {
+        [] => WallpaperApplyAction::ErrorNoMonitors,
+        [monitor] => WallpaperApplyAction::ApplyToSingleDisplay(monitor.name.clone()),
+        _ => WallpaperApplyAction::OpenDisplayPicker(
+            monitors
+                .iter()
+                .map(|monitor| monitor.name.clone())
+                .collect(),
+        ),
+    }
+}
+
+fn display_targets_from_names(monitor_names: &[String]) -> Vec<DisplayTarget> {
+    let mut targets = monitor_names
+        .iter()
+        .cloned()
+        .map(DisplayTarget::Monitor)
+        .collect::<Vec<_>>();
+    targets.push(DisplayTarget::AllDisplays);
+    targets
+}
+
+fn default_display_target_selection(targets: &[DisplayTarget]) -> Option<usize> {
+    targets
+        .iter()
+        .position(|target| matches!(target, DisplayTarget::Monitor(_)))
+}
+
+fn help_line(controls: &[(&str, &str)], theme: ThemePalette) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+
+    for (index, (key, action)) in controls.iter().enumerate() {
+        spans.push(Span::styled((*key).to_string(), theme.key));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled((*action).to_string(), theme.muted));
+
+        if index + 1 != controls.len() {
+            spans.push(Span::raw(" | "));
+        }
+    }
+
+    Line::from(spans)
+}
+
 fn first_active_visible_index(
     indices: &[usize],
     wallpapers: &[IndexedWallpaper],
@@ -1984,9 +2296,12 @@ fn wallpaper_marker_prefix(is_active: bool) -> String {
 #[cfg(test)]
 mod marker_tests {
     use super::{
-        first_active_visible_index, normalized_section_selection, rotation_section_message,
-        wallpaper_marker_prefix, RotationMenuAction, RotationServiceStatus,
+        default_display_target_selection, display_targets_from_names, first_active_visible_index,
+        normalized_section_selection, rotation_section_message, wallpaper_apply_action,
+        wallpaper_marker_prefix, DisplayTarget, RotationMenuAction, RotationServiceStatus,
+        WallpaperApplyAction,
     };
+    use crate::backend::Monitor;
     use crate::cache::IndexedWallpaper;
     use std::{collections::HashSet, path::PathBuf};
 
@@ -2065,6 +2380,67 @@ mod marker_tests {
         assert_eq!(
             rotation_section_message(super::SectionKind::Rotation, false),
             None
+        );
+    }
+
+    #[test]
+    fn display_targets_append_all_displays() {
+        let targets = display_targets_from_names(&["HDMI-A-1".to_string(), "DP-1".to_string()]);
+
+        assert_eq!(
+            targets,
+            vec![
+                DisplayTarget::Monitor("HDMI-A-1".to_string()),
+                DisplayTarget::Monitor("DP-1".to_string()),
+                DisplayTarget::AllDisplays,
+            ]
+        );
+    }
+
+    #[test]
+    fn defaults_display_target_selection_to_first_monitor() {
+        let targets = vec![
+            DisplayTarget::Monitor("HDMI-A-1".to_string()),
+            DisplayTarget::Monitor("DP-1".to_string()),
+            DisplayTarget::AllDisplays,
+        ];
+
+        assert_eq!(default_display_target_selection(&targets), Some(0));
+    }
+
+    #[test]
+    fn wallpaper_apply_action_errors_without_monitors() {
+        assert_eq!(
+            wallpaper_apply_action(&[]),
+            WallpaperApplyAction::ErrorNoMonitors
+        );
+    }
+
+    #[test]
+    fn wallpaper_apply_action_applies_directly_for_one_monitor() {
+        assert_eq!(
+            wallpaper_apply_action(&[Monitor {
+                name: "HDMI-A-1".to_string()
+            }]),
+            WallpaperApplyAction::ApplyToSingleDisplay("HDMI-A-1".to_string())
+        );
+    }
+
+    #[test]
+    fn wallpaper_apply_action_opens_picker_for_multiple_monitors() {
+        assert_eq!(
+            wallpaper_apply_action(&[
+                Monitor {
+                    name: "HDMI-A-1".to_string()
+                },
+                Monitor {
+                    name: "DP-1".to_string()
+                }
+            ]),
+            WallpaperApplyAction::OpenDisplayPicker(vec![
+                "HDMI-A-1".to_string(),
+                "DP-1".to_string()
+            ])
         );
     }
 
