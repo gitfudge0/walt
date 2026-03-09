@@ -54,7 +54,7 @@ install -Dm755 target/release/walt ~/.local/bin/
 
 ### First run
 
-1. Launch `walt`.
+1. Launch `walt` for the terminal UI or `walt gui` for the desktop GUI.
 2. Paste the path to your wallpaper directory.
 3. Press `Enter`.
 
@@ -66,13 +66,14 @@ For Ghostty:
 
 ```conf
 bind = $mainMod SHIFT, D, exec, ghostty --class=walt -e ~/.local/bin/walt
+bind = $mainMod CTRL, D, exec, ~/.local/bin/walt gui
 bind = $mainMod, D, exec, ~/.local/bin/walt random
 windowrulev2 = float, class:^(com\.mitchellh\.ghostty\.walt)$
 windowrulev2 = size 900 600, class:^(com\.mitchellh\.ghostty\.walt)$
 windowrulev2 = center, class:^(com\.mitchellh\.ghostty\.walt)$
 ```
 
-`$mainMod + Shift + D` opens the Walt TUI. `$mainMod + D` applies a random wallpaper immediately.
+`$mainMod + Shift + D` opens the Walt TUI. `$mainMod + Ctrl + D` opens the GUI. `$mainMod + D` applies a random wallpaper immediately.
 
 `install.sh` detects Ghostty, WezTerm, or Kitty and prints matching launch instructions, including the random-wallpaper bind.
 
@@ -92,6 +93,14 @@ walt
 
 Launch the wallpaper browser.
 
+### Open the GUI
+
+```bash
+walt gui
+```
+
+Launch the desktop GUI.
+
 ### Apply random wallpapers
 
 ```bash
@@ -105,6 +114,8 @@ walt random 0
 `walt random --same` applies one random wallpaper to every display.
 
 `walt random 0` applies one random wallpaper to display `0`. Display indices are zero-based and clamp to the last detected display if the requested index is out of range.
+
+The GUI folder picker uses your Linux desktop portal or native dialog backend. On Hyprland, install a matching XDG desktop portal backend such as `xdg-desktop-portal-gtk` or `xdg-desktop-portal-kde` if folder selection does not appear.
 
 ### Manage the rotation service
 

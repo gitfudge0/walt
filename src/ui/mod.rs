@@ -34,12 +34,18 @@ use crate::backend::{
     apply_random_plan, disable_rotation_service, enable_rotation_service, get_active_wallpapers,
     get_monitors, get_rotation_service_status, install_rotation_service, plan_random_assignments,
     restart_rotation_service_if_active, rotation_service_badge, rotation_service_status,
-    scan_directory, set_wallpaper, set_wallpaper_for_monitor, uninstall_rotation_service, Monitor,
+    scan_directory, set_wallpaper, set_wallpaper_for_monitor, uninstall_rotation_service,
     RandomMode, RandomPlan, RotationServiceStatus,
 };
-use crate::cache::{IndexedWallpaper, ThumbnailCache, WallpaperIndex};
+use crate::cache::{IndexedWallpaper, ThumbnailCache, ThumbnailProfile, WallpaperIndex};
 use crate::config::Config;
-use theme::{ThemeKind, ThemePalette};
+use crate::shared::{
+    default_display_target_selection, display_targets_from_names, first_active_visible_index,
+    random_apply_action, random_menu_actions, selection_for_random_plan, wallpaper_apply_action,
+    DisplayTarget, RandomApplyAction, RandomMenuAction, WallpaperApplyAction,
+};
+use crate::theme::ThemeKind;
+use theme::ThemePalette;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum AppMode {
@@ -92,60 +98,6 @@ enum RotationMenuAction {
     ToggleWallpaperScope,
     ToggleDisplayMode,
     SetInterval,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DisplayTarget {
-    Monitor(String),
-    AllDisplays,
-}
-
-impl DisplayTarget {
-    fn label(&self) -> &str {
-        match self {
-            Self::Monitor(name) => name,
-            Self::AllDisplays => "All displays",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum WallpaperApplyAction {
-    ErrorNoMonitors,
-    ApplyToSingleDisplay(String),
-    OpenDisplayPicker(Vec<String>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RandomMenuAction {
-    DifferentAll,
-    SameAll,
-    DisplayIndex(usize, String),
-}
-
-impl RandomMenuAction {
-    fn label(&self) -> String {
-        match self {
-            Self::DifferentAll => "Different on all displays".to_string(),
-            Self::SameAll => "Same on all displays".to_string(),
-            Self::DisplayIndex(index, name) => format!("Display {index}: {name}"),
-        }
-    }
-
-    fn mode(&self) -> RandomMode {
-        match self {
-            Self::DifferentAll => RandomMode::DifferentAll,
-            Self::SameAll => RandomMode::SameAll,
-            Self::DisplayIndex(index, _) => RandomMode::DisplayIndex(*index),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RandomApplyAction {
-    ErrorNoMonitors,
-    ApplyToSingleDisplay,
-    OpenRandomMenu(Vec<String>),
 }
 
 impl RotationMenuAction {
@@ -1377,25 +1329,8 @@ impl App {
     }
 
     fn sync_selection_with_random_plan(&mut self, plan: &RandomPlan) {
-        let mut unique_paths = HashSet::new();
-        for assignment in &plan.assignments {
-            unique_paths.insert(assignment.wallpaper_path.clone());
-        }
-
-        if unique_paths.len() != 1 {
-            return;
-        }
-
-        let Some(path) = unique_paths.into_iter().next() else {
-            return;
-        };
         let indices = self.section_indices(self.active_section);
-        if let Some(selected) = indices.iter().position(|index| {
-            self.wallpapers
-                .get(*index)
-                .map(|wallpaper| wallpaper.path == path)
-                .unwrap_or(false)
-        }) {
+        if let Some(selected) = selection_for_random_plan(&indices, &self.wallpapers, plan) {
             self.section_state_mut(self.active_section)
                 .select(Some(selected));
             self.request_preview_load();
@@ -2409,7 +2344,7 @@ fn spawn_prewarm_worker(thumbnail_cache: Option<ThumbnailCache>) -> Sender<Vec<P
             };
 
             for path in paths {
-                let _ = cache.generate_thumbnail(path);
+                let _ = cache.generate_thumbnail(path, ThumbnailProfile::TuiPreview);
             }
         }
     });
@@ -2423,7 +2358,11 @@ fn build_preview_protocol(
     request: &PreviewRequest,
 ) -> anyhow::Result<StatefulProtocol> {
     let preview_path = thumbnail_cache
-        .and_then(|cache| cache.generate_thumbnail(&request.image_path).ok())
+        .and_then(|cache| {
+            cache
+                .generate_thumbnail(&request.image_path, ThumbnailProfile::TuiPreview)
+                .ok()
+        })
         .unwrap_or_else(|| request.image_path.clone());
     let dyn_img = image::open(preview_path)?;
     let mut protocol = picker.new_resize_protocol(dyn_img);
@@ -2481,59 +2420,6 @@ fn rotation_section_message(
     }
 }
 
-fn wallpaper_apply_action(monitors: &[Monitor]) -> WallpaperApplyAction {
-    match monitors {
-        [] => WallpaperApplyAction::ErrorNoMonitors,
-        [monitor] => WallpaperApplyAction::ApplyToSingleDisplay(monitor.name.clone()),
-        _ => WallpaperApplyAction::OpenDisplayPicker(
-            monitors
-                .iter()
-                .map(|monitor| monitor.name.clone())
-                .collect(),
-        ),
-    }
-}
-
-fn display_targets_from_names(monitor_names: &[String]) -> Vec<DisplayTarget> {
-    let mut targets = monitor_names
-        .iter()
-        .cloned()
-        .map(DisplayTarget::Monitor)
-        .collect::<Vec<_>>();
-    targets.push(DisplayTarget::AllDisplays);
-    targets
-}
-
-fn default_display_target_selection(targets: &[DisplayTarget]) -> Option<usize> {
-    targets
-        .iter()
-        .position(|target| matches!(target, DisplayTarget::Monitor(_)))
-}
-
-fn random_apply_action(monitors: &[Monitor]) -> RandomApplyAction {
-    match monitors {
-        [] => RandomApplyAction::ErrorNoMonitors,
-        [_monitor] => RandomApplyAction::ApplyToSingleDisplay,
-        _ => RandomApplyAction::OpenRandomMenu(
-            monitors
-                .iter()
-                .map(|monitor| monitor.name.clone())
-                .collect(),
-        ),
-    }
-}
-
-fn random_menu_actions(monitor_names: &[String]) -> Vec<RandomMenuAction> {
-    let mut actions = vec![RandomMenuAction::DifferentAll, RandomMenuAction::SameAll];
-    actions.extend(
-        monitor_names
-            .iter()
-            .enumerate()
-            .map(|(index, name)| RandomMenuAction::DisplayIndex(index, name.clone())),
-    );
-    actions
-}
-
 fn help_line(controls: &[(&str, &str)], theme: ThemePalette) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
 
@@ -2553,19 +2439,6 @@ fn help_line(controls: &[(&str, &str)], theme: ThemePalette) -> Line<'static> {
 fn popup_divider_line(width: u16, theme: ThemePalette) -> Line<'static> {
     let divider_width = width.saturating_sub(1).max(1) as usize;
     Line::from(Span::styled("─".repeat(divider_width), theme.border))
-}
-
-fn first_active_visible_index(
-    indices: &[usize],
-    wallpapers: &[IndexedWallpaper],
-    active_wallpaper_paths: &HashSet<PathBuf>,
-) -> Option<usize> {
-    indices.iter().position(|index| {
-        wallpapers
-            .get(*index)
-            .map(|wallpaper| active_wallpaper_paths.contains(&wallpaper.path))
-            .unwrap_or(false)
-    })
 }
 
 fn format_file_size(bytes: u64) -> String {
@@ -2600,28 +2473,10 @@ fn wallpaper_marker_prefix(is_active: bool) -> String {
 #[cfg(test)]
 mod marker_tests {
     use super::{
-        default_display_target_selection, display_targets_from_names, first_active_visible_index,
-        normalized_section_selection, random_apply_action, random_menu_actions,
-        rotation_section_message, wallpaper_apply_action, wallpaper_marker_prefix, DisplayTarget,
-        RandomApplyAction, RandomMenuAction, RotationMenuAction, RotationServiceStatus,
-        WallpaperApplyAction,
+        normalized_section_selection, rotation_section_message, wallpaper_marker_prefix,
+        RotationMenuAction, RotationServiceStatus,
     };
-    use crate::backend::Monitor;
-    use crate::cache::IndexedWallpaper;
-    use std::{collections::HashSet, path::PathBuf};
-
-    fn wallpaper(name: &str) -> IndexedWallpaper {
-        IndexedWallpaper {
-            path: PathBuf::from(format!("/wallpapers/{name}.jpg")),
-            name: name.to_string(),
-            directory: PathBuf::from("/wallpapers"),
-            extension: "jpg".to_string(),
-            modified_unix_secs: 0,
-            file_size: 0,
-            width: None,
-            height: None,
-        }
-    }
+    use std::path::PathBuf;
 
     #[test]
     fn marker_prefix_for_plain_wallpaper() {
@@ -2631,42 +2486,6 @@ mod marker_tests {
     #[test]
     fn marker_prefix_for_active_wallpaper() {
         assert_eq!(wallpaper_marker_prefix(true), "● ");
-    }
-
-    #[test]
-    fn selects_first_active_wallpaper_in_all() {
-        let wallpapers = vec![wallpaper("alpha"), wallpaper("beta"), wallpaper("gamma")];
-        let indices = vec![0, 1, 2];
-        let active_paths = HashSet::from([wallpapers[1].path.clone()]);
-
-        assert_eq!(
-            first_active_visible_index(&indices, &wallpapers, &active_paths),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn selects_first_matching_active_wallpaper_when_multiple_are_active() {
-        let wallpapers = vec![wallpaper("alpha"), wallpaper("beta"), wallpaper("gamma")];
-        let indices = vec![2, 1, 0];
-        let active_paths = HashSet::from([wallpapers[0].path.clone(), wallpapers[2].path.clone()]);
-
-        assert_eq!(
-            first_active_visible_index(&indices, &wallpapers, &active_paths),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn returns_none_when_active_wallpaper_is_not_indexed() {
-        let wallpapers = vec![wallpaper("alpha"), wallpaper("beta")];
-        let indices = vec![0, 1];
-        let active_paths = HashSet::from([PathBuf::from("/wallpapers/missing.jpg")]);
-
-        assert_eq!(
-            first_active_visible_index(&indices, &wallpapers, &active_paths),
-            None
-        );
     }
 
     #[test]
@@ -2685,107 +2504,6 @@ mod marker_tests {
         assert_eq!(
             rotation_section_message(super::SectionKind::Rotation, false),
             None
-        );
-    }
-
-    #[test]
-    fn display_targets_append_all_displays() {
-        let targets = display_targets_from_names(&["HDMI-A-1".to_string(), "DP-1".to_string()]);
-
-        assert_eq!(
-            targets,
-            vec![
-                DisplayTarget::Monitor("HDMI-A-1".to_string()),
-                DisplayTarget::Monitor("DP-1".to_string()),
-                DisplayTarget::AllDisplays,
-            ]
-        );
-    }
-
-    #[test]
-    fn defaults_display_target_selection_to_first_monitor() {
-        let targets = vec![
-            DisplayTarget::Monitor("HDMI-A-1".to_string()),
-            DisplayTarget::Monitor("DP-1".to_string()),
-            DisplayTarget::AllDisplays,
-        ];
-
-        assert_eq!(default_display_target_selection(&targets), Some(0));
-    }
-
-    #[test]
-    fn random_menu_actions_include_all_modes_in_order() {
-        let actions = random_menu_actions(&["HDMI-A-1".to_string(), "DP-1".to_string()]);
-
-        assert_eq!(
-            actions,
-            vec![
-                RandomMenuAction::DifferentAll,
-                RandomMenuAction::SameAll,
-                RandomMenuAction::DisplayIndex(0, "HDMI-A-1".to_string()),
-                RandomMenuAction::DisplayIndex(1, "DP-1".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn random_apply_action_applies_directly_for_one_monitor() {
-        assert_eq!(
-            random_apply_action(&[Monitor {
-                name: "HDMI-A-1".to_string()
-            }]),
-            RandomApplyAction::ApplyToSingleDisplay
-        );
-    }
-
-    #[test]
-    fn random_apply_action_opens_menu_for_multiple_monitors() {
-        assert_eq!(
-            random_apply_action(&[
-                Monitor {
-                    name: "HDMI-A-1".to_string()
-                },
-                Monitor {
-                    name: "DP-1".to_string()
-                }
-            ]),
-            RandomApplyAction::OpenRandomMenu(vec!["HDMI-A-1".to_string(), "DP-1".to_string()])
-        );
-    }
-
-    #[test]
-    fn wallpaper_apply_action_errors_without_monitors() {
-        assert_eq!(
-            wallpaper_apply_action(&[]),
-            WallpaperApplyAction::ErrorNoMonitors
-        );
-    }
-
-    #[test]
-    fn wallpaper_apply_action_applies_directly_for_one_monitor() {
-        assert_eq!(
-            wallpaper_apply_action(&[Monitor {
-                name: "HDMI-A-1".to_string()
-            }]),
-            WallpaperApplyAction::ApplyToSingleDisplay("HDMI-A-1".to_string())
-        );
-    }
-
-    #[test]
-    fn wallpaper_apply_action_opens_picker_for_multiple_monitors() {
-        assert_eq!(
-            wallpaper_apply_action(&[
-                Monitor {
-                    name: "HDMI-A-1".to_string()
-                },
-                Monitor {
-                    name: "DP-1".to_string()
-                }
-            ]),
-            WallpaperApplyAction::OpenDisplayPicker(vec![
-                "HDMI-A-1".to_string(),
-                "DP-1".to_string()
-            ])
         );
     }
 

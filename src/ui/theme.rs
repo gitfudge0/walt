@@ -1,19 +1,5 @@
+use crate::theme::ThemeKind;
 use ratatui::style::{Color, Modifier, Style};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ThemeKind {
-    System,
-    CatppuccinMocha,
-    TokyoNight,
-    GruvboxDark,
-    Dracula,
-    Nord,
-    SolarizedDark,
-    Kanagawa,
-    OneDark,
-    EverforestDark,
-    RosePine,
-}
 
 #[derive(Clone, Copy)]
 pub struct ThemePalette {
@@ -28,59 +14,6 @@ pub struct ThemePalette {
 }
 
 impl ThemeKind {
-    pub const ALL: [ThemeKind; 11] = [
-        ThemeKind::System,
-        ThemeKind::CatppuccinMocha,
-        ThemeKind::TokyoNight,
-        ThemeKind::GruvboxDark,
-        ThemeKind::Dracula,
-        ThemeKind::Nord,
-        ThemeKind::SolarizedDark,
-        ThemeKind::Kanagawa,
-        ThemeKind::OneDark,
-        ThemeKind::EverforestDark,
-        ThemeKind::RosePine,
-    ];
-
-    pub fn from_name(name: &str) -> Self {
-        match name {
-            "Catppuccin Mocha" => Self::CatppuccinMocha,
-            "Tokyo Night" => Self::TokyoNight,
-            "Gruvbox Dark" => Self::GruvboxDark,
-            "Dracula" => Self::Dracula,
-            "Nord" => Self::Nord,
-            "Solarized Dark" => Self::SolarizedDark,
-            "Kanagawa" => Self::Kanagawa,
-            "One Dark" => Self::OneDark,
-            "Everforest Dark" => Self::EverforestDark,
-            "Rosé Pine" => Self::RosePine,
-            _ => Self::System,
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::System => "System",
-            Self::CatppuccinMocha => "Catppuccin Mocha",
-            Self::TokyoNight => "Tokyo Night",
-            Self::GruvboxDark => "Gruvbox Dark",
-            Self::Dracula => "Dracula",
-            Self::Nord => "Nord",
-            Self::SolarizedDark => "Solarized Dark",
-            Self::Kanagawa => "Kanagawa",
-            Self::OneDark => "One Dark",
-            Self::EverforestDark => "Everforest Dark",
-            Self::RosePine => "Rosé Pine",
-        }
-    }
-
-    pub fn index(self) -> usize {
-        Self::ALL
-            .iter()
-            .position(|theme| *theme == self)
-            .unwrap_or(0)
-    }
-
     pub fn palette(self) -> ThemePalette {
         match self {
             Self::System => ThemePalette {
