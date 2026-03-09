@@ -1053,12 +1053,22 @@ impl GuiApp {
         let palette = self.palette();
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(GuiTypography::rich(
-                        GuiTextRole::AppEyebrow,
-                        "WALT",
-                        palette,
-                    ));
+                ui.label(GuiTypography::rich(
+                    GuiTextRole::AppEyebrow,
+                    "WALT",
+                    palette,
+                ));
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    ui.add(
+                        egui::Button::new(GuiTypography::rich_color(
+                            GuiTextRole::MetaLabel,
+                            format!("v{}", env!("CARGO_PKG_VERSION")),
+                            palette.text,
+                        ))
+                        .fill(palette.background)
+                        .stroke(Stroke::new(1.0, palette.border))
+                        .corner_radius(0.0),
+                    );
                     ui.add(
                         egui::Button::new(GuiTypography::rich_color(
                             GuiTextRole::MetaLabel,

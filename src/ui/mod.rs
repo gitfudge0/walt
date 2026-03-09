@@ -366,7 +366,6 @@ impl App {
 
         let res = self.run_app(&mut terminal);
 
-        disable_raw_mode()?;
         if keyboard_enhancement_enabled {
             execute!(
                 terminal.backend_mut(),
@@ -381,6 +380,7 @@ impl App {
                 DisableMouseCapture
             )?;
         }
+        disable_raw_mode()?;
         terminal.show_cursor()?;
 
         if let Err(err) = res {
@@ -1342,7 +1342,7 @@ impl App {
         frame.render_widget(Block::default().style(theme.surface), frame.area());
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(4)])
+            .constraints([Constraint::Min(0), Constraint::Length(5)])
             .split(frame.area());
 
         match self.mode {
@@ -1733,10 +1733,16 @@ impl App {
         };
 
         let midpoint = controls.len().div_ceil(2);
-        let lines = controls
+        let mut lines = vec![Line::from(vec![
+            Span::styled("Version: ", theme.key),
+            Span::styled(format!("v{}", env!("CARGO_PKG_VERSION")), theme.accent),
+        ])];
+        lines.extend(
+            controls
             .chunks(midpoint)
             .map(|row| help_line(row, theme))
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>(),
+        );
 
         frame.render_widget(
             Para::new(lines)
