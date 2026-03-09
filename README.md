@@ -158,12 +158,14 @@ Walt opens with the current wallpaper selected in the `All` list when it is alre
 - `Tab` or `l` switch between `All` and `Rotation`
 - `Shift+Tab` or `h` switch to the previous section
 - `g/G` jump to the top or bottom
-- `Enter` apply the selected wallpaper
+- `Enter` apply the selected wallpaper directly when one display is detected, or open a display picker when multiple displays are detected
+- `A` apply the selected wallpaper to all displays
 - `/` filter the active section
 - `s` toggle sort for the active section between name and modification date
 - `r` add or remove the selected wallpaper from the manual rotation list
 - `Ctrl+r` pick and apply a random wallpaper
-- `R` open the rotation popup for service actions and rotate-all mode
+- `R` open the rotation options for service actions and rotate-all mode
+- `All displays` in the display picker applies the selected wallpaper to every display when `A` is unavailable
 - `i` change the interval used by the installed rotation service
 - `p` manage wallpaper paths
 - `t` open the theme picker
