@@ -1,20 +1,33 @@
 # Walt
 
-Walt is a terminal wallpaper picker for Hyprland. It lets you browse, preview, apply, randomize, and rotate wallpapers without leaving the keyboard, using `hyprpaper` to set the background. The TUI stays focused on fast navigation through large wallpaper directories while still giving you themes and rotation controls when you need them.
+Walt is a wallpaper manager for Hyprland with both a terminal UI and a native desktop GUI. It lets you browse, preview, apply, randomize, and rotate wallpapers using `hyprpaper`, while keeping the TUI fast for keyboard-heavy workflows and the GUI focused on preview-driven browsing.
 
 ![Walt banner](assets/walt-banner.jpg)
 
 ## At a glance
 
-- Browse and apply wallpapers from the terminal
-- Preview images in place before switching
-- Navigate large wallpaper libraries quickly
-- Use built-in themes, including `System`
-- Apply a random wallpaper with a single command
-- Install an optional background rotation service
-- Work with multi-monitor Hyprland setups through `hyprpaper`
+- Browse and apply wallpapers from the terminal or native GUI
+- Preview wallpapers before switching
+- Manage multi-display wallpaper assignment
+- Apply random wallpapers from the app or CLI
+- Control a background rotation service
+- Manage wallpaper directories and themes
+
+## Choose an Interface
+
+- `walt`
+  - keyboard-first terminal workflow
+  - in-terminal preview
+  - best for fast browsing
 
 ![Walt screenshot](assets/screenshot.png)
+
+- `walt gui`
+  - native desktop window
+  - larger visual preview
+  - better for pointer-driven browsing and dialogs
+
+![Walt GUI screenshot](assets/screenshot-gui.png)
 
 ## Quick Start
 
@@ -23,7 +36,7 @@ Walt is a terminal wallpaper picker for Hyprland. It lets you browse, preview, a
 - `rust` and `cargo`
 - `hyprpaper`
 - `hyprctl`
-- an image-capable terminal:
+- an image-capable terminal for the TUI preview only:
   - Ghostty
   - Kitty
   - WezTerm
@@ -54,27 +67,32 @@ install -Dm755 target/release/walt ~/.local/bin/
 
 ### First run
 
-1. Launch `walt`.
+1. Launch `walt` for the terminal UI or `walt gui` for the desktop GUI.
 2. Paste the path to your wallpaper directory.
 3. Press `Enter`.
 
+The GUI folder picker may depend on an XDG desktop portal or native dialog backend on Linux.
+
 Walt stores its config in `~/.config/walt/`. If you have older settings in `~/.config/wallpaper-switcher/`, Walt will read them automatically.
 
-### Hyprland example
+## Hyprland Integration
 
 For Ghostty:
 
 ```conf
 bind = $mainMod SHIFT, D, exec, ghostty --class=walt -e ~/.local/bin/walt
+bind = $mainMod CTRL, D, exec, ~/.local/bin/walt gui
 bind = $mainMod, D, exec, ~/.local/bin/walt random
 windowrulev2 = float, class:^(com\.mitchellh\.ghostty\.walt)$
 windowrulev2 = size 900 600, class:^(com\.mitchellh\.ghostty\.walt)$
 windowrulev2 = center, class:^(com\.mitchellh\.ghostty\.walt)$
 ```
 
-`$mainMod + Shift + D` opens the Walt TUI. `$mainMod + D` applies a random wallpaper immediately.
+`$mainMod + Shift + D` opens the Walt TUI. `$mainMod + Ctrl + D` opens the GUI. `$mainMod + D` applies a random wallpaper immediately.
 
 `install.sh` detects Ghostty, WezTerm, or Kitty and prints matching launch instructions, including the random-wallpaper bind.
+
+If you want the GUI to float, the `windowrulev2` examples above apply to the GUI window class as well.
 
 Make sure `hyprpaper` is running:
 
@@ -82,17 +100,34 @@ Make sure `hyprpaper` is running:
 exec-once = hyprpaper
 ```
 
+## GUI
+
+Walt ships with a native `egui` desktop interface alongside the original TUI. The GUI keeps the same core capabilities as the terminal app:
+
+- wallpaper browsing and large preview
+- multi-display apply flows
+- random wallpaper actions
+- rotation service controls
+- wallpaper path management
+- uninstall flow
+
+If you do not have a graphical session available, `walt gui` exits with a clear error and you can still use `walt` for the terminal interface.
+
+The GUI folder picker uses your Linux desktop portal or native dialog backend. On Hyprland, install a matching XDG desktop portal backend such as `xdg-desktop-portal-gtk` or `xdg-desktop-portal-kde` if folder selection does not appear.
+
 ## CLI Commands
 
-### Open the TUI
+### Launch interfaces
 
 ```bash
 walt
+walt gui
 ```
 
-Launch the wallpaper browser.
+- `walt` launches the terminal wallpaper browser
+- `walt gui` launches the native desktop GUI
 
-### Apply random wallpapers
+### Random wallpapers
 
 ```bash
 walt random
@@ -106,7 +141,7 @@ walt random 0
 
 `walt random 0` applies one random wallpaper to display `0`. Display indices are zero-based and clamp to the last detected display if the requested index is out of range.
 
-### Manage the rotation service
+### Rotation service
 
 ```bash
 walt rotation install
@@ -157,7 +192,7 @@ walt uninstall --yes
 
 ## Keyboard Controls
 
-### Browser
+### Core TUI Controls
 
 Walt opens with the current wallpaper selected in the `All` list when it is already indexed.
 
@@ -180,6 +215,10 @@ Walt opens with the current wallpaper selected in the `All` list when it is alre
 - `q` or `Esc` quit
 
 `walt rotation enable` and `walt rotation disable` still control only the background service. The rotate-all toggle and the same/different display rotation mode are available only from the `R` popup.
+
+### Popup Controls
+
+The TUI uses focused popups for display selection, random options, rotation controls, path management, and theme selection.
 
 ### Display picker
 

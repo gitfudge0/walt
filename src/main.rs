@@ -1,6 +1,9 @@
 mod backend;
 mod cache;
 mod config;
+mod gui;
+mod shared;
+mod theme;
 mod ui;
 
 use std::env;
@@ -16,6 +19,7 @@ const UNINSTALL_USAGE: &str = "walt uninstall [--yes]";
 #[derive(Debug, Eq, PartialEq)]
 enum CliCommand {
     LaunchUi,
+    Gui,
     Help,
     Random(RandomCommand),
     Uninstall { yes: bool },
@@ -46,6 +50,7 @@ fn main() -> Result<()> {
 
     match parse_command(&argv)? {
         CliCommand::LaunchUi => {}
+        CliCommand::Gui => return gui::run(),
         CliCommand::Help => {
             print_usage();
             return Ok(());
@@ -91,6 +96,7 @@ fn main() -> Result<()> {
 fn parse_command(args: &[&str]) -> Result<CliCommand> {
     match args {
         [] => Ok(CliCommand::LaunchUi),
+        ["gui"] => Ok(CliCommand::Gui),
         ["random"] => Ok(CliCommand::Random(RandomCommand::DifferentAll)),
         ["random", "--same"] => Ok(CliCommand::Random(RandomCommand::SameAll)),
         ["random", display_index] => {
@@ -285,11 +291,13 @@ fn usage_text() -> String {
         "Walt",
         "",
         "Usage:",
+        "  walt gui",
         "  walt random [--same|DISPLAY_INDEX]",
         "  walt uninstall [--yes]",
         "  walt rotation <command>",
         "",
         "Commands:",
+        "  gui                       Launch the desktop GUI",
         "  random [--same|index]     Apply random wallpaper(s), zero-based display index clamps to last",
         "  uninstall [--yes]         Remove Walt service, config, cache, and ~/.local/bin/walt",
         "  rotation install          Install and start the persistent rotation service",
@@ -300,6 +308,7 @@ fn usage_text() -> String {
         "  rotation interval <secs>  Set the rotation interval in seconds",
         "",
         "Examples:",
+        "  walt gui",
         "  walt random",
         "  walt random --same",
         "  walt random 0",
@@ -364,6 +373,11 @@ mod tests {
             parse_command(&["random"]).expect("command"),
             CliCommand::Random(RandomCommand::DifferentAll)
         );
+    }
+
+    #[test]
+    fn parses_gui_command() {
+        assert_eq!(parse_command(&["gui"]).expect("command"), CliCommand::Gui);
     }
 
     #[test]
@@ -526,6 +540,7 @@ mod tests {
         assert!(usage.contains("Usage:"));
         assert!(usage.contains("Commands:"));
         assert!(usage.contains("Examples:"));
+        assert!(usage.contains("walt gui"));
         assert!(usage.contains("walt random [--same|DISPLAY_INDEX]"));
         assert!(usage.contains("walt random --same"));
         assert!(usage.contains("walt random 0"));

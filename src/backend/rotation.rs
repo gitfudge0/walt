@@ -315,7 +315,7 @@ fn is_tolerated_systemctl_failure(details: &str, tolerated_failures: &[&str]) ->
         .any(|fragment| details.contains(fragment))
 }
 
-fn format_rotation_service_status(status: &RotationServiceStatus) -> String {
+pub fn format_rotation_service_status(status: &RotationServiceStatus) -> String {
     let loaded = if status.installed {
         format!("loaded ({})", status.service_file.display())
     } else {

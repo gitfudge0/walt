@@ -192,7 +192,7 @@ impl Config {
 
     pub fn remove_path(&mut self, path: &PathBuf) {
         self.wallpaper_paths.retain(|entry| entry != path);
-        self.rotation.retain(|entry| entry != path);
+        self.rotation.retain(|entry| !entry.starts_with(path));
     }
 
     pub fn set_theme<S: Into<String>>(&mut self, theme_name: S) {
@@ -363,6 +363,24 @@ mod tests {
 
         assert!(!config.toggle_rotation(&path));
         assert!(config.rotation.is_empty());
+    }
+
+    #[test]
+    fn removing_path_clears_rotation_entries_within_it() {
+        let root = PathBuf::from("/tmp/wallpapers");
+        let keep = PathBuf::from("/tmp/other/keep.jpg");
+        let mut config = test_config();
+        config.wallpaper_paths = vec![root.clone()];
+        config.rotation = vec![
+            root.join("alpha.jpg"),
+            root.join("nested/beta.png"),
+            keep.clone(),
+        ];
+
+        config.remove_path(&root);
+
+        assert!(config.wallpaper_paths.is_empty());
+        assert_eq!(config.rotation, vec![keep]);
     }
 
     #[test]

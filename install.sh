@@ -41,6 +41,7 @@ Detected terminal: Ghostty
 Add this to your ~/.config/hypr/hyprland.conf:
 
   bind = $mainMod SHIFT, D, exec, ghostty --class=walt -e ~/.local/bin/walt
+  bind = $mainMod CTRL, D, exec, ~/.local/bin/walt gui
   bind = $mainMod, D, exec, ~/.local/bin/walt random
 
 Optional floating rules:
@@ -57,6 +58,7 @@ Detected terminal: WezTerm
 Add this to your ~/.config/hypr/hyprland.conf:
 
   bind = $mainMod SHIFT, D, exec, wezterm start --class walt -- ~/.local/bin/walt
+  bind = $mainMod CTRL, D, exec, ~/.local/bin/walt gui
   bind = $mainMod, D, exec, ~/.local/bin/walt random
 
 Optional floating rules:
@@ -73,6 +75,7 @@ Detected terminal: Kitty
 Add this to your ~/.config/hypr/hyprland.conf:
 
   bind = $mainMod SHIFT, D, exec, kitty --class walt -e ~/.local/bin/walt
+  bind = $mainMod CTRL, D, exec, ~/.local/bin/walt gui
   bind = $mainMod, D, exec, ~/.local/bin/walt random
 
 Optional floating rules:
@@ -92,6 +95,7 @@ Examples:
   ghostty --class=walt -e ~/.local/bin/walt
   wezterm start --class walt -- ~/.local/bin/walt
   kitty --class walt -e ~/.local/bin/walt
+  ~/.local/bin/walt gui
   ~/.local/bin/walt random
 
 Then match the resulting class/app-id in Hyprland with window rules.
@@ -164,8 +168,8 @@ main() {
   echo ""
   echo "First run:"
   echo "  1. Copy the path to your wallpaper directory."
-  echo "  2. Launch Walt."
-  echo "  3. Paste the directory path into the app and press Enter."
+  echo "  2. Launch Walt with \`walt\` or \`walt gui\`."
+  echo "  3. Add the directory path inside the app."
   echo ""
   echo "Make sure you have:"
   echo "  - hyprpaper installed and running"
