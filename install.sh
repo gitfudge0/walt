@@ -8,6 +8,8 @@ DEFAULT_REF="${WALT_REF:-main}"
 ARCHIVE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${DEFAULT_REF}.tar.gz"
 INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_PATH="${INSTALL_DIR}/walt"
+SOURCE_DIR=""
+TEMP_SOURCE_DIR=""
 
 detect_terminal() {
   if [[ "${TERM_PROGRAM:-}" == "ghostty" ]] || [[ "${TERM:-}" == "xterm-ghostty" ]]; then
@@ -115,27 +117,24 @@ cleanup_tmp_dir() {
 
 prepare_source_tree() {
   if [[ -f "./Cargo.toml" ]] && grep -q '^name = "walt"' "./Cargo.toml"; then
-    pwd
+    SOURCE_DIR="$(pwd)"
     return
   fi
 
   require_cmd curl
   require_cmd tar
 
-  local tmp_dir
-  tmp_dir="$(mktemp -d)"
-  trap "cleanup_tmp_dir '$tmp_dir'" EXIT
+  TEMP_SOURCE_DIR="$(mktemp -d)"
+  trap "cleanup_tmp_dir '$TEMP_SOURCE_DIR'" EXIT
 
   echo "Downloading Walt source from ${DEFAULT_REF}..." >&2
-  curl -fsSL "$ARCHIVE_URL" | tar -xz -C "$tmp_dir"
+  curl -fsSL "$ARCHIVE_URL" | tar -xz -C "$TEMP_SOURCE_DIR"
 
-  local source_dir="${tmp_dir}/${REPO_NAME}-${DEFAULT_REF}"
-  if [[ ! -f "${source_dir}/Cargo.toml" ]]; then
-    echo "Downloaded archive did not contain ${source_dir}/Cargo.toml" >&2
+  SOURCE_DIR="${TEMP_SOURCE_DIR}/${REPO_NAME}-${DEFAULT_REF}"
+  if [[ ! -f "${SOURCE_DIR}/Cargo.toml" ]]; then
+    echo "Downloaded archive did not contain ${SOURCE_DIR}/Cargo.toml" >&2
     exit 1
   fi
-
-  printf '%s\n' "$source_dir"
 }
 
 install_walt() {
@@ -152,9 +151,8 @@ install_walt() {
 }
 
 main() {
-  local source_dir
-  source_dir="$(prepare_source_tree)"
-  install_walt "$source_dir"
+  prepare_source_tree
+  install_walt "$SOURCE_DIR"
 
   local terminal
   terminal="$(detect_terminal)"
