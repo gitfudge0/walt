@@ -6,16 +6,28 @@ Walt is a wallpaper manager for Hyprland with both a terminal UI and a native de
 
 ## At a glance
 
-- Browse and apply wallpapers from the terminal or the desktop GUI
-- Preview images in place before switching
-- Navigate large wallpaper libraries quickly
-- Open a native `walt gui` window with live wallpaper state and multi-display actions
-- Use built-in themes, including `System`
-- Apply a random wallpaper with a single command
-- Install an optional background rotation service
-- Work with multi-monitor Hyprland setups through `hyprpaper`
+- Browse and apply wallpapers from the terminal or native GUI
+- Preview wallpapers before switching
+- Manage multi-display wallpaper assignment
+- Apply random wallpapers from the app or CLI
+- Control a background rotation service
+- Manage wallpaper directories and themes
+
+## Choose an Interface
+
+- `walt`
+  - keyboard-first terminal workflow
+  - in-terminal preview
+  - best for fast browsing
 
 ![Walt screenshot](assets/screenshot.png)
+
+- `walt gui`
+  - native desktop window
+  - larger visual preview
+  - better for pointer-driven browsing and dialogs
+
+![Walt GUI screenshot](assets/screenshot-gui.png)
 
 ## Quick Start
 
@@ -24,7 +36,7 @@ Walt is a wallpaper manager for Hyprland with both a terminal UI and a native de
 - `rust` and `cargo`
 - `hyprpaper`
 - `hyprctl`
-- an image-capable terminal:
+- an image-capable terminal for the TUI preview only:
   - Ghostty
   - Kitty
   - WezTerm
@@ -59,9 +71,11 @@ install -Dm755 target/release/walt ~/.local/bin/
 2. Paste the path to your wallpaper directory.
 3. Press `Enter`.
 
+The GUI folder picker may depend on an XDG desktop portal or native dialog backend on Linux.
+
 Walt stores its config in `~/.config/walt/`. If you have older settings in `~/.config/wallpaper-switcher/`, Walt will read them automatically.
 
-### Hyprland example
+## Hyprland Integration
 
 For Ghostty:
 
@@ -78,29 +92,13 @@ windowrulev2 = center, class:^(com\.mitchellh\.ghostty\.walt)$
 
 `install.sh` detects Ghostty, WezTerm, or Kitty and prints matching launch instructions, including the random-wallpaper bind.
 
+If you want the GUI to float, the `windowrulev2` examples above apply to the GUI window class as well.
+
 Make sure `hyprpaper` is running:
 
 ```conf
 exec-once = hyprpaper
 ```
-
-## CLI Commands
-
-### Open the TUI
-
-```bash
-walt
-```
-
-Launch the wallpaper browser.
-
-### Open the GUI
-
-```bash
-walt gui
-```
-
-Launch the native desktop GUI.
 
 ## GUI
 
@@ -113,11 +111,23 @@ Walt ships with a native `egui` desktop interface alongside the original TUI. Th
 - wallpaper path management
 - uninstall flow
 
-![Walt GUI screenshot](assets/screenshot-gui.png)
-
 If you do not have a graphical session available, `walt gui` exits with a clear error and you can still use `walt` for the terminal interface.
 
-### Apply random wallpapers
+The GUI folder picker uses your Linux desktop portal or native dialog backend. On Hyprland, install a matching XDG desktop portal backend such as `xdg-desktop-portal-gtk` or `xdg-desktop-portal-kde` if folder selection does not appear.
+
+## CLI Commands
+
+### Launch interfaces
+
+```bash
+walt
+walt gui
+```
+
+- `walt` launches the terminal wallpaper browser
+- `walt gui` launches the native desktop GUI
+
+### Random wallpapers
 
 ```bash
 walt random
@@ -131,9 +141,7 @@ walt random 0
 
 `walt random 0` applies one random wallpaper to display `0`. Display indices are zero-based and clamp to the last detected display if the requested index is out of range.
 
-The GUI folder picker uses your Linux desktop portal or native dialog backend. On Hyprland, install a matching XDG desktop portal backend such as `xdg-desktop-portal-gtk` or `xdg-desktop-portal-kde` if folder selection does not appear.
-
-### Manage the rotation service
+### Rotation service
 
 ```bash
 walt rotation install
@@ -184,7 +192,7 @@ walt uninstall --yes
 
 ## Keyboard Controls
 
-### Browser
+### Core TUI Controls
 
 Walt opens with the current wallpaper selected in the `All` list when it is already indexed.
 
@@ -207,6 +215,10 @@ Walt opens with the current wallpaper selected in the `All` list when it is alre
 - `q` or `Esc` quit
 
 `walt rotation enable` and `walt rotation disable` still control only the background service. The rotate-all toggle and the same/different display rotation mode are available only from the `R` popup.
+
+### Popup Controls
+
+The TUI uses focused popups for display selection, random options, rotation controls, path management, and theme selection.
 
 ### Display picker
 
