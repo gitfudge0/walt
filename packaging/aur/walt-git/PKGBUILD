@@ -1,0 +1,51 @@
+pkgname=walt-git
+pkgver=0.4.0.r3.g9f06938
+pkgrel=1
+pkgdesc="Terminal wallpaper picker for Hyprland with randomization and rotation support"
+arch=('x86_64')
+url='https://github.com/gitfudge0/walt'
+license=('MIT')
+depends=('glibc' 'hyprland' 'hyprpaper')
+makedepends=('cargo' 'git')
+optdepends=(
+  'ghostty: image-capable terminal support'
+  'kitty: image-capable terminal support'
+  'wezterm: image-capable terminal support'
+)
+provides=('walt')
+conflicts=('walt')
+source=("$pkgname::git+https://github.com/gitfudge0/walt.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$srcdir/$pkgname"
+  git describe --long --tags --abbrev=7 \
+    | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
+}
+
+prepare() {
+  cd "$srcdir/$pkgname"
+  export CARGO_HOME="$srcdir/cargo-home"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$srcdir/$pkgname"
+  export CARGO_HOME="$srcdir/cargo-home"
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --locked
+}
+
+check() {
+  cd "$srcdir/$pkgname"
+  export CARGO_HOME="$srcdir/cargo-home"
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --locked
+}
+
+package() {
+  cd "$srcdir/$pkgname"
+  install -Dm755 "target/release/walt" "$pkgdir/usr/bin/walt"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/walt/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/walt/README.md"
+}

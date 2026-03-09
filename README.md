@@ -52,6 +52,31 @@ cargo build --release
 install -Dm755 target/release/walt ~/.local/bin/
 ```
 
+### Arch Linux / AUR
+
+Use an AUR helper:
+
+```bash
+yay -S walt
+```
+
+For the development branch package:
+
+```bash
+yay -S walt-git
+```
+
+If you prefer manual AUR builds, use `makepkg -si` from the AUR checkout.
+
+Removal for packaged installs goes through pacman:
+
+```bash
+pacman -R walt
+pacman -R walt-git
+```
+
+Note: AUR packages are not installable with plain `pacman -S` unless the package is already in a configured binary repository.
+
 ### First run
 
 1. Launch `walt`.
@@ -65,8 +90,8 @@ Walt stores its config in `~/.config/walt/`. If you have older settings in `~/.c
 For Ghostty:
 
 ```conf
-bind = $mainMod SHIFT, D, exec, ghostty --class=walt -e ~/.local/bin/walt
-bind = $mainMod, D, exec, ~/.local/bin/walt random
+bind = $mainMod SHIFT, D, exec, ghostty --class=walt -e walt
+bind = $mainMod, D, exec, walt random
 windowrulev2 = float, class:^(com\.mitchellh\.ghostty\.walt)$
 windowrulev2 = size 900 600, class:^(com\.mitchellh\.ghostty\.walt)$
 windowrulev2 = center, class:^(com\.mitchellh\.ghostty\.walt)$
@@ -147,7 +172,9 @@ The rotation status also shows whether displays rotate with the same wallpaper o
 walt uninstall
 ```
 
-Prompts before removing the rotation service, config, cache, and installed `~/.local/bin/walt` binary.
+Prompts before removing the rotation service, config, cache, and the local Walt binary when applicable.
+
+When Walt is installed through pacman or an AUR helper, `walt uninstall` removes only the user service, config, and cache data. Remove the package binary with `pacman -R walt` or `pacman -R walt-git`.
 
 For non-interactive use:
 

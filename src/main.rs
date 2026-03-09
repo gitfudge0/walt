@@ -266,7 +266,15 @@ where
     )?;
     writeln!(output, "  - config: {}", paths.config_dir.display())?;
     writeln!(output, "  - cache: {}", paths.cache_dir.display())?;
-    writeln!(output, "  - binary: {}", paths.binary_path.display())?;
+    writeln!(
+        output,
+        "  - binary: {} ({})",
+        paths.binary_origin.path().display(),
+        paths.binary_origin.description()
+    )?;
+    if let Some(hint) = paths.binary_origin.removal_hint() {
+        writeln!(output, "    {hint}")?;
+    }
     write!(output, "Continue? [y/N]: ")?;
     output.flush()?;
 
@@ -291,7 +299,7 @@ fn usage_text() -> String {
         "",
         "Commands:",
         "  random [--same|index]     Apply random wallpaper(s), zero-based display index clamps to last",
-        "  uninstall [--yes]         Remove Walt service, config, cache, and ~/.local/bin/walt",
+        "  uninstall [--yes]         Remove Walt service, config, cache, and the local Walt binary when applicable",
         "  rotation install          Install and start the persistent rotation service",
         "  rotation enable           Enable and start the installed rotation service",
         "  rotation disable          Disable and stop the installed rotation service",
@@ -345,6 +353,7 @@ mod tests {
         confirm_uninstall_with_io, parse_command, usage_text, CliCommand, RandomCommand,
         RotationCommand,
     };
+    use crate::backend::uninstall::BinaryOrigin;
     use crate::backend::UninstallPaths;
     use std::io::Cursor;
     use std::path::PathBuf;
@@ -354,7 +363,16 @@ mod tests {
             service_file: PathBuf::from("/tmp/walt-rotation.service"),
             config_dir: PathBuf::from("/tmp/config/walt"),
             cache_dir: PathBuf::from("/tmp/cache/walt"),
-            binary_path: PathBuf::from("/tmp/.local/bin/walt"),
+            binary_origin: BinaryOrigin::UserLocal(PathBuf::from("/tmp/.local/bin/walt")),
+        }
+    }
+
+    fn packaged_uninstall_paths() -> UninstallPaths {
+        UninstallPaths {
+            service_file: PathBuf::from("/tmp/walt-rotation.service"),
+            config_dir: PathBuf::from("/tmp/config/walt"),
+            cache_dir: PathBuf::from("/tmp/cache/walt"),
+            binary_origin: BinaryOrigin::ExternallyManaged(PathBuf::from("/usr/bin/walt")),
         }
     }
 
@@ -555,6 +573,7 @@ mod tests {
         assert!(confirmed);
         let text = String::from_utf8(output).expect("utf8");
         assert!(text.contains("This will remove Walt from this system:"));
+        assert!(text.contains("/tmp/.local/bin/walt (local binary (will be removed))"));
         assert!(text.contains("Continue? [y/N]: "));
     }
 
@@ -595,5 +614,27 @@ mod tests {
             error.to_string(),
             "walt uninstall requires confirmation in an interactive terminal. Re-run with `walt uninstall --yes`."
         );
+    }
+
+    #[test]
+    fn uninstall_confirmation_explains_external_binary() {
+        let mut input = Cursor::new("yes\n");
+        let mut output = Vec::new();
+
+        let confirmed = confirm_uninstall_with_io(
+            false,
+            &packaged_uninstall_paths(),
+            true,
+            true,
+            &mut input,
+            &mut output,
+        )
+        .expect("confirmation");
+
+        assert!(confirmed);
+        let text = String::from_utf8(output).expect("utf8");
+        assert!(text
+            .contains("/usr/bin/walt (package-managed or external binary (will not be removed))"));
+        assert!(text.contains("Remove the installed package with `pacman -R <pkgname>`"));
     }
 }

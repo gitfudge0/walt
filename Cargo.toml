@@ -2,6 +2,11 @@
 name = "walt"
 version = "0.6.0"
 edition = "2021"
+description = "Terminal wallpaper picker for Hyprland with randomization and rotation support"
+license = "MIT"
+repository = "https://github.com/gitfudge0/walt"
+homepage = "https://github.com/gitfudge0/walt"
+readme = "README.md"
 
 [dependencies]
 ratatui = "0.29"

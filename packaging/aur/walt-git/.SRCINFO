@@ -1,0 +1,21 @@
+pkgbase = walt-git
+	pkgdesc = Terminal wallpaper picker for Hyprland with randomization and rotation support
+	pkgver = 0.4.0.r3.g9f06938
+	pkgrel = 1
+	url = https://github.com/gitfudge0/walt
+	arch = x86_64
+	license = MIT
+	makedepends = cargo
+	makedepends = git
+	depends = glibc
+	depends = hyprland
+	depends = hyprpaper
+	optdepends = ghostty: image-capable terminal support
+	optdepends = kitty: image-capable terminal support
+	optdepends = wezterm: image-capable terminal support
+	provides = walt
+	conflicts = walt
+	source = walt-git::git+https://github.com/gitfudge0/walt.git
+	sha256sums = SKIP
+
+pkgname = walt-git

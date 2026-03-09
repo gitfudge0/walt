@@ -10,13 +10,20 @@ pub struct UninstallPaths {
     pub service_file: PathBuf,
     pub config_dir: PathBuf,
     pub cache_dir: PathBuf,
-    pub binary_path: PathBuf,
+    pub binary_origin: BinaryOrigin,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BinaryOrigin {
+    UserLocal(PathBuf),
+    ExternallyManaged(PathBuf),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CleanupStatus {
     Removed,
     SkippedMissing,
+    SkippedExternallyManaged,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,7 +37,7 @@ pub struct UninstallReport {
 
 impl UninstallReport {
     pub fn summary(&self) -> String {
-        [
+        let mut lines = vec![
             "Walt uninstall complete.".to_string(),
             format!(
                 "Rotation service: {} ({})",
@@ -50,10 +57,15 @@ impl UninstallReport {
             format!(
                 "Binary: {} ({})",
                 self.binary.label(),
-                self.paths.binary_path.display()
+                self.paths.binary_origin.path().display()
             ),
-        ]
-        .join("\n")
+        ];
+
+        if let Some(hint) = self.paths.binary_origin.removal_hint() {
+            lines.push(hint.to_string());
+        }
+
+        lines.join("\n")
     }
 }
 
@@ -62,11 +74,41 @@ impl CleanupStatus {
         match self {
             Self::Removed => "removed",
             Self::SkippedMissing => "not found",
+            Self::SkippedExternallyManaged => "managed externally",
+        }
+    }
+}
+
+impl BinaryOrigin {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::UserLocal(path) | Self::ExternallyManaged(path) => path,
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::UserLocal(_) => "local binary (will be removed)",
+            Self::ExternallyManaged(_) => {
+                "package-managed or external binary (will not be removed)"
+            }
+        }
+    }
+
+    pub fn removal_hint(&self) -> Option<&'static str> {
+        match self {
+            Self::UserLocal(_) => None,
+            Self::ExternallyManaged(_) => Some(
+                "Remove the installed package with `pacman -R <pkgname>` or delete the external binary manually.",
+            ),
         }
     }
 }
 
 pub fn uninstall_paths() -> Result<UninstallPaths> {
+    let current_executable =
+        std::env::current_exe().context("Could not determine current Walt executable path")?;
+
     Ok(UninstallPaths {
         service_file: rotation_service_file_path()?,
         config_dir: dirs::config_dir()
@@ -75,11 +117,7 @@ pub fn uninstall_paths() -> Result<UninstallPaths> {
         cache_dir: dirs::cache_dir()
             .context("Could not find cache directory")?
             .join("walt"),
-        binary_path: dirs::home_dir()
-            .context("Could not find home directory")?
-            .join(".local")
-            .join("bin")
-            .join("walt"),
+        binary_origin: classify_binary_origin(current_executable)?,
     })
 }
 
@@ -106,6 +144,13 @@ fn remove_dir_if_exists(path: &Path) -> Result<CleanupStatus> {
     Ok(CleanupStatus::Removed)
 }
 
+fn remove_binary_if_owned(origin: &BinaryOrigin) -> Result<CleanupStatus> {
+    match origin {
+        BinaryOrigin::UserLocal(path) => remove_file_if_exists(path),
+        BinaryOrigin::ExternallyManaged(_) => Ok(CleanupStatus::SkippedExternallyManaged),
+    }
+}
+
 fn remove_file_if_exists(path: &Path) -> Result<CleanupStatus> {
     if !path.exists() {
         return Ok(CleanupStatus::SkippedMissing);
@@ -115,6 +160,17 @@ fn remove_file_if_exists(path: &Path) -> Result<CleanupStatus> {
     Ok(CleanupStatus::Removed)
 }
 
+fn classify_binary_origin(path: PathBuf) -> Result<BinaryOrigin> {
+    let home_dir = dirs::home_dir().context("Could not find home directory")?;
+    let user_local_binary = home_dir.join(".local").join("bin").join("walt");
+
+    if path == user_local_binary {
+        Ok(BinaryOrigin::UserLocal(path))
+    } else {
+        Ok(BinaryOrigin::ExternallyManaged(path))
+    }
+}
+
 fn uninstall_walt_with_paths<F>(paths: UninstallPaths, remove_service: F) -> Result<UninstallReport>
 where
     F: FnOnce(&Path) -> Result<CleanupStatus>,
@@ -122,7 +178,7 @@ where
     let service = remove_service(&paths.service_file)?;
     let config = remove_dir_if_exists(&paths.config_dir)?;
     let cache = remove_dir_if_exists(&paths.cache_dir)?;
-    let binary = remove_file_if_exists(&paths.binary_path)?;
+    let binary = remove_binary_if_owned(&paths.binary_origin)?;
 
     Ok(UninstallReport {
         paths,
@@ -135,7 +191,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{uninstall_walt_with_paths, CleanupStatus, UninstallPaths};
+    use super::{
+        classify_binary_origin, uninstall_walt_with_paths, BinaryOrigin, CleanupStatus,
+        UninstallPaths,
+    };
     use std::fs;
     use std::path::Path;
     use std::sync::{
@@ -162,7 +221,7 @@ mod tests {
                 .join("walt-rotation.service"),
             config_dir: root.join("config").join("walt"),
             cache_dir: root.join("cache").join("walt"),
-            binary_path: root.join(".local").join("bin").join("walt"),
+            binary_origin: BinaryOrigin::UserLocal(root.join(".local").join("bin").join("walt")),
         }
     }
 
@@ -174,12 +233,13 @@ mod tests {
 
         fs::create_dir_all(paths.config_dir.join("nested")).expect("config dir");
         fs::create_dir_all(paths.cache_dir.join("thumbs")).expect("cache dir");
-        fs::create_dir_all(paths.binary_path.parent().expect("binary parent")).expect("bin dir");
+        fs::create_dir_all(paths.binary_origin.path().parent().expect("binary parent"))
+            .expect("bin dir");
         fs::create_dir_all(unrelated_binary.parent().expect("unrelated parent"))
             .expect("unrelated dir");
         fs::write(&paths.config_dir.join("state.json"), b"{}").expect("config file");
         fs::write(&paths.cache_dir.join("wallpapers.json"), b"[]").expect("cache file");
-        fs::write(&paths.binary_path, b"binary").expect("binary");
+        fs::write(paths.binary_origin.path(), b"binary").expect("binary");
         fs::write(&unrelated_binary, b"other-binary").expect("other binary");
         fs::create_dir_all(paths.service_file.parent().expect("service parent"))
             .expect("service dir");
@@ -202,7 +262,7 @@ mod tests {
         assert!(!paths.service_file.exists());
         assert!(!paths.config_dir.exists());
         assert!(!paths.cache_dir.exists());
-        assert!(!paths.binary_path.exists());
+        assert!(!paths.binary_origin.path().exists());
         assert!(unrelated_binary.exists());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -245,5 +305,53 @@ mod tests {
         assert_eq!(report.service, CleanupStatus::Removed);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn keeps_externally_managed_binary() {
+        let root = make_temp_dir("external-binary");
+        let external_binary = root.join("usr").join("bin").join("walt");
+        let paths = UninstallPaths {
+            service_file: root
+                .join("systemd")
+                .join("user")
+                .join("walt-rotation.service"),
+            config_dir: root.join("config").join("walt"),
+            cache_dir: root.join("cache").join("walt"),
+            binary_origin: BinaryOrigin::ExternallyManaged(external_binary.clone()),
+        };
+
+        fs::create_dir_all(external_binary.parent().expect("binary parent")).expect("bin dir");
+        fs::write(&external_binary, b"binary").expect("binary");
+
+        let report = uninstall_walt_with_paths(paths, |_| Ok(CleanupStatus::SkippedMissing))
+            .expect("uninstall");
+
+        assert_eq!(report.binary, CleanupStatus::SkippedExternallyManaged);
+        assert!(external_binary.exists());
+        assert!(report.summary().contains("pacman -R <pkgname>"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn classifies_user_local_binary() {
+        let home_dir = dirs::home_dir().expect("home dir");
+        let binary = home_dir.join(".local").join("bin").join("walt");
+
+        assert_eq!(
+            classify_binary_origin(binary.clone()).expect("classification"),
+            BinaryOrigin::UserLocal(binary)
+        );
+    }
+
+    #[test]
+    fn classifies_external_binary() {
+        let binary = Path::new("/usr/bin/walt").to_path_buf();
+
+        assert_eq!(
+            classify_binary_origin(binary.clone()).expect("classification"),
+            BinaryOrigin::ExternallyManaged(binary)
+        );
     }
 }
