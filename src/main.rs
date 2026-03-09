@@ -7,20 +7,27 @@ use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};
 
 use anyhow::{bail, Context, Result};
-use rand::seq::SliceRandom;
 
 const ROTATION_OPTIONS: &str = "install, enable, disable, uninstall, status, interval";
 const ROTATION_USAGE: &str = "walt rotation <install|enable|disable|uninstall|status|interval>";
+const RANDOM_USAGE: &str = "walt random [--same|DISPLAY_INDEX]";
 const UNINSTALL_USAGE: &str = "walt uninstall [--yes]";
 
 #[derive(Debug, Eq, PartialEq)]
 enum CliCommand {
     LaunchUi,
     Help,
-    Random,
+    Random(RandomCommand),
     Uninstall { yes: bool },
     RotateDaemon,
     Rotation(RotationCommand),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum RandomCommand {
+    DifferentAll,
+    SameAll,
+    DisplayIndex(usize),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -43,7 +50,7 @@ fn main() -> Result<()> {
             print_usage();
             return Ok(());
         }
-        CliCommand::Random => return print_random_wallpaper(),
+        CliCommand::Random(command) => return run_random_wallpaper(command),
         CliCommand::Uninstall { yes } => return run_uninstall(yes),
         CliCommand::RotateDaemon => return backend::run_rotation_daemon(),
         CliCommand::Rotation(command) => {
@@ -84,8 +91,17 @@ fn main() -> Result<()> {
 fn parse_command(args: &[&str]) -> Result<CliCommand> {
     match args {
         [] => Ok(CliCommand::LaunchUi),
-        ["random"] => Ok(CliCommand::Random),
-        ["random", ..] => bail!("Usage: walt random"),
+        ["random"] => Ok(CliCommand::Random(RandomCommand::DifferentAll)),
+        ["random", "--same"] => Ok(CliCommand::Random(RandomCommand::SameAll)),
+        ["random", display_index] => {
+            let Ok(display_index) = display_index.parse::<usize>() else {
+                bail!("Usage: {RANDOM_USAGE}");
+            };
+            Ok(CliCommand::Random(RandomCommand::DisplayIndex(
+                display_index,
+            )))
+        }
+        ["random", ..] => bail!("Usage: {RANDOM_USAGE}"),
         ["uninstall"] => Ok(CliCommand::Uninstall { yes: false }),
         ["uninstall", "--yes"] | ["uninstall", "-y"] => Ok(CliCommand::Uninstall { yes: true }),
         ["uninstall", ..] => bail!("Usage: {UNINSTALL_USAGE}"),
@@ -126,7 +142,7 @@ fn parse_rotation_interval(value: &str) -> Result<u64> {
     Ok(seconds)
 }
 
-fn print_random_wallpaper() -> Result<()> {
+fn run_random_wallpaper(command: RandomCommand) -> Result<()> {
     let config = config::Config::new();
 
     if config.is_empty() {
@@ -134,13 +150,65 @@ fn print_random_wallpaper() -> Result<()> {
     }
 
     let wallpapers = backend::scan_wallpapers_from_paths(&config.wallpaper_paths);
-    let wallpaper = wallpapers
-        .choose(&mut rand::thread_rng())
-        .ok_or_else(|| anyhow::anyhow!("No wallpapers found in configured directories."))?;
+    let wallpaper_paths = wallpapers
+        .into_iter()
+        .map(|wallpaper| wallpaper.path)
+        .collect::<Vec<_>>();
+    let monitors = backend::get_monitors();
+    let random_mode = match command {
+        RandomCommand::DifferentAll => backend::RandomMode::DifferentAll,
+        RandomCommand::SameAll => backend::RandomMode::SameAll,
+        RandomCommand::DisplayIndex(index) => backend::RandomMode::DisplayIndex(index),
+    };
+    let plan = backend::plan_random_assignments(&monitors, &wallpaper_paths, random_mode)?;
 
-    let wallpaper_path = wallpaper.path.to_string_lossy();
-    backend::set_wallpaper(&wallpaper_path)?;
+    backend::apply_random_plan(&plan)?;
+    print_random_summary(&plan);
     Ok(())
+}
+
+fn print_random_summary(plan: &backend::RandomPlan) {
+    match &plan.mode {
+        backend::RandomMode::DifferentAll => {
+            println!("Applied random wallpapers to all displays:");
+            for assignment in &plan.assignments {
+                println!(
+                    "  {} -> {}",
+                    assignment.monitor_name,
+                    assignment.wallpaper_path.display()
+                );
+            }
+        }
+        backend::RandomMode::SameAll => {
+            if let Some(assignment) = plan.assignments.first() {
+                println!(
+                    "Applied the same random wallpaper to all displays: {}",
+                    assignment.wallpaper_path.display()
+                );
+            }
+        }
+        backend::RandomMode::DisplayIndex(requested) => {
+            if let Some(assignment) = plan.assignments.first() {
+                let resolved = plan.resolved_display_index.unwrap_or(*requested);
+                if resolved == *requested {
+                    println!(
+                        "Applied a random wallpaper to display {} ({}): {}",
+                        resolved,
+                        assignment.monitor_name,
+                        assignment.wallpaper_path.display()
+                    );
+                } else {
+                    println!(
+                        "Applied a random wallpaper to display {} (clamped from {}, {}): {}",
+                        resolved,
+                        requested,
+                        assignment.monitor_name,
+                        assignment.wallpaper_path.display()
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn run_uninstall(yes: bool) -> Result<()> {
@@ -217,12 +285,12 @@ fn usage_text() -> String {
         "Walt",
         "",
         "Usage:",
-        "  walt random",
+        "  walt random [--same|DISPLAY_INDEX]",
         "  walt uninstall [--yes]",
         "  walt rotation <command>",
         "",
         "Commands:",
-        "  random                    Apply a random wallpaper from the configured list",
+        "  random [--same|index]     Apply random wallpaper(s), zero-based display index clamps to last",
         "  uninstall [--yes]         Remove Walt service, config, cache, and ~/.local/bin/walt",
         "  rotation install          Install and start the persistent rotation service",
         "  rotation enable           Enable and start the installed rotation service",
@@ -233,6 +301,8 @@ fn usage_text() -> String {
         "",
         "Examples:",
         "  walt random",
+        "  walt random --same",
+        "  walt random 0",
         "  walt uninstall --yes",
         "  walt rotation install",
         "  walt rotation interval 900",
@@ -272,7 +342,8 @@ fn format_interval(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        confirm_uninstall_with_io, parse_command, usage_text, CliCommand, RotationCommand,
+        confirm_uninstall_with_io, parse_command, usage_text, CliCommand, RandomCommand,
+        RotationCommand,
     };
     use crate::backend::UninstallPaths;
     use std::io::Cursor;
@@ -291,7 +362,23 @@ mod tests {
     fn parses_random_command() {
         assert_eq!(
             parse_command(&["random"]).expect("command"),
-            CliCommand::Random
+            CliCommand::Random(RandomCommand::DifferentAll)
+        );
+    }
+
+    #[test]
+    fn parses_random_same_command() {
+        assert_eq!(
+            parse_command(&["random", "--same"]).expect("command"),
+            CliCommand::Random(RandomCommand::SameAll)
+        );
+    }
+
+    #[test]
+    fn parses_random_display_index_command() {
+        assert_eq!(
+            parse_command(&["random", "0"]).expect("command"),
+            CliCommand::Random(RandomCommand::DisplayIndex(0))
         );
     }
 
@@ -385,7 +472,19 @@ mod tests {
     #[test]
     fn rejects_random_with_extra_arguments() {
         let error = parse_command(&["random", "extra"]).expect_err("extra args should fail");
-        assert_eq!(error.to_string(), "Usage: walt random");
+        assert_eq!(
+            error.to_string(),
+            "Usage: walt random [--same|DISPLAY_INDEX]"
+        );
+    }
+
+    #[test]
+    fn rejects_random_same_with_extra_arguments() {
+        let error = parse_command(&["random", "--same", "1"]).expect_err("extra args should fail");
+        assert_eq!(
+            error.to_string(),
+            "Usage: walt random [--same|DISPLAY_INDEX]"
+        );
     }
 
     #[test]
@@ -427,6 +526,9 @@ mod tests {
         assert!(usage.contains("Usage:"));
         assert!(usage.contains("Commands:"));
         assert!(usage.contains("Examples:"));
+        assert!(usage.contains("walt random [--same|DISPLAY_INDEX]"));
+        assert!(usage.contains("walt random --same"));
+        assert!(usage.contains("walt random 0"));
         assert!(usage.contains("walt uninstall [--yes]"));
         assert!(usage.contains("rotation interval <secs>"));
         assert!(!usage.contains("--random"));

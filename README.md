@@ -92,13 +92,19 @@ walt
 
 Launch the wallpaper browser.
 
-### Apply a random wallpaper
+### Apply random wallpapers
 
 ```bash
 walt random
+walt random --same
+walt random 0
 ```
 
-This picks one random wallpaper from all configured directories and applies it without opening the TUI.
+`walt random` applies different random wallpapers across all detected displays when possible.
+
+`walt random --same` applies one random wallpaper to every display.
+
+`walt random 0` applies one random wallpaper to display `0`. Display indices are zero-based and clamp to the last detected display if the requested index is out of range.
 
 ### Manage the rotation service
 
@@ -133,6 +139,7 @@ Entries:  12 wallpapers
 
 Walt does not auto-rotate wallpapers while the TUI is open unless you install the background service.
 When rotate-all mode is enabled from the TUI, `Entries` changes to `all wallpapers`.
+The rotation status also shows whether displays rotate with the same wallpaper or different wallpapers per display.
 
 ### Uninstall
 
@@ -163,16 +170,44 @@ Walt opens with the current wallpaper selected in the `All` list when it is alre
 - `/` filter the active section
 - `s` toggle sort for the active section between name and modification date
 - `r` add or remove the selected wallpaper from the manual rotation list
-- `Ctrl+r` pick and apply a random wallpaper
-- `R` open the rotation options for service actions and rotate-all mode
-- `All displays` in the display picker applies the selected wallpaper to every display when `A` is unavailable
+- `Ctrl+r` apply a random wallpaper directly when one display is detected, or open random options when multiple displays are detected
+- `R` open the rotation options for service actions, wallpaper scope, and display mode
+- `All displays` in the display picker applies the selected wallpaper to every display from inside the popup
 - `i` change the interval used by the installed rotation service
 - `p` manage wallpaper paths
 - `t` open the theme picker
 - `?` open the keybindings popup
 - `q` or `Esc` quit
 
-`walt rotation enable` and `walt rotation disable` still control only the background service. The rotate-all mode is available only from the `R` popup.
+`walt rotation enable` and `walt rotation disable` still control only the background service. The rotate-all toggle and the same/different display rotation mode are available only from the `R` popup.
+
+### Display picker
+
+- Appears after `Enter` when multiple displays are detected
+- Lists each detected display plus `All displays`
+- `↑/↓` or `j/k` move
+- `Enter` apply
+- `Esc` or `q` close
+
+### Random options
+
+- Appears after `Ctrl+r` when multiple displays are detected
+- Offers:
+  - `Different on all displays`
+  - `Same on all displays`
+  - one random target per display, shown as `Display N: <name>`
+- Display indices in the popup match the CLI `walt random N` numbering
+- `↑/↓` or `j/k` move
+- `Enter` apply
+- `Esc` or `q` close
+
+### Rotation options
+
+- Open with `R`
+- Lets you install or enable the service, switch between selected wallpapers and all wallpapers, choose same-on-all-displays or different-per-display rotation, and change the interval
+- `↑/↓` or `j/k` move
+- `Enter` run the selected action
+- `Esc` close
 
 ### Path manager
 
@@ -181,6 +216,13 @@ Walt opens with the current wallpaper selected in the `All` list when it is alre
 - `d` remove the selected path
 - `p`, `q`, or `Esc` return
 - `t` open the theme picker
+
+### Path adding
+
+- Type a path manually
+- `Tab` completes from the suggestions list
+- `Enter` add the selected path
+- `Esc` cancels only when this flow was opened from the path manager
 
 ### Theme picker
 
