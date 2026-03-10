@@ -178,6 +178,7 @@ walt rotation uninstall
 - `disable` stops the installed service
 - `enable` starts it again
 - `uninstall` removes it completely
+- while the service is running, newly attached displays are handled automatically
 
 Example `status` output:
 
@@ -195,6 +196,10 @@ Entries:  12 wallpapers
 Walt does not auto-rotate wallpapers while the TUI is open unless you install the background service.
 When rotate-all mode is enabled from the TUI, `Entries` changes to `all wallpapers`.
 The rotation status also shows whether displays rotate with the same wallpaper or different wallpapers per display.
+When the rotation service is running, hotplug behavior follows the display mode:
+
+- `same on all displays` mirrors the current wallpaper onto the new display
+- `different per display` assigns a fresh random wallpaper to only the new display
 
 ### Uninstall
 
