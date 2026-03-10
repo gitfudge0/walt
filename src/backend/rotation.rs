@@ -1,6 +1,17 @@
-use std::{fs, path::PathBuf, process::Command, thread, time::Duration};
+use std::{
+    collections::HashSet,
+    fs,
+    io::{BufRead, BufReader},
+    os::unix::net::UnixStream,
+    path::PathBuf,
+    process::Command,
+    sync::mpsc::{self, RecvTimeoutError, Sender},
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::{bail, Context, Result};
+use rand::{seq::SliceRandom, Rng};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -8,7 +19,14 @@ use crate::{
     config::Config,
 };
 
-use super::{get_monitors, set_wallpaper, set_wallpapers_for_monitors, Monitor};
+use super::{
+    get_monitors,
+    hyprpaper::{
+        classify_backend_unavailable, get_active_wallpaper_assignments, ActiveWallpaperAssignment,
+        BackendUnavailableReason,
+    },
+    set_wallpaper, set_wallpaper_for_monitor, set_wallpapers_for_monitors, Monitor,
+};
 
 const CONFIG_DIR: &str = "walt";
 const ROTATION_STATE_FILE: &str = "rotation-state.json";
@@ -20,6 +38,7 @@ const BENIGN_DISABLE_ERRORS: &[&str] = &[
     "no files found for walt-rotation.service",
     "unit walt-rotation.service could not be found",
 ];
+const BACKEND_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SortMode {
@@ -30,6 +49,35 @@ enum SortMode {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct RotationState {
     last_wallpaper: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HyprlandEvent {
+    MonitorAdded(String),
+    MonitorRemoved(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MonitorHotplugAction {
+    SetOnMonitor {
+        monitor_name: String,
+        wallpaper_path: PathBuf,
+    },
+    SetOnAllDisplays {
+        wallpaper_path: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RotationTickOutcome {
+    Scheduled(Duration),
+    RetrySoon(Duration, BackendUnavailableReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HotplugApplyOutcome {
+    Applied,
+    RetrySoon(BackendUnavailableReason),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,35 +175,416 @@ pub fn rotation_service_status() -> Result<String> {
 
 pub fn run_rotation_daemon() -> Result<()> {
     let index = WallpaperIndex::new()?;
+    let mut known_monitors = current_monitor_names();
+    let mut pending_monitor_additions = HashSet::new();
+    let mut last_transient_backend_message = None;
+    let (event_tx, event_rx) = mpsc::channel();
+    spawn_hyprland_event_listener(event_tx);
+    let mut next_rotation_at = Instant::now()
+        + handle_rotation_tick_outcome(
+            run_rotation_iteration(&index)?,
+            &mut last_transient_backend_message,
+        );
 
     loop {
-        let config = Config::new();
-        let candidates = rotation_candidates(&index, &config);
-        let interval = Duration::from_secs(config.rotation_interval_secs.max(1));
+        pending_monitor_additions.retain(|name| known_monitors.contains(name));
+        if let Some(delay) = try_apply_pending_monitor_additions(
+            &index,
+            &known_monitors,
+            &mut pending_monitor_additions,
+            &mut last_transient_backend_message,
+        )? {
+            next_rotation_at = Instant::now()
+                + delay.min(next_rotation_at.saturating_duration_since(Instant::now()));
+        }
 
-        if candidates.is_empty() {
-            thread::sleep(interval.min(Duration::from_secs(30)));
+        let timeout = next_rotation_at.saturating_duration_since(Instant::now());
+        match event_rx.recv_timeout(timeout) {
+            Ok(HyprlandEvent::MonitorAdded(name)) => {
+                queue_monitor_addition(&known_monitors, &mut pending_monitor_additions, &name);
+                known_monitors = current_monitor_names();
+            }
+            Ok(HyprlandEvent::MonitorRemoved(name)) => {
+                known_monitors = current_monitor_names();
+                known_monitors.remove(&name);
+                pending_monitor_additions.remove(&name);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                next_rotation_at = Instant::now()
+                    + handle_rotation_tick_outcome(
+                        run_rotation_iteration(&index)?,
+                        &mut last_transient_backend_message,
+                    );
+                known_monitors = current_monitor_names();
+                pending_monitor_additions.retain(|name| known_monitors.contains(name));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("Hyprland event listener channel disconnected");
+            }
+        }
+    }
+}
+
+fn queue_monitor_addition(
+    previous_known_monitors: &HashSet<String>,
+    pending_monitor_additions: &mut HashSet<String>,
+    monitor_name: &str,
+) -> bool {
+    if should_queue_monitor_addition(previous_known_monitors, monitor_name) {
+        pending_monitor_additions.insert(monitor_name.to_string());
+        true
+    } else {
+        false
+    }
+}
+
+fn should_queue_monitor_addition(
+    previous_known_monitors: &HashSet<String>,
+    monitor_name: &str,
+) -> bool {
+    !previous_known_monitors.contains(monitor_name)
+}
+
+fn handle_rotation_tick_outcome(
+    outcome: RotationTickOutcome,
+    last_transient_backend_message: &mut Option<String>,
+) -> Duration {
+    match outcome {
+        RotationTickOutcome::Scheduled(delay) => {
+            *last_transient_backend_message = None;
+            delay
+        }
+        RotationTickOutcome::RetrySoon(delay, reason) => {
+            log_transient_backend_state(last_transient_backend_message, reason);
+            delay
+        }
+    }
+}
+
+fn run_rotation_iteration(index: &WallpaperIndex) -> Result<RotationTickOutcome> {
+    let config = Config::new();
+    let candidates = rotation_candidates(index, &config);
+    let interval = Duration::from_secs(config.rotation_interval_secs.max(1));
+
+    if candidates.is_empty() {
+        return Ok(RotationTickOutcome::Scheduled(
+            interval.min(Duration::from_secs(30)),
+        ));
+    }
+
+    let mut state = load_rotation_state()?;
+    if config.uses_same_wallpaper_on_all_displays_for_rotation() {
+        let next = next_wallpaper(&candidates, state.last_wallpaper.as_ref())
+            .cloned()
+            .context("Could not determine next rotation wallpaper")?;
+        if let Err(error) = set_wallpaper(&next.path.to_string_lossy()) {
+            if let Some(reason) = classify_backend_unavailable(&error) {
+                return Ok(RotationTickOutcome::RetrySoon(BACKEND_RETRY_DELAY, reason));
+            }
+            return Err(error);
+        }
+        state.last_wallpaper = Some(next.path.clone());
+    } else {
+        let monitors = get_monitors();
+        let selection =
+            next_wallpaper_assignments(&monitors, &candidates, state.last_wallpaper.as_ref())
+                .context("Could not determine next rotation wallpapers")?;
+        if let Err(error) = set_wallpapers_for_monitors(&selection.assignments) {
+            if let Some(reason) = classify_backend_unavailable(&error) {
+                return Ok(RotationTickOutcome::RetrySoon(BACKEND_RETRY_DELAY, reason));
+            }
+            return Err(error);
+        }
+        state.last_wallpaper = Some(selection.last_wallpaper);
+    }
+    save_rotation_state(&state)?;
+
+    Ok(RotationTickOutcome::Scheduled(interval))
+}
+
+fn current_monitor_names() -> HashSet<String> {
+    get_monitors()
+        .into_iter()
+        .map(|monitor| monitor.name)
+        .collect()
+}
+
+fn try_apply_pending_monitor_additions(
+    index: &WallpaperIndex,
+    known_monitors: &HashSet<String>,
+    pending_monitor_additions: &mut HashSet<String>,
+    last_transient_backend_message: &mut Option<String>,
+) -> Result<Option<Duration>> {
+    if pending_monitor_additions.is_empty() {
+        return Ok(None);
+    }
+
+    let pending = pending_monitor_additions
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut should_retry = false;
+
+    for monitor_name in pending {
+        if !known_monitors.contains(&monitor_name) {
+            pending_monitor_additions.remove(&monitor_name);
             continue;
         }
 
-        let mut state = load_rotation_state()?;
-        if config.uses_same_wallpaper_on_all_displays_for_rotation() {
-            let next = next_wallpaper(&candidates, state.last_wallpaper.as_ref())
-                .cloned()
-                .context("Could not determine next rotation wallpaper")?;
-            set_wallpaper(&next.path.to_string_lossy())?;
-            state.last_wallpaper = Some(next.path.clone());
-        } else {
-            let monitors = get_monitors();
-            let selection =
-                next_wallpaper_assignments(&monitors, &candidates, state.last_wallpaper.as_ref())
-                    .context("Could not determine next rotation wallpapers")?;
-            set_wallpapers_for_monitors(&selection.assignments)?;
-            state.last_wallpaper = Some(selection.last_wallpaper);
+        match handle_monitor_added(index, &monitor_name)? {
+            HotplugApplyOutcome::Applied => {
+                pending_monitor_additions.remove(&monitor_name);
+                *last_transient_backend_message = None;
+            }
+            HotplugApplyOutcome::RetrySoon(reason) => {
+                should_retry = true;
+                log_transient_backend_state(last_transient_backend_message, reason);
+            }
         }
-        save_rotation_state(&state)?;
-        thread::sleep(interval);
     }
+
+    if should_retry {
+        Ok(Some(BACKEND_RETRY_DELAY))
+    } else {
+        Ok(None)
+    }
+}
+
+fn log_transient_backend_state(
+    last_transient_backend_message: &mut Option<String>,
+    reason: BackendUnavailableReason,
+) {
+    let message = transient_backend_message(reason);
+    if last_transient_backend_message.as_deref() != Some(message) {
+        eprintln!("{message}");
+        *last_transient_backend_message = Some(message.to_string());
+    }
+}
+
+fn transient_backend_message(reason: BackendUnavailableReason) -> &'static str {
+    match reason {
+        BackendUnavailableReason::HyprpaperUnavailable => {
+            "Hyprpaper is unavailable; Walt rotation will retry shortly."
+        }
+        BackendUnavailableReason::NoMonitors => {
+            "No monitors are available; Walt rotation will retry shortly."
+        }
+        BackendUnavailableReason::MonitorNotReady => {
+            "A monitor is not ready for wallpaper assignment yet; Walt rotation will retry shortly."
+        }
+    }
+}
+
+fn handle_monitor_added(index: &WallpaperIndex, monitor_name: &str) -> Result<HotplugApplyOutcome> {
+    let config = Config::new();
+    let candidates = rotation_candidates(index, &config);
+    if candidates.is_empty() {
+        return Ok(HotplugApplyOutcome::Applied);
+    }
+
+    let active_assignments = match get_active_wallpaper_assignments() {
+        Ok(assignments) => assignments,
+        Err(error) => {
+            if let Some(reason) = classify_backend_unavailable(&error) {
+                return Ok(HotplugApplyOutcome::RetrySoon(reason));
+            }
+            return Err(error);
+        }
+    };
+    let mut rng = rand::thread_rng();
+    let action = plan_monitor_added_action(
+        monitor_name,
+        &config,
+        &candidates,
+        &active_assignments,
+        load_rotation_state()?.last_wallpaper.as_ref(),
+        &mut rng,
+    )?;
+
+    match action {
+        MonitorHotplugAction::SetOnMonitor {
+            monitor_name,
+            wallpaper_path,
+        } => match set_wallpaper_for_monitor(&monitor_name, &wallpaper_path.to_string_lossy()) {
+            Ok(()) => Ok(HotplugApplyOutcome::Applied),
+            Err(error) => {
+                if let Some(reason) = classify_backend_unavailable(&error) {
+                    return Ok(HotplugApplyOutcome::RetrySoon(reason));
+                }
+                Err(error)
+            }
+        },
+        MonitorHotplugAction::SetOnAllDisplays { wallpaper_path } => {
+            if let Err(error) = set_wallpaper(&wallpaper_path.to_string_lossy()) {
+                if let Some(reason) = classify_backend_unavailable(&error) {
+                    return Ok(HotplugApplyOutcome::RetrySoon(reason));
+                }
+                return Err(error);
+            }
+            let mut state = load_rotation_state()?;
+            state.last_wallpaper = Some(wallpaper_path);
+            save_rotation_state(&state)?;
+            Ok(HotplugApplyOutcome::Applied)
+        }
+    }
+}
+
+fn plan_monitor_added_action<R: Rng + ?Sized>(
+    new_monitor_name: &str,
+    config: &Config,
+    candidates: &[IndexedWallpaper],
+    active_assignments: &[ActiveWallpaperAssignment],
+    last_wallpaper: Option<&PathBuf>,
+    rng: &mut R,
+) -> Result<MonitorHotplugAction> {
+    if config.uses_same_wallpaper_on_all_displays_for_rotation() {
+        if let Some(existing) = active_assignments.iter().find(|assignment| {
+            assignment.monitor_name != new_monitor_name
+                && !assignment.wallpaper_path.as_os_str().is_empty()
+        }) {
+            return Ok(MonitorHotplugAction::SetOnMonitor {
+                monitor_name: new_monitor_name.to_string(),
+                wallpaper_path: existing.wallpaper_path.clone(),
+            });
+        }
+
+        let next = next_wallpaper(candidates, last_wallpaper)
+            .cloned()
+            .context("Could not determine next rotation wallpaper")?;
+        return Ok(MonitorHotplugAction::SetOnAllDisplays {
+            wallpaper_path: next.path,
+        });
+    }
+
+    let candidate_paths = candidates
+        .iter()
+        .map(|wallpaper| wallpaper.path.clone())
+        .collect::<Vec<_>>();
+    let active_paths = active_assignments
+        .iter()
+        .filter(|assignment| assignment.monitor_name != new_monitor_name)
+        .map(|assignment| assignment.wallpaper_path.clone())
+        .collect::<HashSet<_>>();
+    let wallpaper_path = choose_hotplug_wallpaper_with_rng(&candidate_paths, &active_paths, rng)?;
+
+    Ok(MonitorHotplugAction::SetOnMonitor {
+        monitor_name: new_monitor_name.to_string(),
+        wallpaper_path,
+    })
+}
+
+fn choose_hotplug_wallpaper_with_rng<R: Rng + ?Sized>(
+    candidates: &[PathBuf],
+    active_paths: &HashSet<PathBuf>,
+    rng: &mut R,
+) -> Result<PathBuf> {
+    let preferred = candidates
+        .iter()
+        .filter(|candidate| !active_paths.contains(*candidate))
+        .cloned()
+        .collect::<Vec<_>>();
+    let pool = if preferred.is_empty() {
+        candidates
+    } else {
+        preferred.as_slice()
+    };
+
+    pool.choose(rng)
+        .cloned()
+        .context("No rotation wallpapers available for monitor hotplug")
+}
+
+fn parse_hyprland_event(line: &str) -> Option<HyprlandEvent> {
+    let (event_name, data) = line.trim().split_once(">>")?;
+    match event_name {
+        "monitoradded" => parse_direct_monitor_event(data).map(HyprlandEvent::MonitorAdded),
+        "monitorremoved" => parse_direct_monitor_event(data).map(HyprlandEvent::MonitorRemoved),
+        "monitoraddedv2" => parse_v2_monitor_event(data).map(HyprlandEvent::MonitorAdded),
+        "monitorremovedv2" => parse_v2_monitor_event(data).map(HyprlandEvent::MonitorRemoved),
+        _ => None,
+    }
+}
+
+fn parse_direct_monitor_event(data: &str) -> Option<String> {
+    let name = data.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn parse_v2_monitor_event(data: &str) -> Option<String> {
+    let mut fields = data.split(',');
+    fields.next()?;
+    let name = fields.next()?.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn socket2_path() -> Result<PathBuf> {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .context("XDG_RUNTIME_DIR is not set for Hyprland event listener")?;
+    let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
+        .context("HYPRLAND_INSTANCE_SIGNATURE is not set for Hyprland event listener")?;
+
+    Ok(PathBuf::from(runtime_dir)
+        .join("hypr")
+        .join(signature)
+        .join(".socket2.sock"))
+}
+
+fn spawn_hyprland_event_listener(tx: Sender<HyprlandEvent>) {
+    thread::spawn(move || loop {
+        let socket_path = match socket2_path() {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("Failed to resolve Hyprland event socket path: {error}");
+                thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+        };
+
+        let stream = match UnixStream::connect(&socket_path) {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!(
+                    "Failed to connect to Hyprland event socket {}: {}",
+                    socket_path.display(),
+                    error
+                );
+                thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+        };
+
+        let reader = BufReader::new(stream);
+        let mut disconnected = false;
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    if let Some(event) = parse_hyprland_event(&line) {
+                        if tx.send(event).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Failed to read Hyprland event socket: {error}");
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        if !disconnected {
+            eprintln!("Hyprland event socket disconnected; retrying");
+        }
+        thread::sleep(Duration::from_secs(5));
+    });
 }
 
 fn rotation_candidates(index: &WallpaperIndex, config: &Config) -> Vec<IndexedWallpaper> {
@@ -472,13 +901,19 @@ fn config_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_wallpapers_for_rotation, format_rotation_service_status,
+        choose_hotplug_wallpaper_with_rng, filter_wallpapers_for_rotation,
+        format_rotation_service_status, handle_rotation_tick_outcome,
         is_tolerated_systemctl_failure, next_wallpaper, next_wallpaper_assignments,
-        service_file_contents, Monitor, RotationServiceStatus,
+        parse_hyprland_event, plan_monitor_added_action, queue_monitor_addition,
+        service_file_contents, should_queue_monitor_addition, transient_backend_message,
+        BackendUnavailableReason, HyprlandEvent, Monitor, MonitorHotplugAction,
+        RotationServiceStatus, RotationTickOutcome, BACKEND_RETRY_DELAY,
     };
+    use crate::backend::hyprpaper::{classify_backend_unavailable, ActiveWallpaperAssignment};
     use crate::cache::IndexedWallpaper;
     use crate::config::Config;
-    use std::path::PathBuf;
+    use rand::{rngs::StdRng, SeedableRng};
+    use std::{collections::HashSet, path::PathBuf, time::Duration};
 
     fn wallpaper(name: &str) -> IndexedWallpaper {
         IndexedWallpaper {
@@ -493,7 +928,11 @@ mod tests {
         }
     }
 
-    fn config(rotation: Vec<&str>, rotate_all_wallpapers: bool) -> Config {
+    fn config(
+        rotation: Vec<&str>,
+        rotate_all_wallpapers: bool,
+        same_on_all_displays: bool,
+    ) -> Config {
         Config {
             wallpaper_paths: vec![],
             theme_name: "System".to_string(),
@@ -502,10 +941,17 @@ mod tests {
                 .map(|name| PathBuf::from(format!("/tmp/{name}.png")))
                 .collect(),
             rotate_all_wallpapers,
-            rotation_same_wallpaper_on_all_displays: true,
+            rotation_same_wallpaper_on_all_displays: same_on_all_displays,
             rotation_interval_secs: 300,
             all_sort: "name".to_string(),
             rotation_sort: "name".to_string(),
+        }
+    }
+
+    fn active_assignment(monitor_name: &str, wallpaper_name: &str) -> ActiveWallpaperAssignment {
+        ActiveWallpaperAssignment {
+            monitor_name: monitor_name.to_string(),
+            wallpaper_path: PathBuf::from(format!("/tmp/{wallpaper_name}.png")),
         }
     }
 
@@ -528,7 +974,8 @@ mod tests {
     #[test]
     fn keeps_only_selected_wallpapers_when_rotate_all_is_off() {
         let wallpapers = vec![wallpaper("alpha"), wallpaper("beta"), wallpaper("gamma")];
-        let filtered = filter_wallpapers_for_rotation(wallpapers, &config(vec!["beta"], false));
+        let filtered =
+            filter_wallpapers_for_rotation(wallpapers, &config(vec!["beta"], false, true));
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "beta");
@@ -537,7 +984,8 @@ mod tests {
     #[test]
     fn keeps_all_wallpapers_when_rotate_all_is_on() {
         let wallpapers = vec![wallpaper("alpha"), wallpaper("beta"), wallpaper("gamma")];
-        let filtered = filter_wallpapers_for_rotation(wallpapers, &config(vec!["beta"], true));
+        let filtered =
+            filter_wallpapers_for_rotation(wallpapers, &config(vec!["beta"], true, true));
 
         assert_eq!(filtered.len(), 3);
         assert_eq!(filtered[0].name, "alpha");
@@ -590,6 +1038,262 @@ mod tests {
     fn returns_none_for_multi_display_assignments_without_monitors() {
         let wallpapers = vec![wallpaper("alpha")];
         assert!(next_wallpaper_assignments(&[], &wallpapers, None).is_none());
+    }
+
+    #[test]
+    fn parses_monitor_added_event() {
+        assert_eq!(
+            parse_hyprland_event("monitoradded>>DP-1"),
+            Some(HyprlandEvent::MonitorAdded("DP-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_monitor_added_v2_event() {
+        assert_eq!(
+            parse_hyprland_event("monitoraddedv2>>3,DP-1,Dell Inc."),
+            Some(HyprlandEvent::MonitorAdded("DP-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_monitor_removed_event() {
+        assert_eq!(
+            parse_hyprland_event("monitorremoved>>HDMI-A-1"),
+            Some(HyprlandEvent::MonitorRemoved("HDMI-A-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_monitor_removed_v2_event() {
+        assert_eq!(
+            parse_hyprland_event("monitorremovedv2>>7,eDP-1,Laptop Panel"),
+            Some(HyprlandEvent::MonitorRemoved("eDP-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn ignores_unrelated_hyprland_events() {
+        assert_eq!(parse_hyprland_event("workspace>>1"), None);
+        assert_eq!(parse_hyprland_event("monitoraddedv2>>"), None);
+    }
+
+    #[test]
+    fn same_on_all_hotplug_mirrors_existing_wallpaper() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let action = plan_monitor_added_action(
+            "DP-1",
+            &config(vec!["alpha", "beta"], false, true),
+            &vec![wallpaper("alpha"), wallpaper("beta")],
+            &[active_assignment("eDP-1", "beta")],
+            Some(&PathBuf::from("/tmp/alpha.png")),
+            &mut rng,
+        )
+        .expect("action");
+
+        assert_eq!(
+            action,
+            MonitorHotplugAction::SetOnMonitor {
+                monitor_name: "DP-1".to_string(),
+                wallpaper_path: PathBuf::from("/tmp/beta.png"),
+            }
+        );
+    }
+
+    #[test]
+    fn same_on_all_hotplug_falls_back_to_next_rotation_wallpaper() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let action = plan_monitor_added_action(
+            "DP-1",
+            &config(vec!["alpha", "beta"], false, true),
+            &vec![wallpaper("alpha"), wallpaper("beta")],
+            &[],
+            Some(&PathBuf::from("/tmp/alpha.png")),
+            &mut rng,
+        )
+        .expect("action");
+
+        assert_eq!(
+            action,
+            MonitorHotplugAction::SetOnAllDisplays {
+                wallpaper_path: PathBuf::from("/tmp/beta.png"),
+            }
+        );
+    }
+
+    #[test]
+    fn different_per_display_hotplug_prefers_non_active_wallpaper() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let action = plan_monitor_added_action(
+            "DP-1",
+            &config(vec!["alpha", "beta", "gamma"], true, false),
+            &vec![wallpaper("alpha"), wallpaper("beta"), wallpaper("gamma")],
+            &[
+                active_assignment("eDP-1", "alpha"),
+                active_assignment("HDMI-A-1", "beta"),
+            ],
+            None,
+            &mut rng,
+        )
+        .expect("action");
+
+        assert_eq!(
+            action,
+            MonitorHotplugAction::SetOnMonitor {
+                monitor_name: "DP-1".to_string(),
+                wallpaper_path: PathBuf::from("/tmp/gamma.png"),
+            }
+        );
+    }
+
+    #[test]
+    fn different_per_display_hotplug_falls_back_to_full_pool() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let picked = choose_hotplug_wallpaper_with_rng(
+            &[
+                PathBuf::from("/tmp/alpha.png"),
+                PathBuf::from("/tmp/beta.png"),
+            ],
+            &HashSet::from([
+                PathBuf::from("/tmp/alpha.png"),
+                PathBuf::from("/tmp/beta.png"),
+            ]),
+            &mut rng,
+        )
+        .expect("wallpaper");
+
+        assert!(
+            picked == PathBuf::from("/tmp/alpha.png") || picked == PathBuf::from("/tmp/beta.png")
+        );
+    }
+
+    #[test]
+    fn hotplug_random_selection_errors_without_candidates() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let error = choose_hotplug_wallpaper_with_rng(&[], &HashSet::new(), &mut rng)
+            .expect_err("empty candidates should fail");
+
+        assert!(error
+            .to_string()
+            .contains("No rotation wallpapers available for monitor hotplug"));
+    }
+
+    #[test]
+    fn monitor_add_event_queues_monitor_when_missing_from_previous_known_set() {
+        let previous_known = HashSet::from(["eDP-1".to_string()]);
+        let refreshed_known = HashSet::from(["eDP-1".to_string(), "DP-1".to_string()]);
+        let mut pending = HashSet::new();
+
+        assert!(queue_monitor_addition(
+            &previous_known,
+            &mut pending,
+            "DP-1"
+        ));
+        assert!(pending.contains("DP-1"));
+        assert!(refreshed_known.contains("DP-1"));
+    }
+
+    #[test]
+    fn monitor_add_event_skips_duplicate_when_already_in_previous_known_set() {
+        let previous_known = HashSet::from(["eDP-1".to_string(), "DP-1".to_string()]);
+        let refreshed_known = HashSet::from(["eDP-1".to_string(), "DP-1".to_string()]);
+        let mut pending = HashSet::new();
+
+        assert!(!queue_monitor_addition(
+            &previous_known,
+            &mut pending,
+            "DP-1"
+        ));
+        assert!(!pending.contains("DP-1"));
+        assert!(refreshed_known.contains("DP-1"));
+    }
+
+    #[test]
+    fn monitor_removed_then_monitor_added_queues_again() {
+        let previous_known = HashSet::from(["eDP-1".to_string()]);
+        let mut pending = HashSet::new();
+
+        assert!(should_queue_monitor_addition(&previous_known, "DP-1"));
+        assert!(queue_monitor_addition(
+            &previous_known,
+            &mut pending,
+            "DP-1"
+        ));
+        assert!(pending.contains("DP-1"));
+    }
+
+    #[test]
+    fn daemon_event_sequence_populates_pending_queue_for_new_attach() {
+        let previous_known = HashSet::from(["eDP-1".to_string()]);
+        let refreshed_known = HashSet::from(["eDP-1".to_string(), "DP-1".to_string()]);
+        let mut pending = HashSet::new();
+
+        let queued = queue_monitor_addition(&previous_known, &mut pending, "DP-1");
+
+        assert!(queued);
+        assert!(pending.contains("DP-1"));
+        assert!(refreshed_known.contains("DP-1"));
+    }
+
+    #[test]
+    fn retry_tick_keeps_transient_message_until_success() {
+        let mut last_message = None;
+        let retry_delay = handle_rotation_tick_outcome(
+            RotationTickOutcome::RetrySoon(
+                BACKEND_RETRY_DELAY,
+                BackendUnavailableReason::HyprpaperUnavailable,
+            ),
+            &mut last_message,
+        );
+
+        assert_eq!(retry_delay, BACKEND_RETRY_DELAY);
+        assert_eq!(
+            last_message,
+            Some(
+                transient_backend_message(BackendUnavailableReason::HyprpaperUnavailable)
+                    .to_string()
+            )
+        );
+
+        let scheduled = handle_rotation_tick_outcome(
+            RotationTickOutcome::Scheduled(Duration::from_secs(300)),
+            &mut last_message,
+        );
+        assert_eq!(scheduled, Duration::from_secs(300));
+        assert_eq!(last_message, None);
+    }
+
+    #[test]
+    fn same_on_all_hotplug_returns_retry_when_backend_is_unavailable() {
+        let error = anyhow::anyhow!(
+            "Active wallpaper query failed: status exit status: 3, stdout: Couldn't connect to /run/user/1000/hypr/instance/.hyprpaper.sock. (3)"
+        );
+
+        assert_eq!(
+            classify_backend_unavailable(&error),
+            Some(BackendUnavailableReason::HyprpaperUnavailable)
+        );
+    }
+
+    #[test]
+    fn pending_monitor_queue_retains_monitor_until_success() {
+        let known_monitors = HashSet::from(["DP-1".to_string()]);
+        let mut pending = HashSet::from(["DP-1".to_string()]);
+
+        pending.retain(|name| known_monitors.contains(name));
+        assert!(pending.contains("DP-1"));
+
+        pending.remove("DP-1");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn pending_monitor_queue_drops_removed_monitor() {
+        let known_monitors = HashSet::from(["eDP-1".to_string()]);
+        let mut pending = HashSet::from(["DP-1".to_string()]);
+
+        pending.retain(|name| known_monitors.contains(name));
+        assert!(pending.is_empty());
     }
 
     #[test]

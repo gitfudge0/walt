@@ -1739,9 +1739,9 @@ impl App {
         ])];
         lines.extend(
             controls
-            .chunks(midpoint)
-            .map(|row| help_line(row, theme))
-            .collect::<Vec<_>>(),
+                .chunks(midpoint)
+                .map(|row| help_line(row, theme))
+                .collect::<Vec<_>>(),
         );
 
         frame.render_widget(
