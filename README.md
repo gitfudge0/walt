@@ -64,10 +64,10 @@ Quick install:
 curl -fsSL https://raw.githubusercontent.com/gitfudge0/walt/main/install.sh | bash
 ```
 
-If you're on Arch:
+If you're on Arch, use your preferred AUR helper:
 
 ```sh
-yay walt-git
+yay -S walt-git
 ```
 
 This installs `walt` to `~/.local/bin/walt`.
