@@ -19,6 +19,8 @@ Install Walt quickly:
 curl -fsSL https://raw.githubusercontent.com/gitfudge0/walt/main/install.sh | bash
 ```
 
+> If you're on Arch Linux, you can refer to the [Install](#install) section and use the AUR package.
+
 Start using the app with:
 
 ```bash
@@ -60,6 +62,12 @@ Quick install:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gitfudge0/walt/main/install.sh | bash
+```
+
+If you're on Arch, use your preferred AUR helper:
+
+```sh
+yay -S walt-git
 ```
 
 This installs `walt` to `~/.local/bin/walt`.
