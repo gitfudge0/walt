@@ -85,6 +85,43 @@ cargo build --release
 install -Dm755 target/release/walt ~/.local/bin/
 ```
 
+If you're on Nix, you can use flake.nix:
+
+To run it:
+```bash
+nix run github:gitfudge0/walt
+```
+
+To install it to your profile:
+```bash
+nix profile add github:gitfudge0/walt
+```
+
+Or in order to install declaratively, add this to your flake.nix:
+
+```nix
+{
+    inputs = {
+        nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+        walt.url = "https://github.com/gitfudge0/walt";
+    };
+
+    outputs = {walt, nixpkgs, ...}:
+    {
+        nixosConfigurations."<your-hostname>" = nixpkgs.lib.nixosSystem {
+            system = "x86_64-linux"; # or "aarch64-linux"
+            modules = [
+                ({ pkgs, ... }: {
+                    environment.systemPackages = [
+                        walt.packages.${pkgs.system}.default
+                    ];
+                })
+            ];
+        };
+    }
+}
+```
+
 ### First run
 
 1. Launch `walt` for the terminal UI or `walt gui` for the desktop GUI.
