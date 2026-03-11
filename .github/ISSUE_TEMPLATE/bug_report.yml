@@ -1,0 +1,102 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+title: '[Bug]: '
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the details below.
+
+  - type: input
+    id: version
+    attributes:
+      label: Walt Version
+      description: Run `walt --version` to get this
+      placeholder: e.g., 0.8.0
+    validations:
+      required: true
+
+  - type: input
+    id: rust-version
+    attributes:
+      label: Rust Version
+      description: Run `rustc --version` to get this
+      placeholder: e.g., 1.75.0
+    validations:
+      required: true
+
+  - type: input
+    id: hyprland-version
+    attributes:
+      label: Hyprland Version
+      description: Run `hyprctl version` to get this
+      placeholder: e.g., 0.35.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: interface
+    attributes:
+      label: Interface
+      description: Which interface were you using?
+      options:
+        - TUI (Terminal)
+        - GUI (Desktop)
+        - CLI Commands
+        - Both
+    validations:
+      required: true
+
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal Emulator
+      description: If using TUI, which terminal?
+      placeholder: e.g., Ghostty, Kitty, WezTerm
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear description of the bug
+      placeholder: Describe what happened...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce the bug?
+      placeholder: |
+        1. Run 'walt'
+        2. Navigate to ...
+        3. Press ...
+        4. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+      placeholder: Describe what should have happened...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or Error Messages
+      description: Any relevant output or error messages
+      render: shell
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Checklist
+      options:
+        - label: I've searched existing issues and this hasn't been reported
+          required: true
