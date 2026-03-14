@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
@@ -13,21 +13,24 @@ use eframe::egui::{
 };
 
 use crate::{
+    backend::hyprpaper::get_active_wallpaper_assignments_if_supported,
     backend::{
         apply_random_plan, disable_rotation_service, enable_rotation_service,
-        format_rotation_service_status, get_active_wallpapers, get_monitors,
-        get_rotation_service_status, install_rotation_service, plan_random_assignments,
-        restart_rotation_service_if_active, rotation_service_badge, set_wallpaper,
-        set_wallpaper_for_monitor, uninstall_paths, uninstall_rotation_service, uninstall_walt,
-        RandomMode, RandomPlan, RotationServiceStatus,
+        format_rotation_service_status, get_monitors, get_rotation_service_status,
+        install_rotation_service, plan_random_assignments, restart_rotation_service_if_active,
+        rotation_service_badge, set_wallpaper, set_wallpaper_for_monitor, uninstall_paths,
+        uninstall_rotation_service, uninstall_walt, RandomMode, RandomPlan, RotationServiceStatus,
     },
     cache::{IndexedWallpaper, ThumbnailCache, ThumbnailProfile, WallpaperIndex},
     config::Config,
     shared::{
-        default_display_target_selection, display_targets_from_names, first_active_visible_index,
-        random_apply_action, random_menu_actions, selection_for_random_plan,
-        wallpaper_apply_action, DisplayTarget, RandomApplyAction, RandomMenuAction,
-        WallpaperApplyAction,
+        active_wallpaper_paths_from_assignments, default_display_target_selection,
+        display_targets_from_names, first_active_visible_index,
+        merge_active_wallpaper_assignments_from_random_plan, random_apply_action,
+        random_menu_actions, selection_for_random_plan, set_active_wallpaper_assignment,
+        set_active_wallpaper_assignments_for_all_monitors,
+        set_active_wallpaper_assignments_from_backend, wallpaper_apply_action, DisplayTarget,
+        RandomApplyAction, RandomMenuAction, WallpaperApplyAction,
     },
     theme::ThemeKind,
 };
@@ -102,7 +105,7 @@ struct IndexResponse {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BackendStateSnapshot {
-    active_wallpaper_paths: HashSet<PathBuf>,
+    active_wallpaper_assignments: HashMap<String, PathBuf>,
     rotation_service_state: Option<RotationServiceStatus>,
     rotation_status_text: String,
 }
@@ -128,6 +131,7 @@ pub struct GuiApp {
     selected_rotation: Option<usize>,
     all_filter: String,
     rotation_filter: String,
+    active_wallpaper_assignments: HashMap<String, PathBuf>,
     active_wallpaper_paths: HashSet<PathBuf>,
     rotation_paths: HashSet<PathBuf>,
     texture_cache: PreviewTextures,
@@ -198,6 +202,7 @@ impl GuiApp {
             selected_rotation: None,
             all_filter: String::new(),
             rotation_filter: String::new(),
+            active_wallpaper_assignments: HashMap::new(),
             active_wallpaper_paths: HashSet::new(),
             rotation_paths: HashSet::new(),
             texture_cache: PreviewTextures::new(),
@@ -344,14 +349,20 @@ impl GuiApp {
     }
 
     fn info(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        log::info!("gui info: {message}");
         self.push_toast(ToastKind::Info, message);
     }
 
     fn success(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        log::info!("gui success: {message}");
         self.push_toast(ToastKind::Success, message);
     }
 
     fn error(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        log::error!("gui error: {message}");
         self.push_toast(ToastKind::Error, message);
     }
 
@@ -512,9 +523,20 @@ impl GuiApp {
     }
 
     fn refresh_active_wallpapers(&mut self, quiet: bool) {
-        match get_active_wallpapers() {
-            Ok(paths) => {
-                self.active_wallpaper_paths = paths.into_iter().collect();
+        match get_active_wallpaper_assignments_if_supported() {
+            Ok(Some(assignments)) => {
+                log::debug!("gui active wallpaper refresh used backend state");
+                set_active_wallpaper_assignments_from_backend(
+                    &mut self.active_wallpaper_assignments,
+                    &assignments,
+                );
+                self.active_wallpaper_paths =
+                    active_wallpaper_paths_from_assignments(&self.active_wallpaper_assignments);
+            }
+            Ok(None) => {
+                log::debug!(
+                    "gui active wallpaper refresh kept local state because backend status query is unsupported"
+                );
             }
             Err(error) if !quiet => {
                 self.error(format!("Failed to refresh active wallpapers: {error}"))
@@ -539,19 +561,21 @@ impl GuiApp {
 
     fn current_backend_state_snapshot(&self) -> BackendStateSnapshot {
         BackendStateSnapshot {
-            active_wallpaper_paths: self.active_wallpaper_paths.clone(),
+            active_wallpaper_assignments: self.active_wallpaper_assignments.clone(),
             rotation_service_state: self.rotation_service_state.clone(),
             rotation_status_text: self.rotation_status_text.clone(),
         }
     }
 
     fn apply_backend_state_snapshot(&mut self, snapshot: BackendStateSnapshot) -> bool {
-        let changed = self.active_wallpaper_paths != snapshot.active_wallpaper_paths
+        let changed = self.active_wallpaper_assignments != snapshot.active_wallpaper_assignments
             || self.rotation_service_state != snapshot.rotation_service_state
             || self.rotation_status_text != snapshot.rotation_status_text;
 
         if changed {
-            self.active_wallpaper_paths = snapshot.active_wallpaper_paths;
+            self.active_wallpaper_assignments = snapshot.active_wallpaper_assignments;
+            self.active_wallpaper_paths =
+                active_wallpaper_paths_from_assignments(&self.active_wallpaper_assignments);
             self.rotation_service_state = snapshot.rotation_service_state;
             self.rotation_status_text = snapshot.rotation_status_text;
         }
@@ -773,9 +797,20 @@ impl GuiApp {
         mode: RandomMode,
         candidates: &[PathBuf],
     ) -> anyhow::Result<()> {
+        log::info!(
+            "gui applying random wallpaper mode={:?} candidates={}",
+            mode,
+            candidates.len()
+        );
         let monitors = get_monitors();
         let plan = plan_random_assignments(&monitors, candidates, mode)?;
         apply_random_plan(&plan)?;
+        merge_active_wallpaper_assignments_from_random_plan(
+            &mut self.active_wallpaper_assignments,
+            &plan,
+        );
+        self.active_wallpaper_paths =
+            active_wallpaper_paths_from_assignments(&self.active_wallpaper_assignments);
         self.refresh_active_wallpapers(false);
         self.sync_selection_with_random_plan(&plan);
 
@@ -837,7 +872,19 @@ impl GuiApp {
         wallpaper_path: &PathBuf,
     ) -> anyhow::Result<()> {
         let path_str = wallpaper_path.to_string_lossy().to_string();
+        log::info!(
+            "gui applying wallpaper to single display monitor={} path={}",
+            monitor_name,
+            path_str
+        );
         set_wallpaper_for_monitor(monitor_name, &path_str)?;
+        set_active_wallpaper_assignment(
+            &mut self.active_wallpaper_assignments,
+            monitor_name,
+            wallpaper_path,
+        );
+        self.active_wallpaper_paths =
+            active_wallpaper_paths_from_assignments(&self.active_wallpaper_assignments);
         self.refresh_active_wallpapers(false);
         self.success(format!("Wallpaper set on {monitor_name}: {path_str}"));
         Ok(())
@@ -845,7 +892,16 @@ impl GuiApp {
 
     fn apply_wallpaper_to_all_displays(&mut self, wallpaper_path: &PathBuf) -> anyhow::Result<()> {
         let path_str = wallpaper_path.to_string_lossy().to_string();
+        log::info!("gui applying wallpaper to all displays path={path_str}");
         set_wallpaper(&path_str)?;
+        let monitors = get_monitors();
+        set_active_wallpaper_assignments_for_all_monitors(
+            &mut self.active_wallpaper_assignments,
+            &monitors,
+            wallpaper_path,
+        );
+        self.active_wallpaper_paths =
+            active_wallpaper_paths_from_assignments(&self.active_wallpaper_assignments);
         self.refresh_active_wallpapers(false);
         self.success(format!("Wallpaper set on all displays: {path_str}"));
         Ok(())
@@ -2159,15 +2215,18 @@ fn spawn_backend_state_worker() -> (Sender<BackendStateRequest>, Receiver<Backen
                 request = next_request;
             }
 
-            let active_wallpapers =
-                get_active_wallpapers().map(|paths| paths.into_iter().collect::<HashSet<_>>());
+            let active_wallpaper_assignments = get_active_wallpaper_assignments_if_supported();
             let rotation_status = get_rotation_service_status();
 
             let mut snapshot = request.fallback;
             let mut has_success = false;
 
-            if let Ok(paths) = active_wallpapers {
-                snapshot.active_wallpaper_paths = paths;
+            if let Ok(Some(assignments)) = active_wallpaper_assignments {
+                log::debug!("gui backend state worker refreshed active wallpaper paths");
+                set_active_wallpaper_assignments_from_backend(
+                    &mut snapshot.active_wallpaper_assignments,
+                    &assignments,
+                );
                 has_success = true;
             }
 
@@ -2391,7 +2450,7 @@ mod tests {
     use super::{BackendStateSnapshot, GuiApp, RotationServiceStatus, SectionKind};
     use crate::{config::Config, theme::ThemeKind};
     use std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         path::PathBuf,
         sync::mpsc,
         time::{Duration, Instant},
@@ -2429,6 +2488,7 @@ mod tests {
             selected_rotation: Some(0),
             all_filter: String::new(),
             rotation_filter: String::new(),
+            active_wallpaper_assignments: HashMap::new(),
             active_wallpaper_paths: HashSet::new(),
             rotation_paths: HashSet::new(),
             texture_cache: super::PreviewTextures::new(),
@@ -2474,6 +2534,8 @@ mod tests {
     #[test]
     fn apply_backend_state_snapshot_reports_changes_without_changing_selection() {
         let mut app = test_app();
+        let active_assignments =
+            HashMap::from([("HDMI-A-1".to_string(), PathBuf::from("/tmp/active.png"))]);
         let mut active_paths = HashSet::new();
         active_paths.insert(PathBuf::from("/tmp/active.png"));
         let status = RotationServiceStatus {
@@ -2488,12 +2550,13 @@ mod tests {
         };
 
         let changed = app.apply_backend_state_snapshot(BackendStateSnapshot {
-            active_wallpaper_paths: active_paths.clone(),
+            active_wallpaper_assignments: active_assignments.clone(),
             rotation_service_state: Some(status.clone()),
             rotation_status_text: "running".to_string(),
         });
 
         assert!(changed);
+        assert_eq!(app.active_wallpaper_assignments, active_assignments);
         assert_eq!(app.active_wallpaper_paths, active_paths);
         assert_eq!(app.rotation_service_state, Some(status));
         assert_eq!(app.rotation_status_text, "running");
@@ -2505,12 +2568,31 @@ mod tests {
     fn apply_backend_state_snapshot_is_noop_for_identical_state() {
         let mut app = test_app();
         let snapshot = BackendStateSnapshot {
-            active_wallpaper_paths: HashSet::new(),
+            active_wallpaper_assignments: HashMap::new(),
             rotation_service_state: None,
             rotation_status_text: String::new(),
         };
 
         assert!(!app.apply_backend_state_snapshot(snapshot.clone()));
         assert!(!app.apply_backend_state_snapshot(snapshot));
+    }
+
+    #[test]
+    fn apply_backend_state_snapshot_derives_paths_from_assignments() {
+        let mut app = test_app();
+        let snapshot = BackendStateSnapshot {
+            active_wallpaper_assignments: HashMap::from([
+                ("HDMI-A-1".to_string(), PathBuf::from("/tmp/shared.png")),
+                ("DP-1".to_string(), PathBuf::from("/tmp/shared.png")),
+            ]),
+            rotation_service_state: None,
+            rotation_status_text: String::new(),
+        };
+
+        assert!(app.apply_backend_state_snapshot(snapshot));
+        assert_eq!(
+            app.active_wallpaper_paths,
+            HashSet::from([PathBuf::from("/tmp/shared.png")])
+        );
     }
 }
