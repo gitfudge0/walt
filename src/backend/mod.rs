@@ -4,6 +4,7 @@ pub mod rotation;
 pub mod scanner;
 pub mod uninstall;
 
+#[allow(unused_imports)]
 pub use hyprpaper::{
     get_active_wallpapers, get_monitors, set_wallpaper, set_wallpaper_for_monitor,
     set_wallpapers_for_monitors, Monitor,

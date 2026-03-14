@@ -2,9 +2,12 @@ use std::{
     collections::HashSet,
     path::PathBuf,
     process::{Command, Output},
+    sync::{Mutex, OnceLock},
     thread,
     time::Duration,
 };
+
+use log::{debug, error, info, warn};
 
 const HYPERPAPER_SERVICE: &str = "hyprpaper.service";
 const HYPERPAPER_PROCESS_NAME: &str = "hyprpaper";
@@ -29,6 +32,30 @@ pub enum BackendUnavailableReason {
     MonitorNotReady,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HyprpaperCommandFailure {
+    Transient(BackendUnavailableReason),
+    UnsupportedPreload,
+    UnsupportedActiveQuery,
+    HardFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreloadSupport {
+    Preloaded,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilitySupport {
+    Unknown,
+    Supported,
+    Unsupported,
+}
+
+static PRELOAD_SUPPORT_CACHE: OnceLock<Mutex<CapabilitySupport>> = OnceLock::new();
+static ACTIVE_QUERY_SUPPORT_CACHE: OnceLock<Mutex<CapabilitySupport>> = OnceLock::new();
+
 pub fn get_monitors() -> Vec<Monitor> {
     let output = match Command::new("hyprctl").args(["monitors", "-j"]).output() {
         Ok(output) => output,
@@ -40,7 +67,13 @@ pub fn get_monitors() -> Vec<Monitor> {
     }
 
     let json_str = String::from_utf8_lossy(&output.stdout);
-    parse_monitors(&json_str)
+    let monitors = parse_monitors(&json_str);
+    debug!(
+        "parsed monitors count={} monitors={:?}",
+        monitors.len(),
+        monitors
+    );
+    monitors
 }
 
 pub fn classify_backend_unavailable(error: &anyhow::Error) -> Option<BackendUnavailableReason> {
@@ -68,33 +101,34 @@ fn parse_monitors(json_str: &str) -> Vec<Monitor> {
 }
 
 pub fn set_wallpaper(wallpaper_path: &str) -> anyhow::Result<()> {
-    preload_wallpaper(wallpaper_path)?;
+    info!("applying wallpaper to all monitors path={wallpaper_path}");
+    preload_wallpaper_if_supported(wallpaper_path)?;
     let monitors = get_monitors();
     if monitors.is_empty() {
         return Err(anyhow::anyhow!("No monitors found"));
     }
 
+    let mut failures = Vec::new();
     for monitor in monitors {
         if let Err(error) = apply_wallpaper_to_monitor(&monitor.name, wallpaper_path) {
-            eprintln!(
-                "Warning: Failed to set wallpaper for {}: {}",
-                monitor.name, error
-            );
+            failures.push((monitor.name, error.to_string()));
         }
     }
 
-    Ok(())
+    summarize_multi_monitor_apply_failures(&failures)
 }
 
 pub fn set_wallpaper_for_monitor(monitor_name: &str, wallpaper_path: &str) -> anyhow::Result<()> {
-    preload_wallpaper(wallpaper_path)?;
+    info!("applying wallpaper to single monitor monitor={monitor_name} path={wallpaper_path}");
+    preload_wallpaper_if_supported(wallpaper_path)?;
     apply_wallpaper_to_monitor(monitor_name, wallpaper_path)
 }
 
 pub fn set_wallpapers_for_monitors(assignments: &[(String, PathBuf)]) -> anyhow::Result<()> {
-    for wallpaper_path in unique_wallpaper_paths(assignments) {
-        preload_wallpaper(&wallpaper_path.to_string_lossy())?;
-    }
+    info!("applying wallpaper batch assignments={}", assignments.len());
+    preload_unique_wallpapers(assignments, |wallpaper_path| {
+        preload_wallpaper_if_supported(&wallpaper_path.to_string_lossy())
+    })?;
 
     for (monitor_name, wallpaper_path) in assignments {
         apply_wallpaper_to_monitor(monitor_name, &wallpaper_path.to_string_lossy())?;
@@ -103,18 +137,38 @@ pub fn set_wallpapers_for_monitors(assignments: &[(String, PathBuf)]) -> anyhow:
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn get_active_wallpaper_assignments() -> anyhow::Result<Vec<ActiveWallpaperAssignment>> {
-    let output = run_hyprpaper_query_with_retry(&["listactive"], "Active wallpaper query failed")?;
-
-    Ok(parse_active_wallpaper_assignments(
-        &String::from_utf8_lossy(&output.stdout),
+    Ok(active_wallpaper_assignments_or_empty(
+        get_active_wallpaper_assignments_if_supported()?,
     ))
 }
 
+#[allow(dead_code)]
 pub fn get_active_wallpapers() -> anyhow::Result<Vec<PathBuf>> {
-    Ok(deduplicate_active_wallpapers(
-        &get_active_wallpaper_assignments()?,
+    Ok(active_wallpapers_from_assignments(
+        get_active_wallpaper_assignments_if_supported()?,
     ))
+}
+
+pub(crate) fn get_active_wallpapers_if_supported() -> anyhow::Result<Option<Vec<PathBuf>>> {
+    Ok(get_active_wallpaper_assignments_if_supported()?
+        .map(|assignments| active_wallpapers_from_assignments(Some(assignments))))
+}
+
+pub(crate) fn get_active_wallpaper_assignments_if_supported(
+) -> anyhow::Result<Option<Vec<ActiveWallpaperAssignment>>> {
+    info!("querying active wallpapers");
+    if cached_capability_support(&ACTIVE_QUERY_SUPPORT_CACHE) == CapabilitySupport::Unsupported {
+        debug!("skipping active wallpaper query because capability cache is unsupported");
+        return Ok(None);
+    }
+
+    compatibility_wrap_active_wallpaper_assignments(
+        run_hyprpaper_query_with_retry(&["listactive"], "Active wallpaper query failed").map(
+            |output| parse_active_wallpaper_assignments(&String::from_utf8_lossy(&output.stdout)),
+        ),
+    )
 }
 
 fn parse_active_wallpaper_assignments(output: &str) -> Vec<ActiveWallpaperAssignment> {
@@ -163,7 +217,70 @@ fn deduplicate_active_wallpapers(assignments: &[ActiveWallpaperAssignment]) -> V
     wallpapers
 }
 
+fn active_wallpaper_assignments_or_empty(
+    assignments: Option<Vec<ActiveWallpaperAssignment>>,
+) -> Vec<ActiveWallpaperAssignment> {
+    assignments.unwrap_or_default()
+}
+
+fn active_wallpapers_from_assignments(
+    assignments: Option<Vec<ActiveWallpaperAssignment>>,
+) -> Vec<PathBuf> {
+    deduplicate_active_wallpapers(&active_wallpaper_assignments_or_empty(assignments))
+}
+
+fn compatibility_wrap_active_wallpaper_assignments(
+    assignments: anyhow::Result<Vec<ActiveWallpaperAssignment>>,
+) -> anyhow::Result<Option<Vec<ActiveWallpaperAssignment>>> {
+    match assignments {
+        Ok(assignments) => {
+            debug!(
+                "parsed active wallpaper assignments count={}",
+                assignments.len()
+            );
+            update_cached_capability_support(&ACTIVE_QUERY_SUPPORT_CACHE, "active-query", Ok(()));
+            Ok(Some(assignments))
+        }
+        Err(error) => {
+            let failure = classify_hyprpaper_command_failure_message(&error.to_string());
+            log_hyprpaper_failure("active wallpaper query", failure, &error.to_string());
+            update_cached_capability_support(
+                &ACTIVE_QUERY_SUPPORT_CACHE,
+                "active-query",
+                Err(failure),
+            );
+            match failure {
+                HyprpaperCommandFailure::UnsupportedActiveQuery => {
+                    info!("active wallpaper query unsupported; using best-effort local state");
+                    Ok(None)
+                }
+                _ => Err(error),
+            }
+        }
+    }
+}
+
+fn summarize_multi_monitor_apply_failures(failures: &[(String, String)]) -> anyhow::Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    let details = failures
+        .iter()
+        .map(|(monitor, error)| format!("{monitor}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    let message = format!("Failed to set wallpaper on one or more monitors: {details}");
+    error!("{message}");
+    Err(anyhow::anyhow!("{message}"))
+}
+
 fn command_failure(context: &str, output: &std::process::Output) -> anyhow::Error {
+    anyhow::anyhow!("{context}: {}", command_output_details(output))
+}
+
+fn command_output_details(output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let mut details = format!("status {}", output.status);
@@ -176,7 +293,7 @@ fn command_failure(context: &str, output: &std::process::Output) -> anyhow::Erro
         details.push_str(&format!(", stdout: {stdout}"));
     }
 
-    anyhow::anyhow!("{context}: {details}")
+    details
 }
 
 fn classify_backend_unavailable_message(message: &str) -> Option<BackendUnavailableReason> {
@@ -204,8 +321,130 @@ fn classify_backend_unavailable_message(message: &str) -> Option<BackendUnavaila
     None
 }
 
-fn preload_wallpaper(wallpaper_path: &str) -> anyhow::Result<()> {
-    run_hyprpaper_command_with_retry(&["preload", wallpaper_path], "Preload failed")
+fn classify_hyprpaper_command_failure_message(message: &str) -> HyprpaperCommandFailure {
+    let normalized = message.to_lowercase();
+
+    if normalized.contains("preload failed") && normalized.contains("invalid hyprpaper request") {
+        return HyprpaperCommandFailure::UnsupportedPreload;
+    }
+
+    if normalized.contains("preload failed")
+        && (normalized.contains("unknown hyprpaper request")
+            || normalized.contains("unkonwn hyprpaper request")
+            || normalized.contains("invalid request"))
+    {
+        return HyprpaperCommandFailure::UnsupportedPreload;
+    }
+
+    if normalized.contains("active wallpaper query failed")
+        && (normalized.contains("protocol version too low")
+            || normalized.contains("hyprpaper too old"))
+    {
+        return HyprpaperCommandFailure::UnsupportedActiveQuery;
+    }
+
+    if normalized.contains("active wallpaper query failed")
+        && (normalized.contains("unknown hyprpaper request")
+            || normalized.contains("invalid request"))
+    {
+        return HyprpaperCommandFailure::UnsupportedActiveQuery;
+    }
+
+    if let Some(reason) = classify_backend_unavailable_message(message) {
+        return HyprpaperCommandFailure::Transient(reason);
+    }
+
+    HyprpaperCommandFailure::HardFailure
+}
+
+fn capability_cache_state_after_result(
+    current: CapabilitySupport,
+    result: Result<(), HyprpaperCommandFailure>,
+) -> CapabilitySupport {
+    match result {
+        Ok(()) => CapabilitySupport::Supported,
+        Err(HyprpaperCommandFailure::UnsupportedPreload)
+        | Err(HyprpaperCommandFailure::UnsupportedActiveQuery) => CapabilitySupport::Unsupported,
+        Err(HyprpaperCommandFailure::Transient(_)) | Err(HyprpaperCommandFailure::HardFailure) => {
+            current
+        }
+    }
+}
+
+fn cached_capability_support(
+    cache: &'static OnceLock<Mutex<CapabilitySupport>>,
+) -> CapabilitySupport {
+    *cache
+        .get_or_init(|| Mutex::new(CapabilitySupport::Unknown))
+        .lock()
+        .expect("capability cache lock poisoned")
+}
+
+fn update_cached_capability_support(
+    cache: &'static OnceLock<Mutex<CapabilitySupport>>,
+    capability_name: &str,
+    result: Result<(), HyprpaperCommandFailure>,
+) {
+    let mut guard = cache
+        .get_or_init(|| Mutex::new(CapabilitySupport::Unknown))
+        .lock()
+        .expect("capability cache lock poisoned");
+    let previous = *guard;
+    *guard = capability_cache_state_after_result(*guard, result);
+    if previous != *guard {
+        debug!(
+            "{} capability cache transitioned from {:?} to {:?}",
+            capability_name, previous, *guard
+        );
+    }
+}
+
+fn should_retry_hyprpaper_command_failure(failure: HyprpaperCommandFailure) -> bool {
+    matches!(failure, HyprpaperCommandFailure::Transient(_))
+}
+
+fn preload_wallpaper_if_supported(wallpaper_path: &str) -> anyhow::Result<PreloadSupport> {
+    if cached_capability_support(&PRELOAD_SUPPORT_CACHE) == CapabilitySupport::Unsupported {
+        debug!("skipping preload because capability cache is unsupported");
+        return Ok(PreloadSupport::Unsupported);
+    }
+
+    match run_hyprpaper_command_with_retry(&["preload", wallpaper_path], "Preload failed") {
+        Ok(()) => {
+            update_cached_capability_support(&PRELOAD_SUPPORT_CACHE, "preload", Ok(()));
+            Ok(PreloadSupport::Preloaded)
+        }
+        Err(error) => {
+            let failure = classify_hyprpaper_command_failure_message(&error.to_string());
+            update_cached_capability_support(&PRELOAD_SUPPORT_CACHE, "preload", Err(failure));
+            match failure {
+                HyprpaperCommandFailure::UnsupportedPreload => {
+                    info!(
+                        "hyprpaper preload unsupported for path={wallpaper_path}; applying wallpaper without preload"
+                    );
+                    Ok(PreloadSupport::Unsupported)
+                }
+                _ => Err(error),
+            }
+        }
+    }
+}
+
+fn preload_unique_wallpapers<F>(
+    assignments: &[(String, PathBuf)],
+    mut preload: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&PathBuf) -> anyhow::Result<PreloadSupport>,
+{
+    for wallpaper_path in unique_wallpaper_paths(assignments) {
+        match preload(&wallpaper_path)? {
+            PreloadSupport::Preloaded => {}
+            PreloadSupport::Unsupported => break,
+        }
+    }
+
+    Ok(())
 }
 
 fn unique_wallpaper_paths(assignments: &[(String, PathBuf)]) -> Vec<PathBuf> {
@@ -221,9 +460,24 @@ fn unique_wallpaper_paths(assignments: &[(String, PathBuf)]) -> Vec<PathBuf> {
     unique_paths
 }
 
+fn unsupported_active_query_verification_message(
+    active_query_support: CapabilitySupport,
+) -> Option<&'static str> {
+    (active_query_support == CapabilitySupport::Unsupported).then_some(
+        "wallpaper IPC accepted by hyprctl, but Walt cannot verify the visual result because active status query is unsupported",
+    )
+}
+
 fn apply_wallpaper_to_monitor(monitor_name: &str, wallpaper_path: &str) -> anyhow::Result<()> {
     let arg = format!("{monitor_name},{wallpaper_path}");
-    run_hyprpaper_command_with_retry(&["wallpaper", &arg], "wallpaper command failed")
+    debug!("applying hyprpaper wallpaper arg={arg}");
+    run_hyprpaper_command_with_retry(&["wallpaper", &arg], "wallpaper command failed")?;
+    if let Some(message) = unsupported_active_query_verification_message(cached_capability_support(
+        &ACTIVE_QUERY_SUPPORT_CACHE,
+    )) {
+        debug!("{message}");
+    }
+    Ok(())
 }
 
 fn ensure_hyprpaper_ready() -> anyhow::Result<()> {
@@ -233,6 +487,7 @@ fn ensure_hyprpaper_ready() -> anyhow::Result<()> {
 }
 
 fn start_hyprpaper_service_if_possible() {
+    debug!("attempting to start hyprpaper service via systemd user unit");
     let _ = Command::new("systemctl")
         .arg("--user")
         .args(["start", "--no-block", HYPERPAPER_SERVICE])
@@ -261,6 +516,11 @@ fn hyprpaper_process_running() -> bool {
 fn run_hyprpaper_command_with_retry(args: &[&str], context: &str) -> anyhow::Result<()> {
     let output = run_hyprpaper_query_with_retry(args, context)?;
     if output.status.success() {
+        debug!(
+            "hyprpaper command success payload args={:?} {}",
+            args,
+            command_output_details(&output)
+        );
         Ok(())
     } else {
         Err(with_hyprpaper_hint(command_failure(context, &output)))
@@ -272,14 +532,41 @@ fn run_hyprpaper_query_with_retry(args: &[&str], context: &str) -> anyhow::Resul
 
     let mut last_error = None;
     for attempt in 0..HYPERPAPER_WAIT_ATTEMPTS {
+        debug!(
+            "running hyprpaper command attempt={}/{} args={:?} context={}",
+            attempt + 1,
+            HYPERPAPER_WAIT_ATTEMPTS,
+            args,
+            context
+        );
         let output = run_hyprpaper_query(args)
             .map_err(|error| anyhow::anyhow!("Failed to run hyprpaper command: {error}"))?;
 
         if output.status.success() {
+            debug!(
+                "hyprpaper command succeeded attempt={}/{} args={:?}",
+                attempt + 1,
+                HYPERPAPER_WAIT_ATTEMPTS,
+                args
+            );
             return Ok(output);
         }
 
         let error = command_failure(context, &output);
+        let failure = classify_hyprpaper_command_failure_message(&error.to_string());
+        debug!(
+            "hyprpaper command failed attempt={}/{} args={:?} failure={:?} error={}",
+            attempt + 1,
+            HYPERPAPER_WAIT_ATTEMPTS,
+            args,
+            failure,
+            error
+        );
+        if !should_retry_hyprpaper_command_failure(failure) {
+            log_hyprpaper_failure(context, failure, &error.to_string());
+            return Err(with_hyprpaper_hint(error));
+        }
+
         last_error = Some(error);
 
         if should_wait_for_another_hyprpaper_attempt(attempt, HYPERPAPER_WAIT_ATTEMPTS) {
@@ -293,7 +580,30 @@ fn run_hyprpaper_query_with_retry(args: &[&str], context: &str) -> anyhow::Resul
 }
 
 fn run_hyprpaper_query(args: &[&str]) -> std::io::Result<Output> {
+    debug!("executing hyprctl hyprpaper args={:?}", args);
     Command::new("hyprctl").arg("hyprpaper").args(args).output()
+}
+
+fn log_hyprpaper_failure(context: &str, failure: HyprpaperCommandFailure, details: &str) {
+    match failure {
+        HyprpaperCommandFailure::Transient(reason) => warn!(
+            "hyprpaper {} transient failure reason={:?} details={}",
+            context, reason, details
+        ),
+        HyprpaperCommandFailure::UnsupportedPreload => {
+            warn!(
+                "hyprpaper {} unsupported-preload details={}",
+                context, details
+            )
+        }
+        HyprpaperCommandFailure::UnsupportedActiveQuery => warn!(
+            "hyprpaper {} unsupported-active-query details={}",
+            context, details
+        ),
+        HyprpaperCommandFailure::HardFailure => {
+            error!("hyprpaper {} hard failure details={}", context, details)
+        }
+    }
 }
 
 fn with_hyprpaper_hint(error: anyhow::Error) -> anyhow::Error {
@@ -315,12 +625,18 @@ fn should_wait_for_another_hyprpaper_attempt(attempt: usize, max_attempts: usize
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_backend_unavailable_message, deduplicate_active_wallpapers,
-        parse_active_wallpaper_assignments, parse_monitors,
-        should_wait_for_another_hyprpaper_attempt, unique_wallpaper_paths, with_hyprpaper_hint,
-        ActiveWallpaperAssignment, BackendUnavailableReason, Monitor,
+        active_wallpaper_assignments_or_empty, active_wallpapers_from_assignments,
+        capability_cache_state_after_result, classify_backend_unavailable_message,
+        classify_hyprpaper_command_failure_message, command_output_details,
+        compatibility_wrap_active_wallpaper_assignments, deduplicate_active_wallpapers,
+        parse_active_wallpaper_assignments, parse_monitors, preload_unique_wallpapers,
+        should_retry_hyprpaper_command_failure, should_wait_for_another_hyprpaper_attempt,
+        summarize_multi_monitor_apply_failures, unique_wallpaper_paths,
+        unsupported_active_query_verification_message, with_hyprpaper_hint,
+        ActiveWallpaperAssignment, BackendUnavailableReason, CapabilitySupport,
+        HyprpaperCommandFailure, Monitor, PreloadSupport,
     };
-    use std::path::PathBuf;
+    use std::{os::unix::process::ExitStatusExt, path::PathBuf, process::Output};
 
     #[test]
     fn parses_one_monitor() {
@@ -475,6 +791,66 @@ mod tests {
     }
 
     #[test]
+    fn classifies_invalid_hyprpaper_request_as_unsupported_preload() {
+        assert_eq!(
+            classify_hyprpaper_command_failure_message(
+                "Preload failed: status exit status: 1, stdout: error: invalid hyprpaper request"
+            ),
+            HyprpaperCommandFailure::UnsupportedPreload
+        );
+    }
+
+    #[test]
+    fn classifies_unknown_hyprpaper_request_as_unsupported_preload() {
+        assert_eq!(
+            classify_hyprpaper_command_failure_message(
+                "Preload failed: status exit status: 1, stdout: error: Unknown hyprpaper request"
+            ),
+            HyprpaperCommandFailure::UnsupportedPreload
+        );
+    }
+
+    #[test]
+    fn classifies_invalid_request_as_unsupported_preload() {
+        assert_eq!(
+            classify_hyprpaper_command_failure_message(
+                "Preload failed: status exit status: 1, stdout: error: Invalid request"
+            ),
+            HyprpaperCommandFailure::UnsupportedPreload
+        );
+    }
+
+    #[test]
+    fn classifies_old_hyprpaper_protocol_mismatch_as_unsupported_active_query() {
+        assert_eq!(
+            classify_hyprpaper_command_failure_message(
+                "Active wallpaper query failed: status exit status: 1, stdout: error: can't send: hyprpaper protocol version too low (hyprpaper too old)"
+            ),
+            HyprpaperCommandFailure::UnsupportedActiveQuery
+        );
+    }
+
+    #[test]
+    fn classifies_unknown_hyprpaper_request_as_unsupported_active_query() {
+        assert_eq!(
+            classify_hyprpaper_command_failure_message(
+                "Active wallpaper query failed: status exit status: 1, stderr: error: Unknown hyprpaper request"
+            ),
+            HyprpaperCommandFailure::UnsupportedActiveQuery
+        );
+    }
+
+    #[test]
+    fn classifies_invalid_request_as_unsupported_active_query() {
+        assert_eq!(
+            classify_hyprpaper_command_failure_message(
+                "Active wallpaper query failed: status exit status: 1, stderr: error: Invalid request"
+            ),
+            HyprpaperCommandFailure::UnsupportedActiveQuery
+        );
+    }
+
+    #[test]
     fn classifies_no_monitors_as_transient() {
         assert_eq!(
             classify_backend_unavailable_message("No monitors found"),
@@ -488,6 +864,192 @@ mod tests {
             classify_backend_unavailable_message("Preload failed: permission denied"),
             None
         );
+    }
+
+    #[test]
+    fn classifies_permission_denied_as_hard_failure() {
+        assert_eq!(
+            classify_hyprpaper_command_failure_message("Preload failed: permission denied"),
+            HyprpaperCommandFailure::HardFailure
+        );
+    }
+
+    #[test]
+    fn retries_transient_failures() {
+        assert!(should_retry_hyprpaper_command_failure(
+            HyprpaperCommandFailure::Transient(BackendUnavailableReason::HyprpaperUnavailable)
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_unsupported_preload() {
+        assert!(!should_retry_hyprpaper_command_failure(
+            HyprpaperCommandFailure::UnsupportedPreload
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_unsupported_active_query() {
+        assert!(!should_retry_hyprpaper_command_failure(
+            HyprpaperCommandFailure::UnsupportedActiveQuery
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_hard_failures() {
+        assert!(!should_retry_hyprpaper_command_failure(
+            HyprpaperCommandFailure::HardFailure
+        ));
+    }
+
+    #[test]
+    fn stops_batch_preloading_after_first_unsupported_result() {
+        let assignments = vec![
+            (
+                "HDMI-A-1".to_string(),
+                PathBuf::from("/wallpapers/alpha.jpg"),
+            ),
+            ("DP-1".to_string(), PathBuf::from("/wallpapers/beta.jpg")),
+        ];
+        let mut attempts = Vec::new();
+
+        preload_unique_wallpapers(&assignments, |wallpaper_path| {
+            attempts.push(wallpaper_path.clone());
+            if attempts.len() == 1 {
+                Ok(PreloadSupport::Unsupported)
+            } else {
+                Ok(PreloadSupport::Preloaded)
+            }
+        })
+        .expect("preload compatibility flow should succeed");
+
+        assert_eq!(attempts, vec![PathBuf::from("/wallpapers/alpha.jpg")]);
+    }
+
+    #[test]
+    fn unsupported_active_query_becomes_no_assignments() {
+        let assignments = compatibility_wrap_active_wallpaper_assignments(Err(anyhow::anyhow!(
+            "Active wallpaper query failed: status exit status: 1, stdout: error: can't send: hyprpaper protocol version too low (hyprpaper too old)"
+        )))
+        .expect("old hyprpaper active query should degrade");
+
+        assert_eq!(
+            active_wallpaper_assignments_or_empty(assignments),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn unsupported_active_query_becomes_no_active_wallpapers() {
+        let wallpapers = active_wallpapers_from_assignments(None);
+        assert!(wallpapers.is_empty());
+    }
+
+    #[test]
+    fn formats_successful_command_output_details_with_payloads() {
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"ok".to_vec(),
+            stderr: b"warning".to_vec(),
+        };
+
+        assert_eq!(
+            command_output_details(&output),
+            "status exit status: 0, stderr: warning, stdout: ok"
+        );
+    }
+
+    #[test]
+    fn reports_unverified_wallpaper_success_when_active_query_is_unsupported() {
+        assert_eq!(
+            unsupported_active_query_verification_message(CapabilitySupport::Unsupported),
+            Some(
+                "wallpaper IPC accepted by hyprctl, but Walt cannot verify the visual result because active status query is unsupported"
+            )
+        );
+        assert_eq!(
+            unsupported_active_query_verification_message(CapabilitySupport::Supported),
+            None
+        );
+    }
+
+    #[test]
+    fn capability_cache_marks_success_as_supported() {
+        assert_eq!(
+            capability_cache_state_after_result(CapabilitySupport::Unknown, Ok(())),
+            CapabilitySupport::Supported
+        );
+    }
+
+    #[test]
+    fn capability_cache_marks_unsupported_results_as_unsupported() {
+        assert_eq!(
+            capability_cache_state_after_result(
+                CapabilitySupport::Unknown,
+                Err(HyprpaperCommandFailure::UnsupportedPreload)
+            ),
+            CapabilitySupport::Unsupported
+        );
+        assert_eq!(
+            capability_cache_state_after_result(
+                CapabilitySupport::Unknown,
+                Err(HyprpaperCommandFailure::UnsupportedActiveQuery)
+            ),
+            CapabilitySupport::Unsupported
+        );
+    }
+
+    #[test]
+    fn capability_cache_keeps_current_state_for_transient_failures() {
+        assert_eq!(
+            capability_cache_state_after_result(
+                CapabilitySupport::Unknown,
+                Err(HyprpaperCommandFailure::Transient(
+                    BackendUnavailableReason::HyprpaperUnavailable
+                ))
+            ),
+            CapabilitySupport::Unknown
+        );
+        assert_eq!(
+            capability_cache_state_after_result(
+                CapabilitySupport::Supported,
+                Err(HyprpaperCommandFailure::HardFailure)
+            ),
+            CapabilitySupport::Supported
+        );
+    }
+
+    #[test]
+    fn unrelated_active_query_failures_remain_errors() {
+        let error = compatibility_wrap_active_wallpaper_assignments(Err(anyhow::anyhow!(
+            "Active wallpaper query failed: permission denied"
+        )))
+        .expect_err("unexpected active query failures should remain hard errors");
+
+        assert_eq!(
+            error.to_string(),
+            "Active wallpaper query failed: permission denied"
+        );
+    }
+
+    #[test]
+    fn multi_monitor_apply_returns_error_when_any_monitor_fails() {
+        let error = summarize_multi_monitor_apply_failures(&[
+            (
+                "HDMI-A-1".to_string(),
+                "wallpaper command failed: invalid format".to_string(),
+            ),
+            (
+                "DP-1".to_string(),
+                "wallpaper command failed: unknown output".to_string(),
+            ),
+        ])
+        .expect_err("monitor failures should not be reported as success");
+
+        let text = error.to_string();
+        assert!(text.contains("Failed to set wallpaper on one or more monitors"));
+        assert!(text.contains("HDMI-A-1"));
+        assert!(text.contains("DP-1"));
     }
 
     #[test]

@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use log::{debug, error, info, warn};
 use rand::{seq::SliceRandom, Rng};
 use serde::{Deserialize, Serialize};
 
@@ -22,8 +23,8 @@ use crate::{
 use super::{
     get_monitors,
     hyprpaper::{
-        classify_backend_unavailable, get_active_wallpaper_assignments, ActiveWallpaperAssignment,
-        BackendUnavailableReason,
+        classify_backend_unavailable, get_active_wallpaper_assignments_if_supported,
+        ActiveWallpaperAssignment, BackendUnavailableReason,
     },
     set_wallpaper, set_wallpaper_for_monitor, set_wallpapers_for_monitors, Monitor,
 };
@@ -80,6 +81,12 @@ enum HotplugApplyOutcome {
     RetrySoon(BackendUnavailableReason),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MonitorAddedPlan {
+    Apply(MonitorHotplugAction),
+    RetrySoon(BackendUnavailableReason),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RotationServiceStatus {
     pub installed: bool,
@@ -93,6 +100,7 @@ pub struct RotationServiceStatus {
 }
 
 pub fn install_rotation_service() -> Result<()> {
+    info!("installing Walt rotation service");
     let service_dir = service_dir()?;
     fs::create_dir_all(&service_dir)?;
     fs::write(service_file_path()?, service_file_contents()?)?;
@@ -100,6 +108,7 @@ pub fn install_rotation_service() -> Result<()> {
 }
 
 pub fn enable_rotation_service() -> Result<()> {
+    info!("enabling Walt rotation service");
     if !service_file_path()?.exists() {
         bail!("Rotation service is not installed. Run 'walt rotation install' first.");
     }
@@ -109,10 +118,12 @@ pub fn enable_rotation_service() -> Result<()> {
 }
 
 pub fn disable_rotation_service() -> Result<()> {
+    info!("disabling Walt rotation service");
     run_systemctl_checked(&["disable", "--now", SERVICE_FILE], BENIGN_DISABLE_ERRORS)
 }
 
 pub fn restart_rotation_service_if_active() -> Result<()> {
+    debug!("restarting Walt rotation service if active");
     let service_path = service_file_path()?;
     if !service_path.exists() {
         return Ok(());
@@ -127,6 +138,7 @@ pub fn restart_rotation_service_if_active() -> Result<()> {
 }
 
 pub fn uninstall_rotation_service() -> Result<()> {
+    info!("uninstalling Walt rotation service");
     let service_path = service_file_path()?;
     disable_rotation_service()?;
     if service_path.exists() {
@@ -174,6 +186,7 @@ pub fn rotation_service_status() -> Result<String> {
 }
 
 pub fn run_rotation_daemon() -> Result<()> {
+    info!("starting Walt rotation daemon");
     let index = WallpaperIndex::new()?;
     let mut known_monitors = current_monitor_names();
     let mut pending_monitor_additions = HashSet::new();
@@ -356,7 +369,7 @@ fn log_transient_backend_state(
 ) {
     let message = transient_backend_message(reason);
     if last_transient_backend_message.as_deref() != Some(message) {
-        eprintln!("{message}");
+        warn!("{message}");
         *last_transient_backend_message = Some(message.to_string());
     }
 }
@@ -376,57 +389,109 @@ fn transient_backend_message(reason: BackendUnavailableReason) -> &'static str {
 }
 
 fn handle_monitor_added(index: &WallpaperIndex, monitor_name: &str) -> Result<HotplugApplyOutcome> {
+    info!("handling monitor-added event monitor={monitor_name}");
     let config = Config::new();
     let candidates = rotation_candidates(index, &config);
     if candidates.is_empty() {
+        debug!("no rotation candidates available for monitor-added handling");
         return Ok(HotplugApplyOutcome::Applied);
     }
 
-    let active_assignments = match get_active_wallpaper_assignments() {
-        Ok(assignments) => assignments,
-        Err(error) => {
-            if let Some(reason) = classify_backend_unavailable(&error) {
-                return Ok(HotplugApplyOutcome::RetrySoon(reason));
-            }
-            return Err(error);
-        }
-    };
     let mut rng = rand::thread_rng();
-    let action = plan_monitor_added_action(
+    let plan = plan_monitor_added_from_query_result(
         monitor_name,
         &config,
         &candidates,
-        &active_assignments,
+        get_active_wallpaper_assignments_if_supported(),
         load_rotation_state()?.last_wallpaper.as_ref(),
         &mut rng,
     )?;
+    let action = match plan {
+        MonitorAddedPlan::Apply(action) => action,
+        MonitorAddedPlan::RetrySoon(reason) => {
+            warn!("monitor-added planning requested retry reason={:?}", reason);
+            return Ok(HotplugApplyOutcome::RetrySoon(reason));
+        }
+    };
 
     match action {
         MonitorHotplugAction::SetOnMonitor {
             monitor_name,
             wallpaper_path,
         } => match set_wallpaper_for_monitor(&monitor_name, &wallpaper_path.to_string_lossy()) {
-            Ok(()) => Ok(HotplugApplyOutcome::Applied),
+            Ok(()) => {
+                info!(
+                    "applied hotplug wallpaper to monitor={} path={}",
+                    monitor_name,
+                    wallpaper_path.display()
+                );
+                Ok(HotplugApplyOutcome::Applied)
+            }
             Err(error) => {
                 if let Some(reason) = classify_backend_unavailable(&error) {
+                    warn!(
+                        "hotplug single-monitor apply transient failure monitor={} reason={:?}",
+                        monitor_name, reason
+                    );
                     return Ok(HotplugApplyOutcome::RetrySoon(reason));
                 }
+                error!("hotplug single-monitor apply failed: {error}");
                 Err(error)
             }
         },
         MonitorHotplugAction::SetOnAllDisplays { wallpaper_path } => {
             if let Err(error) = set_wallpaper(&wallpaper_path.to_string_lossy()) {
                 if let Some(reason) = classify_backend_unavailable(&error) {
+                    warn!(
+                        "hotplug all-displays apply transient failure path={} reason={:?}",
+                        wallpaper_path.display(),
+                        reason
+                    );
                     return Ok(HotplugApplyOutcome::RetrySoon(reason));
                 }
+                error!("hotplug all-displays apply failed: {error}");
                 return Err(error);
             }
             let mut state = load_rotation_state()?;
             state.last_wallpaper = Some(wallpaper_path);
             save_rotation_state(&state)?;
+            info!("applied hotplug wallpaper to all displays");
             Ok(HotplugApplyOutcome::Applied)
         }
     }
+}
+
+fn plan_monitor_added_from_query_result<R: Rng + ?Sized>(
+    new_monitor_name: &str,
+    config: &Config,
+    candidates: &[IndexedWallpaper],
+    active_assignments_result: Result<Option<Vec<ActiveWallpaperAssignment>>>,
+    last_wallpaper: Option<&PathBuf>,
+    rng: &mut R,
+) -> Result<MonitorAddedPlan> {
+    let active_assignments = match active_assignments_result {
+        Ok(Some(assignments)) => assignments,
+        Ok(None) => {
+            debug!("monitor-added planning is using fallback because active-query support is unavailable");
+            Vec::new()
+        }
+        Err(error) => {
+            if let Some(reason) = classify_backend_unavailable(&error) {
+                return Ok(MonitorAddedPlan::RetrySoon(reason));
+            }
+            error!("monitor-added planning failed to query active assignments: {error}");
+            return Err(error);
+        }
+    };
+
+    Ok(MonitorAddedPlan::Apply(plan_monitor_added_action(
+        new_monitor_name,
+        config,
+        candidates,
+        &active_assignments,
+        last_wallpaper,
+        rng,
+    )?))
 }
 
 fn plan_monitor_added_action<R: Rng + ?Sized>(
@@ -542,7 +607,7 @@ fn spawn_hyprland_event_listener(tx: Sender<HyprlandEvent>) {
         let socket_path = match socket2_path() {
             Ok(path) => path,
             Err(error) => {
-                eprintln!("Failed to resolve Hyprland event socket path: {error}");
+                error!("failed to resolve Hyprland event socket path: {error}");
                 thread::sleep(Duration::from_secs(5));
                 continue;
             }
@@ -551,7 +616,7 @@ fn spawn_hyprland_event_listener(tx: Sender<HyprlandEvent>) {
         let stream = match UnixStream::connect(&socket_path) {
             Ok(stream) => stream,
             Err(error) => {
-                eprintln!(
+                error!(
                     "Failed to connect to Hyprland event socket {}: {}",
                     socket_path.display(),
                     error
@@ -567,13 +632,14 @@ fn spawn_hyprland_event_listener(tx: Sender<HyprlandEvent>) {
             match line {
                 Ok(line) => {
                     if let Some(event) = parse_hyprland_event(&line) {
+                        info!("received Hyprland event {:?}", event);
                         if tx.send(event).is_err() {
                             return;
                         }
                     }
                 }
                 Err(error) => {
-                    eprintln!("Failed to read Hyprland event socket: {error}");
+                    error!("failed to read Hyprland event socket: {error}");
                     disconnected = true;
                     break;
                 }
@@ -581,7 +647,7 @@ fn spawn_hyprland_event_listener(tx: Sender<HyprlandEvent>) {
         }
 
         if !disconnected {
-            eprintln!("Hyprland event socket disconnected; retrying");
+            warn!("Hyprland event socket disconnected; retrying");
         }
         thread::sleep(Duration::from_secs(5));
     });
@@ -592,6 +658,7 @@ fn rotation_candidates(index: &WallpaperIndex, config: &Config) -> Vec<IndexedWa
         .refresh(&config.wallpaper_paths)
         .unwrap_or_else(|_| index.load(&config.wallpaper_paths));
     let mut wallpapers = filter_wallpapers_for_rotation(wallpapers, config);
+    debug!("rotation candidate count={}", wallpapers.len());
 
     let sort_mode = match config.rotation_sort.as_str() {
         "modified" => SortMode::Modified,
@@ -904,10 +971,11 @@ mod tests {
         choose_hotplug_wallpaper_with_rng, filter_wallpapers_for_rotation,
         format_rotation_service_status, handle_rotation_tick_outcome,
         is_tolerated_systemctl_failure, next_wallpaper, next_wallpaper_assignments,
-        parse_hyprland_event, plan_monitor_added_action, queue_monitor_addition,
-        service_file_contents, should_queue_monitor_addition, transient_backend_message,
-        BackendUnavailableReason, HyprlandEvent, Monitor, MonitorHotplugAction,
-        RotationServiceStatus, RotationTickOutcome, BACKEND_RETRY_DELAY,
+        parse_hyprland_event, plan_monitor_added_action, plan_monitor_added_from_query_result,
+        queue_monitor_addition, service_file_contents, should_queue_monitor_addition,
+        transient_backend_message, BackendUnavailableReason, HyprlandEvent, Monitor,
+        MonitorAddedPlan, MonitorHotplugAction, RotationServiceStatus, RotationTickOutcome,
+        BACKEND_RETRY_DELAY,
     };
     use crate::backend::hyprpaper::{classify_backend_unavailable, ActiveWallpaperAssignment};
     use crate::cache::IndexedWallpaper;
@@ -1272,6 +1340,70 @@ mod tests {
         assert_eq!(
             classify_backend_unavailable(&error),
             Some(BackendUnavailableReason::HyprpaperUnavailable)
+        );
+    }
+
+    #[test]
+    fn same_on_all_hotplug_uses_fallback_when_active_query_is_unsupported() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let plan = plan_monitor_added_from_query_result(
+            "DP-1",
+            &config(vec!["alpha", "beta"], false, true),
+            &vec![wallpaper("alpha"), wallpaper("beta")],
+            Ok(None),
+            Some(&PathBuf::from("/tmp/alpha.png")),
+            &mut rng,
+        )
+        .expect("plan");
+
+        assert_eq!(
+            plan,
+            MonitorAddedPlan::Apply(MonitorHotplugAction::SetOnAllDisplays {
+                wallpaper_path: PathBuf::from("/tmp/beta.png"),
+            })
+        );
+    }
+
+    #[test]
+    fn different_per_display_hotplug_uses_full_pool_when_active_query_is_unsupported() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let plan = plan_monitor_added_from_query_result(
+            "DP-1",
+            &config(vec!["alpha", "beta", "gamma"], true, false),
+            &vec![wallpaper("alpha"), wallpaper("beta"), wallpaper("gamma")],
+            Ok(None),
+            None,
+            &mut rng,
+        )
+        .expect("plan");
+
+        assert_eq!(
+            plan,
+            MonitorAddedPlan::Apply(MonitorHotplugAction::SetOnMonitor {
+                monitor_name: "DP-1".to_string(),
+                wallpaper_path: PathBuf::from("/tmp/beta.png"),
+            })
+        );
+    }
+
+    #[test]
+    fn transient_active_query_errors_still_request_retry() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let plan = plan_monitor_added_from_query_result(
+            "DP-1",
+            &config(vec!["alpha", "beta"], false, true),
+            &vec![wallpaper("alpha"), wallpaper("beta")],
+            Err(anyhow::anyhow!(
+                "Active wallpaper query failed: status exit status: 3, stdout: Couldn't connect to /run/user/1000/hypr/instance/.hyprpaper.sock. (3)"
+            )),
+            Some(&PathBuf::from("/tmp/alpha.png")),
+            &mut rng,
+        )
+        .expect("transient backend errors should not fail");
+
+        assert_eq!(
+            plan,
+            MonitorAddedPlan::RetrySoon(BackendUnavailableReason::HyprpaperUnavailable)
         );
     }
 

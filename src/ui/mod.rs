@@ -1,6 +1,7 @@
 mod theme;
 
 use chrono::{Local, TimeZone};
+use log::{debug, error, info};
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     crossterm::{
@@ -30,19 +31,23 @@ use std::{
     thread,
 };
 
+use crate::backend::hyprpaper::get_active_wallpapers_if_supported;
 use crate::backend::{
-    apply_random_plan, disable_rotation_service, enable_rotation_service, get_active_wallpapers,
-    get_monitors, get_rotation_service_status, install_rotation_service, plan_random_assignments,
+    apply_random_plan, disable_rotation_service, enable_rotation_service, get_monitors,
+    get_rotation_service_status, install_rotation_service, plan_random_assignments,
     restart_rotation_service_if_active, rotation_service_badge, rotation_service_status,
     scan_directory, set_wallpaper, set_wallpaper_for_monitor, uninstall_rotation_service,
     RandomMode, RandomPlan, RotationServiceStatus,
 };
 use crate::cache::{IndexedWallpaper, ThumbnailCache, ThumbnailProfile, WallpaperIndex};
 use crate::config::Config;
+use crate::logging::set_stderr_mirroring_enabled;
 use crate::shared::{
-    default_display_target_selection, display_targets_from_names, first_active_visible_index,
-    random_apply_action, random_menu_actions, selection_for_random_plan, wallpaper_apply_action,
-    DisplayTarget, RandomApplyAction, RandomMenuAction, WallpaperApplyAction,
+    active_wallpaper_paths_for_random_plan, default_display_target_selection,
+    display_targets_from_names, first_active_visible_index, mark_active_wallpaper,
+    random_apply_action, random_menu_actions, selection_for_random_plan,
+    set_active_wallpaper_paths, wallpaper_apply_action, DisplayTarget, RandomApplyAction,
+    RandomMenuAction, WallpaperApplyAction,
 };
 use crate::theme::ThemeKind;
 use theme::ThemePalette;
@@ -347,6 +352,7 @@ impl App {
     }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
+        info!("starting terminal UI");
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         let keyboard_enhancement_enabled = matches!(supports_keyboard_enhancement(), Ok(true))
@@ -361,6 +367,7 @@ impl App {
             )
             .is_ok();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        set_stderr_mirroring_enabled(false);
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -380,10 +387,12 @@ impl App {
                 DisableMouseCapture
             )?;
         }
+        set_stderr_mirroring_enabled(true);
         disable_raw_mode()?;
         terminal.show_cursor()?;
 
         if let Err(err) = res {
+            error!("terminal UI exited with error: {:?}", err);
             eprintln!("Error: {:?}", err);
         }
 
@@ -511,7 +520,7 @@ impl App {
             (KeyCode::Char('G'), KeyModifiers::SHIFT) | (KeyCode::End, _) => self.go_to_bottom(),
             (KeyCode::Char('A'), KeyModifiers::SHIFT) => {
                 if let Err(error) = self.apply_wallpaper() {
-                    eprintln!("Failed to apply: {error}");
+                    error!("terminal UI apply-all failed: {error}");
                 }
             }
             (KeyCode::Enter, _) => self.handle_enter()?,
@@ -603,7 +612,7 @@ impl App {
             KeyCode::Char('G') | KeyCode::End => self.go_to_bottom(),
             KeyCode::Enter => {
                 if let Err(error) = self.apply_display_selection() {
-                    eprintln!("Failed to apply: {error}");
+                    error!("terminal UI display selection apply failed: {error}");
                 }
             }
             _ => {}
@@ -619,7 +628,7 @@ impl App {
             KeyCode::Char('G') | KeyCode::End => self.go_to_bottom(),
             KeyCode::Enter => {
                 if let Err(error) = self.apply_random_menu_selection() {
-                    eprintln!("Failed to apply random wallpaper: {error}");
+                    error!("terminal UI random menu apply failed: {error}");
                 }
             }
             _ => {}
@@ -672,7 +681,7 @@ impl App {
             }
             AppMode::Wallpaper => {
                 if let Err(error) = self.apply_wallpaper_on_enter() {
-                    eprintln!("Failed to apply: {error}");
+                    error!("terminal UI enter-apply failed: {error}");
                 }
             }
             AppMode::DisplaySelect => {}
@@ -1006,12 +1015,18 @@ impl App {
     }
 
     fn refresh_active_wallpapers(&mut self) {
-        match get_active_wallpapers() {
-            Ok(paths) => {
-                self.active_wallpaper_paths = paths.into_iter().collect();
+        match get_active_wallpapers_if_supported() {
+            Ok(Some(paths)) => {
+                debug!("terminal UI active wallpaper refresh used backend state");
+                set_active_wallpaper_paths(&mut self.active_wallpaper_paths, paths);
+            }
+            Ok(None) => {
+                debug!(
+                    "terminal UI active wallpaper refresh kept local state because backend status query is unsupported"
+                );
             }
             Err(error) => {
-                eprintln!("Failed to refresh active wallpapers: {error}");
+                error!("terminal UI failed to refresh active wallpapers: {error}");
             }
         }
     }
@@ -1265,13 +1280,13 @@ impl App {
 
         match random_apply_action(&get_monitors()) {
             RandomApplyAction::ErrorNoMonitors => {
-                eprintln!("Failed to apply random wallpaper: No monitors found")
+                error!("terminal UI random wallpaper apply failed: no monitors found");
             }
             RandomApplyAction::ApplyToSingleDisplay => {
                 if let Err(error) =
                     self.apply_random_wallpaper_mode(RandomMode::DisplayIndex(0), &candidates)
                 {
-                    eprintln!("Failed to apply random wallpaper: {error}");
+                    error!("terminal UI random wallpaper apply failed: {error}");
                 }
             }
             RandomApplyAction::OpenRandomMenu(monitor_names) => {
@@ -1300,16 +1315,33 @@ impl App {
         mode: RandomMode,
         candidates: &[PathBuf],
     ) -> anyhow::Result<()> {
+        info!(
+            "terminal UI applying random wallpaper mode={:?} candidates={}",
+            mode,
+            candidates.len()
+        );
         let monitors = get_monitors();
         let plan = plan_random_assignments(&monitors, candidates, mode)?;
         apply_random_plan(&plan)?;
+        set_active_wallpaper_paths(
+            &mut self.active_wallpaper_paths,
+            active_wallpaper_paths_for_random_plan(&plan),
+        );
         self.refresh_active_wallpapers();
         self.sync_selection_with_random_plan(&plan);
 
         if let Some(assignment) = plan.assignments.first() {
             if matches!(plan.mode, RandomMode::DifferentAll) {
+                info!(
+                    "terminal UI applied different random wallpapers assignments={}",
+                    plan.assignments.len()
+                );
                 println!("Applied different random wallpapers across displays.");
             } else {
+                info!(
+                    "terminal UI applied random wallpaper path={}",
+                    assignment.wallpaper_path.display()
+                );
                 println!(
                     "Random wallpaper applied: {}",
                     assignment.wallpaper_path.display()
@@ -2106,7 +2138,7 @@ impl App {
                     if response.request_id == self.preview_request_id {
                         match response.protocol {
                             Ok(protocol) => self.current_image = Some(protocol),
-                            Err(error) => eprintln!("Failed to load preview: {error}"),
+                            Err(error) => error!("terminal UI failed to load preview: {error}"),
                         }
                     }
                 }
@@ -2197,7 +2229,12 @@ impl App {
         wallpaper_path: &PathBuf,
     ) -> anyhow::Result<()> {
         let path_str = wallpaper_path.to_string_lossy().to_string();
+        info!(
+            "terminal UI applying wallpaper to single display monitor={} path={}",
+            monitor_name, path_str
+        );
         set_wallpaper_for_monitor(monitor_name, &path_str)?;
+        mark_active_wallpaper(&mut self.active_wallpaper_paths, wallpaper_path);
         self.refresh_active_wallpapers();
         println!("Wallpaper set on {monitor_name}: {path_str}");
         Ok(())
@@ -2205,7 +2242,12 @@ impl App {
 
     fn apply_wallpaper_to_all_displays(&mut self, wallpaper_path: &PathBuf) -> anyhow::Result<()> {
         let path_str = wallpaper_path.to_string_lossy().to_string();
+        info!("terminal UI applying wallpaper to all displays path={path_str}");
         set_wallpaper(&path_str)?;
+        set_active_wallpaper_paths(
+            &mut self.active_wallpaper_paths,
+            vec![wallpaper_path.clone()],
+        );
         self.refresh_active_wallpapers();
         println!("Wallpaper set to: {path_str}");
         Ok(())

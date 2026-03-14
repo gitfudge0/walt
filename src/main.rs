@@ -2,6 +2,7 @@ mod backend;
 mod cache;
 mod config;
 mod gui;
+mod logging;
 mod shared;
 mod theme;
 mod ui;
@@ -45,13 +46,33 @@ enum RotationCommand {
 }
 
 fn main() -> Result<()> {
+    logging::init_logging();
     let args = env::args().skip(1).collect::<Vec<_>>();
     let argv = args.iter().map(String::as_str).collect::<Vec<_>>();
+    log::info!(
+        "starting Walt version={} argv={:?} level={}",
+        env!("CARGO_PKG_VERSION"),
+        args,
+        log::max_level()
+    );
+    if let Ok(path) = logging::log_file_path() {
+        log::info!("log file path={}", path.display());
+    }
 
-    match parse_command(&argv)? {
+    let command = match parse_command(&argv) {
+        Ok(command) => command,
+        Err(error) => {
+            log::error!("failed to parse command line: {error}");
+            return Err(error);
+        }
+    };
+    log::info!("selected command={:?}", command);
+
+    match command {
         CliCommand::LaunchUi => {}
         CliCommand::Gui => return gui::run(),
         CliCommand::Help => {
+            log::info!("printing help text");
             print_usage();
             return Ok(());
         }
@@ -62,25 +83,31 @@ fn main() -> Result<()> {
             match command {
                 RotationCommand::Install => {
                     backend::install_rotation_service()?;
+                    log::info!("installed and started Walt rotation service");
                     println!("Installed and started Walt rotation service.");
                 }
                 RotationCommand::Enable => {
                     backend::enable_rotation_service()?;
+                    log::info!("enabled and started Walt rotation service");
                     println!("Enabled and started Walt rotation service.");
                 }
                 RotationCommand::Disable => {
                     backend::disable_rotation_service()?;
+                    log::info!("disabled and stopped Walt rotation service");
                     println!("Disabled and stopped Walt rotation service.");
                 }
                 RotationCommand::Uninstall => {
                     backend::uninstall_rotation_service()?;
+                    log::info!("removed Walt rotation service");
                     println!("Removed Walt rotation service.");
                 }
                 RotationCommand::Status => {
+                    log::info!("printing rotation service status");
                     println!("{}", backend::rotation_service_status()?);
                 }
                 RotationCommand::Interval(seconds) => {
                     set_rotation_interval(seconds)?;
+                    log::info!("set rotation interval seconds={seconds}");
                     println!("Rotation interval set to {}.", format_interval(seconds));
                 }
             }
@@ -88,6 +115,7 @@ fn main() -> Result<()> {
         }
     }
 
+    log::info!("launching terminal UI");
     let mut app = ui::App::new()?;
     app.run()?;
     Ok(())
@@ -150,6 +178,7 @@ fn parse_rotation_interval(value: &str) -> Result<u64> {
 
 fn run_random_wallpaper(command: RandomCommand) -> Result<()> {
     let config = config::Config::new();
+    log::info!("running random wallpaper command mode={:?}", command);
 
     if config.is_empty() {
         bail!("No wallpaper directories configured. Launch walt once to add paths.")
@@ -169,6 +198,11 @@ fn run_random_wallpaper(command: RandomCommand) -> Result<()> {
     let plan = backend::plan_random_assignments(&monitors, &wallpaper_paths, random_mode)?;
 
     backend::apply_random_plan(&plan)?;
+    log::info!(
+        "applied random wallpaper command mode={:?} assignments={}",
+        plan.mode,
+        plan.assignments.len()
+    );
     print_random_summary(&plan);
     Ok(())
 }
@@ -235,11 +269,13 @@ fn run_uninstall(yes: bool) -> Result<()> {
     )?;
 
     if !confirmed {
+        log::info!("Walt uninstall cancelled");
         println!("Walt uninstall cancelled.");
         return Ok(());
     }
 
     let report = backend::uninstall_walt()?;
+    log::info!("Walt uninstall completed");
     println!("{}", report.summary());
     Ok(())
 }

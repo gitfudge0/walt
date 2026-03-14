@@ -13,21 +13,22 @@ use eframe::egui::{
 };
 
 use crate::{
+    backend::hyprpaper::get_active_wallpapers_if_supported,
     backend::{
         apply_random_plan, disable_rotation_service, enable_rotation_service,
-        format_rotation_service_status, get_active_wallpapers, get_monitors,
-        get_rotation_service_status, install_rotation_service, plan_random_assignments,
-        restart_rotation_service_if_active, rotation_service_badge, set_wallpaper,
-        set_wallpaper_for_monitor, uninstall_paths, uninstall_rotation_service, uninstall_walt,
-        RandomMode, RandomPlan, RotationServiceStatus,
+        format_rotation_service_status, get_monitors, get_rotation_service_status,
+        install_rotation_service, plan_random_assignments, restart_rotation_service_if_active,
+        rotation_service_badge, set_wallpaper, set_wallpaper_for_monitor, uninstall_paths,
+        uninstall_rotation_service, uninstall_walt, RandomMode, RandomPlan, RotationServiceStatus,
     },
     cache::{IndexedWallpaper, ThumbnailCache, ThumbnailProfile, WallpaperIndex},
     config::Config,
     shared::{
-        default_display_target_selection, display_targets_from_names, first_active_visible_index,
+        active_wallpaper_paths_for_random_plan, default_display_target_selection,
+        display_targets_from_names, first_active_visible_index, mark_active_wallpaper,
         random_apply_action, random_menu_actions, selection_for_random_plan,
-        wallpaper_apply_action, DisplayTarget, RandomApplyAction, RandomMenuAction,
-        WallpaperApplyAction,
+        set_active_wallpaper_paths, wallpaper_apply_action, DisplayTarget, RandomApplyAction,
+        RandomMenuAction, WallpaperApplyAction,
     },
     theme::ThemeKind,
 };
@@ -344,14 +345,20 @@ impl GuiApp {
     }
 
     fn info(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        log::info!("gui info: {message}");
         self.push_toast(ToastKind::Info, message);
     }
 
     fn success(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        log::info!("gui success: {message}");
         self.push_toast(ToastKind::Success, message);
     }
 
     fn error(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        log::error!("gui error: {message}");
         self.push_toast(ToastKind::Error, message);
     }
 
@@ -512,9 +519,15 @@ impl GuiApp {
     }
 
     fn refresh_active_wallpapers(&mut self, quiet: bool) {
-        match get_active_wallpapers() {
-            Ok(paths) => {
-                self.active_wallpaper_paths = paths.into_iter().collect();
+        match get_active_wallpapers_if_supported() {
+            Ok(Some(paths)) => {
+                log::debug!("gui active wallpaper refresh used backend state");
+                set_active_wallpaper_paths(&mut self.active_wallpaper_paths, paths);
+            }
+            Ok(None) => {
+                log::debug!(
+                    "gui active wallpaper refresh kept local state because backend status query is unsupported"
+                );
             }
             Err(error) if !quiet => {
                 self.error(format!("Failed to refresh active wallpapers: {error}"))
@@ -773,9 +786,18 @@ impl GuiApp {
         mode: RandomMode,
         candidates: &[PathBuf],
     ) -> anyhow::Result<()> {
+        log::info!(
+            "gui applying random wallpaper mode={:?} candidates={}",
+            mode,
+            candidates.len()
+        );
         let monitors = get_monitors();
         let plan = plan_random_assignments(&monitors, candidates, mode)?;
         apply_random_plan(&plan)?;
+        set_active_wallpaper_paths(
+            &mut self.active_wallpaper_paths,
+            active_wallpaper_paths_for_random_plan(&plan),
+        );
         self.refresh_active_wallpapers(false);
         self.sync_selection_with_random_plan(&plan);
 
@@ -837,7 +859,13 @@ impl GuiApp {
         wallpaper_path: &PathBuf,
     ) -> anyhow::Result<()> {
         let path_str = wallpaper_path.to_string_lossy().to_string();
+        log::info!(
+            "gui applying wallpaper to single display monitor={} path={}",
+            monitor_name,
+            path_str
+        );
         set_wallpaper_for_monitor(monitor_name, &path_str)?;
+        mark_active_wallpaper(&mut self.active_wallpaper_paths, wallpaper_path);
         self.refresh_active_wallpapers(false);
         self.success(format!("Wallpaper set on {monitor_name}: {path_str}"));
         Ok(())
@@ -845,7 +873,12 @@ impl GuiApp {
 
     fn apply_wallpaper_to_all_displays(&mut self, wallpaper_path: &PathBuf) -> anyhow::Result<()> {
         let path_str = wallpaper_path.to_string_lossy().to_string();
+        log::info!("gui applying wallpaper to all displays path={path_str}");
         set_wallpaper(&path_str)?;
+        set_active_wallpaper_paths(
+            &mut self.active_wallpaper_paths,
+            vec![wallpaper_path.clone()],
+        );
         self.refresh_active_wallpapers(false);
         self.success(format!("Wallpaper set on all displays: {path_str}"));
         Ok(())
@@ -2159,14 +2192,15 @@ fn spawn_backend_state_worker() -> (Sender<BackendStateRequest>, Receiver<Backen
                 request = next_request;
             }
 
-            let active_wallpapers =
-                get_active_wallpapers().map(|paths| paths.into_iter().collect::<HashSet<_>>());
+            let active_wallpapers = get_active_wallpapers_if_supported()
+                .map(|paths| paths.map(|paths| paths.into_iter().collect::<HashSet<_>>()));
             let rotation_status = get_rotation_service_status();
 
             let mut snapshot = request.fallback;
             let mut has_success = false;
 
-            if let Ok(paths) = active_wallpapers {
+            if let Ok(Some(paths)) = active_wallpapers {
+                log::debug!("gui backend state worker refreshed active wallpaper paths");
                 snapshot.active_wallpaper_paths = paths;
                 has_success = true;
             }

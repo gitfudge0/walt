@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use eframe::egui;
 
 pub fn run() -> Result<()> {
+    log::info!("starting GUI");
     if env::var_os("DISPLAY").is_none() && env::var_os("WAYLAND_DISPLAY").is_none() {
         bail!("No graphical session found. Use `walt` to launch the terminal UI instead.");
     }

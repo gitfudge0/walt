@@ -120,6 +120,10 @@ Make sure `hyprpaper` is running:
 exec-once = hyprpaper
 ```
 
+Walt handles legacy `hyprpaper` builds that still expose `preload`, newer builds that apply wallpapers without a preload dispatcher, and active-status implementations where `hyprctl` cannot query active wallpapers by falling back to best-effort in-session indicators.
+
+Debug logs are written to `~/.cache/walt/logs/walt.log` at `info` level by default. Use `WALT_LOG=debug cargo run`, `WALT_LOG=debug cargo run -- gui`, or `WALT_LOG=debug ./target/debug/walt` for verbose tracing, and `tail -f ~/.cache/walt/logs/walt.log` to watch failures live.
+
 ## GUI
 
 Walt ships with a native `egui` desktop interface alongside the original TUI. The GUI keeps the same core capabilities as the terminal app:
