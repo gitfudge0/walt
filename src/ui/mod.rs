@@ -24,14 +24,14 @@ use ratatui::{
 };
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol, Resize, StatefulImage};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io,
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
 };
 
-use crate::backend::hyprpaper::get_active_wallpapers_if_supported;
+use crate::backend::hyprpaper::get_active_wallpaper_assignments_if_supported;
 use crate::backend::{
     apply_random_plan, disable_rotation_service, enable_rotation_service, get_monitors,
     get_rotation_service_status, install_rotation_service, plan_random_assignments,
@@ -43,11 +43,13 @@ use crate::cache::{IndexedWallpaper, ThumbnailCache, ThumbnailProfile, Wallpaper
 use crate::config::Config;
 use crate::logging::set_stderr_mirroring_enabled;
 use crate::shared::{
-    active_wallpaper_paths_for_random_plan, default_display_target_selection,
-    display_targets_from_names, first_active_visible_index, mark_active_wallpaper,
-    random_apply_action, random_menu_actions, selection_for_random_plan,
-    set_active_wallpaper_paths, wallpaper_apply_action, DisplayTarget, RandomApplyAction,
-    RandomMenuAction, WallpaperApplyAction,
+    active_wallpaper_paths_from_assignments, default_display_target_selection,
+    display_targets_from_names, first_active_visible_index,
+    merge_active_wallpaper_assignments_from_random_plan, random_apply_action, random_menu_actions,
+    selection_for_random_plan, set_active_wallpaper_assignment,
+    set_active_wallpaper_assignments_for_all_monitors,
+    set_active_wallpaper_assignments_from_backend, wallpaper_apply_action, DisplayTarget,
+    RandomApplyAction, RandomMenuAction, WallpaperApplyAction,
 };
 use crate::theme::ThemeKind;
 use theme::ThemePalette;
@@ -239,6 +241,7 @@ pub struct App {
     interval_buffer: String,
     all_indices: Vec<usize>,
     rotation_indices: Vec<usize>,
+    active_wallpaper_assignments: HashMap<String, PathBuf>,
     active_wallpaper_paths: HashSet<PathBuf>,
     rotation_paths: HashSet<PathBuf>,
     display_targets: Vec<DisplayTarget>,
@@ -318,6 +321,7 @@ impl App {
             interval_buffer: String::new(),
             all_indices: vec![],
             rotation_indices: vec![],
+            active_wallpaper_assignments: HashMap::new(),
             active_wallpaper_paths: HashSet::new(),
             rotation_paths: HashSet::new(),
             display_targets: vec![],
@@ -1015,10 +1019,15 @@ impl App {
     }
 
     fn refresh_active_wallpapers(&mut self) {
-        match get_active_wallpapers_if_supported() {
-            Ok(Some(paths)) => {
+        match get_active_wallpaper_assignments_if_supported() {
+            Ok(Some(assignments)) => {
                 debug!("terminal UI active wallpaper refresh used backend state");
-                set_active_wallpaper_paths(&mut self.active_wallpaper_paths, paths);
+                set_active_wallpaper_assignments_from_backend(
+                    &mut self.active_wallpaper_assignments,
+                    &assignments,
+                );
+                self.active_wallpaper_paths =
+                    active_wallpaper_paths_from_assignments(&self.active_wallpaper_assignments);
             }
             Ok(None) => {
                 debug!(
@@ -1323,9 +1332,10 @@ impl App {
         let monitors = get_monitors();
         let plan = plan_random_assignments(&monitors, candidates, mode)?;
         apply_random_plan(&plan)?;
-        set_active_wallpaper_paths(
+        sync_random_plan_into_active_wallpaper_state(
+            &mut self.active_wallpaper_assignments,
             &mut self.active_wallpaper_paths,
-            active_wallpaper_paths_for_random_plan(&plan),
+            &plan,
         );
         self.refresh_active_wallpapers();
         self.sync_selection_with_random_plan(&plan);
@@ -2234,7 +2244,13 @@ impl App {
             monitor_name, path_str
         );
         set_wallpaper_for_monitor(monitor_name, &path_str)?;
-        mark_active_wallpaper(&mut self.active_wallpaper_paths, wallpaper_path);
+        set_active_wallpaper_assignment(
+            &mut self.active_wallpaper_assignments,
+            monitor_name,
+            wallpaper_path,
+        );
+        self.active_wallpaper_paths =
+            active_wallpaper_paths_from_assignments(&self.active_wallpaper_assignments);
         self.refresh_active_wallpapers();
         println!("Wallpaper set on {monitor_name}: {path_str}");
         Ok(())
@@ -2244,10 +2260,14 @@ impl App {
         let path_str = wallpaper_path.to_string_lossy().to_string();
         info!("terminal UI applying wallpaper to all displays path={path_str}");
         set_wallpaper(&path_str)?;
-        set_active_wallpaper_paths(
-            &mut self.active_wallpaper_paths,
-            vec![wallpaper_path.clone()],
+        let monitors = get_monitors();
+        set_active_wallpaper_assignments_for_all_monitors(
+            &mut self.active_wallpaper_assignments,
+            &monitors,
+            wallpaper_path,
         );
+        self.active_wallpaper_paths =
+            active_wallpaper_paths_from_assignments(&self.active_wallpaper_assignments);
         self.refresh_active_wallpapers();
         println!("Wallpaper set to: {path_str}");
         Ok(())
@@ -2489,6 +2509,15 @@ fn popup_divider_line(width: u16, theme: ThemePalette) -> Line<'static> {
     Line::from(Span::styled("─".repeat(divider_width), theme.border))
 }
 
+fn sync_random_plan_into_active_wallpaper_state(
+    active_wallpaper_assignments: &mut HashMap<String, PathBuf>,
+    active_wallpaper_paths: &mut HashSet<PathBuf>,
+    plan: &RandomPlan,
+) {
+    merge_active_wallpaper_assignments_from_random_plan(active_wallpaper_assignments, plan);
+    *active_wallpaper_paths = active_wallpaper_paths_from_assignments(active_wallpaper_assignments);
+}
+
 fn format_file_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
@@ -2521,9 +2550,12 @@ fn wallpaper_marker_prefix(is_active: bool) -> String {
 #[cfg(test)]
 mod marker_tests {
     use super::{
-        normalized_section_selection, rotation_section_message, wallpaper_marker_prefix,
-        RotationMenuAction, RotationServiceStatus,
+        normalized_section_selection, rotation_section_message,
+        sync_random_plan_into_active_wallpaper_state, wallpaper_marker_prefix, RotationMenuAction,
+        RotationServiceStatus,
     };
+    use crate::backend::{random::RandomAssignment, RandomMode, RandomPlan};
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
     #[test]
@@ -2594,6 +2626,54 @@ mod marker_tests {
         assert_eq!(
             RotationMenuAction::ToggleDisplayMode.label(status, false, false),
             "Use same wallpaper on all displays"
+        );
+    }
+
+    #[test]
+    fn random_display_index_sync_preserves_untouched_assignments() {
+        let mut active_assignments = HashMap::from([
+            (
+                "HDMI-A-1".to_string(),
+                PathBuf::from("/wallpapers/alpha.jpg"),
+            ),
+            ("DP-1".to_string(), PathBuf::from("/wallpapers/beta.jpg")),
+        ]);
+        let mut active_paths = HashSet::from([
+            PathBuf::from("/wallpapers/alpha.jpg"),
+            PathBuf::from("/wallpapers/beta.jpg"),
+        ]);
+        let plan = RandomPlan {
+            mode: RandomMode::DisplayIndex(0),
+            assignments: vec![RandomAssignment {
+                monitor_name: "HDMI-A-1".to_string(),
+                wallpaper_path: PathBuf::from("/wallpapers/gamma.jpg"),
+            }],
+            requested_display_index: Some(0),
+            resolved_display_index: Some(0),
+        };
+
+        sync_random_plan_into_active_wallpaper_state(
+            &mut active_assignments,
+            &mut active_paths,
+            &plan,
+        );
+
+        assert_eq!(
+            active_assignments,
+            HashMap::from([
+                (
+                    "HDMI-A-1".to_string(),
+                    PathBuf::from("/wallpapers/gamma.jpg"),
+                ),
+                ("DP-1".to_string(), PathBuf::from("/wallpapers/beta.jpg")),
+            ])
+        );
+        assert_eq!(
+            active_paths,
+            HashSet::from([
+                PathBuf::from("/wallpapers/gamma.jpg"),
+                PathBuf::from("/wallpapers/beta.jpg"),
+            ])
         );
     }
 }

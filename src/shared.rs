@@ -1,7 +1,10 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use crate::{
-    backend::{Monitor, RandomMode, RandomPlan},
+    backend::{hyprpaper::ActiveWallpaperAssignment, Monitor, RandomMode, RandomPlan},
     cache::IndexedWallpaper,
 };
 
@@ -148,41 +151,78 @@ pub fn selection_for_random_plan(
     })
 }
 
-pub fn set_active_wallpaper_paths<I>(active_wallpaper_paths: &mut HashSet<PathBuf>, paths: I)
-where
-    I: IntoIterator<Item = PathBuf>,
-{
-    *active_wallpaper_paths = paths.into_iter().collect();
+pub fn set_active_wallpaper_assignments_from_backend(
+    active_wallpaper_assignments: &mut HashMap<String, PathBuf>,
+    assignments: &[ActiveWallpaperAssignment],
+) {
+    *active_wallpaper_assignments = assignments
+        .iter()
+        .map(|assignment| {
+            (
+                assignment.monitor_name.clone(),
+                assignment.wallpaper_path.clone(),
+            )
+        })
+        .collect();
 }
 
-pub fn mark_active_wallpaper(
-    active_wallpaper_paths: &mut HashSet<PathBuf>,
+pub fn set_active_wallpaper_assignment(
+    active_wallpaper_assignments: &mut HashMap<String, PathBuf>,
+    monitor_name: &str,
     wallpaper_path: &PathBuf,
 ) {
-    active_wallpaper_paths.insert(wallpaper_path.clone());
+    active_wallpaper_assignments.insert(monitor_name.to_string(), wallpaper_path.clone());
 }
 
-pub fn active_wallpaper_paths_for_random_plan(plan: &RandomPlan) -> HashSet<PathBuf> {
-    plan.assignments
+pub fn set_active_wallpaper_assignments_for_all_monitors(
+    active_wallpaper_assignments: &mut HashMap<String, PathBuf>,
+    monitors: &[Monitor],
+    wallpaper_path: &PathBuf,
+) {
+    *active_wallpaper_assignments = monitors
         .iter()
-        .map(|assignment| assignment.wallpaper_path.clone())
+        .map(|monitor| (monitor.name.clone(), wallpaper_path.clone()))
         .collect()
+}
+
+pub fn merge_active_wallpaper_assignments_from_random_plan(
+    active_wallpaper_assignments: &mut HashMap<String, PathBuf>,
+    plan: &RandomPlan,
+) {
+    for assignment in &plan.assignments {
+        active_wallpaper_assignments.insert(
+            assignment.monitor_name.clone(),
+            assignment.wallpaper_path.clone(),
+        );
+    }
+}
+
+pub fn active_wallpaper_paths_from_assignments(
+    active_wallpaper_assignments: &HashMap<String, PathBuf>,
+) -> HashSet<PathBuf> {
+    active_wallpaper_assignments.values().cloned().collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, path::PathBuf};
+    use std::{
+        collections::{HashMap, HashSet},
+        path::PathBuf,
+    };
 
     use super::{
-        active_wallpaper_paths_for_random_plan, default_display_target_selection,
-        display_targets_from_names, first_active_visible_index, mark_active_wallpaper,
-        random_apply_action, random_menu_actions, selection_for_random_plan,
-        set_active_wallpaper_paths, wallpaper_apply_action, DisplayTarget, RandomApplyAction,
-        RandomMenuAction, WallpaperApplyAction,
+        active_wallpaper_paths_from_assignments, default_display_target_selection,
+        display_targets_from_names, first_active_visible_index, random_apply_action,
+        random_menu_actions, selection_for_random_plan, set_active_wallpaper_assignment,
+        set_active_wallpaper_assignments_for_all_monitors,
+        set_active_wallpaper_assignments_from_backend, wallpaper_apply_action, DisplayTarget,
+        RandomApplyAction, RandomMenuAction, WallpaperApplyAction,
     };
     use crate::{
-        backend::random::RandomAssignment,
-        backend::{Monitor, RandomMode, RandomPlan},
+        backend::{
+            hyprpaper::ActiveWallpaperAssignment, random::RandomAssignment, Monitor, RandomMode,
+            RandomPlan,
+        },
         cache::IndexedWallpaper,
     };
 
@@ -359,59 +399,105 @@ mod tests {
     }
 
     #[test]
-    fn set_active_wallpaper_paths_replaces_existing_state() {
-        let mut active_paths = HashSet::from([
+    fn set_active_wallpaper_assignments_from_backend_replaces_existing_state() {
+        let mut active_assignments = HashMap::from([(
+            "HDMI-A-1".to_string(),
             PathBuf::from("/wallpapers/old-alpha.jpg"),
-            PathBuf::from("/wallpapers/old-beta.jpg"),
+        )]);
+
+        set_active_wallpaper_assignments_from_backend(
+            &mut active_assignments,
+            &[ActiveWallpaperAssignment {
+                monitor_name: "DP-1".to_string(),
+                wallpaper_path: PathBuf::from("/wallpapers/new-alpha.jpg"),
+            }],
+        );
+
+        assert_eq!(
+            active_assignments,
+            HashMap::from([(
+                "DP-1".to_string(),
+                PathBuf::from("/wallpapers/new-alpha.jpg")
+            )])
+        );
+    }
+
+    #[test]
+    fn set_active_wallpaper_assignment_replaces_monitor_and_drops_stale_path() {
+        let mut active_assignments = HashMap::from([
+            (
+                "HDMI-A-1".to_string(),
+                PathBuf::from("/wallpapers/alpha.jpg"),
+            ),
+            ("DP-1".to_string(), PathBuf::from("/wallpapers/beta.jpg")),
         ]);
 
-        set_active_wallpaper_paths(
-            &mut active_paths,
-            vec![PathBuf::from("/wallpapers/new-alpha.jpg")],
+        set_active_wallpaper_assignment(
+            &mut active_assignments,
+            "HDMI-A-1",
+            &PathBuf::from("/wallpapers/beta.jpg"),
         );
 
         assert_eq!(
-            active_paths,
-            HashSet::from([PathBuf::from("/wallpapers/new-alpha.jpg")])
+            active_wallpaper_paths_from_assignments(&active_assignments),
+            HashSet::from([PathBuf::from("/wallpapers/beta.jpg")])
         );
     }
 
     #[test]
-    fn mark_active_wallpaper_preserves_existing_state() {
-        let mut active_paths = HashSet::from([PathBuf::from("/wallpapers/alpha.jpg")]);
+    fn set_active_wallpaper_assignments_for_all_monitors_collapses_paths() {
+        let mut active_assignments = HashMap::new();
+        let monitors = vec![
+            Monitor {
+                name: "HDMI-A-1".to_string(),
+            },
+            Monitor {
+                name: "DP-1".to_string(),
+            },
+        ];
 
-        mark_active_wallpaper(&mut active_paths, &PathBuf::from("/wallpapers/beta.jpg"));
+        set_active_wallpaper_assignments_for_all_monitors(
+            &mut active_assignments,
+            &monitors,
+            &PathBuf::from("/wallpapers/alpha.jpg"),
+        );
 
         assert_eq!(
-            active_paths,
-            HashSet::from([
+            active_wallpaper_paths_from_assignments(&active_assignments),
+            HashSet::from([PathBuf::from("/wallpapers/alpha.jpg")])
+        );
+    }
+
+    #[test]
+    fn merge_random_plan_preserves_untouched_monitor_assignments() {
+        let mut active_assignments = HashMap::from([
+            (
+                "HDMI-A-1".to_string(),
                 PathBuf::from("/wallpapers/alpha.jpg"),
-                PathBuf::from("/wallpapers/beta.jpg"),
-            ])
-        );
-    }
-
-    #[test]
-    fn active_wallpaper_paths_for_random_plan_deduplicates_paths() {
+            ),
+            ("DP-1".to_string(), PathBuf::from("/wallpapers/beta.jpg")),
+        ]);
         let plan = RandomPlan {
-            mode: RandomMode::SameAll,
-            assignments: vec![
-                RandomAssignment {
-                    monitor_name: "HDMI-A-1".to_string(),
-                    wallpaper_path: PathBuf::from("/wallpapers/alpha.jpg"),
-                },
-                RandomAssignment {
-                    monitor_name: "DP-1".to_string(),
-                    wallpaper_path: PathBuf::from("/wallpapers/alpha.jpg"),
-                },
-            ],
-            requested_display_index: None,
-            resolved_display_index: None,
+            mode: RandomMode::DisplayIndex(0),
+            assignments: vec![RandomAssignment {
+                monitor_name: "HDMI-A-1".to_string(),
+                wallpaper_path: PathBuf::from("/wallpapers/gamma.jpg"),
+            }],
+            requested_display_index: Some(0),
+            resolved_display_index: Some(0),
         };
 
+        super::merge_active_wallpaper_assignments_from_random_plan(&mut active_assignments, &plan);
+
         assert_eq!(
-            active_wallpaper_paths_for_random_plan(&plan),
-            HashSet::from([PathBuf::from("/wallpapers/alpha.jpg")])
+            active_assignments,
+            HashMap::from([
+                (
+                    "HDMI-A-1".to_string(),
+                    PathBuf::from("/wallpapers/gamma.jpg"),
+                ),
+                ("DP-1".to_string(), PathBuf::from("/wallpapers/beta.jpg")),
+            ])
         );
     }
 }

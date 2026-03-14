@@ -151,14 +151,9 @@ pub fn get_active_wallpapers() -> anyhow::Result<Vec<PathBuf>> {
     ))
 }
 
-pub(crate) fn get_active_wallpapers_if_supported() -> anyhow::Result<Option<Vec<PathBuf>>> {
-    Ok(get_active_wallpaper_assignments_if_supported()?
-        .map(|assignments| active_wallpapers_from_assignments(Some(assignments))))
-}
-
 pub(crate) fn get_active_wallpaper_assignments_if_supported(
 ) -> anyhow::Result<Option<Vec<ActiveWallpaperAssignment>>> {
-    info!("querying active wallpapers");
+    debug!("querying active wallpapers");
     if cached_capability_support(&ACTIVE_QUERY_SUPPORT_CACHE) == CapabilitySupport::Unsupported {
         debug!("skipping active wallpaper query because capability cache is unsupported");
         return Ok(None);

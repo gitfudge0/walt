@@ -513,7 +513,14 @@ fn plan_monitor_added_action<R: Rng + ?Sized>(
             });
         }
 
-        let next = next_wallpaper(candidates, last_wallpaper)
+        if let Some(current) = last_wallpaper {
+            return Ok(MonitorHotplugAction::SetOnMonitor {
+                monitor_name: new_monitor_name.to_string(),
+                wallpaper_path: current.clone(),
+            });
+        }
+
+        let next = next_wallpaper(candidates, None)
             .cloned()
             .context("Could not determine next rotation wallpaper")?;
         return Ok(MonitorHotplugAction::SetOnAllDisplays {
@@ -1169,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn same_on_all_hotplug_falls_back_to_next_rotation_wallpaper() {
+    fn same_on_all_hotplug_falls_back_to_last_rotation_wallpaper() {
         let mut rng = StdRng::seed_from_u64(7);
         let action = plan_monitor_added_action(
             "DP-1",
@@ -1183,8 +1190,30 @@ mod tests {
 
         assert_eq!(
             action,
+            MonitorHotplugAction::SetOnMonitor {
+                monitor_name: "DP-1".to_string(),
+                wallpaper_path: PathBuf::from("/tmp/alpha.png"),
+            }
+        );
+    }
+
+    #[test]
+    fn same_on_all_hotplug_uses_candidate_fallback_without_current_state() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let action = plan_monitor_added_action(
+            "DP-1",
+            &config(vec!["alpha", "beta"], false, true),
+            &vec![wallpaper("alpha"), wallpaper("beta")],
+            &[],
+            None,
+            &mut rng,
+        )
+        .expect("action");
+
+        assert_eq!(
+            action,
             MonitorHotplugAction::SetOnAllDisplays {
-                wallpaper_path: PathBuf::from("/tmp/beta.png"),
+                wallpaper_path: PathBuf::from("/tmp/alpha.png"),
             }
         );
     }
@@ -1358,8 +1387,9 @@ mod tests {
 
         assert_eq!(
             plan,
-            MonitorAddedPlan::Apply(MonitorHotplugAction::SetOnAllDisplays {
-                wallpaper_path: PathBuf::from("/tmp/beta.png"),
+            MonitorAddedPlan::Apply(MonitorHotplugAction::SetOnMonitor {
+                monitor_name: "DP-1".to_string(),
+                wallpaper_path: PathBuf::from("/tmp/alpha.png"),
             })
         );
     }
