@@ -145,10 +145,13 @@ The GUI folder picker uses your Linux desktop portal or native dialog backend. O
 
 ```bash
 walt
+walt --version
+walt -v
 walt gui
 ```
 
 - `walt` launches the terminal wallpaper browser
+- `walt --version` and `walt -v` print the installed Walt version
 - `walt gui` launches the native desktop GUI
 
 ### Random wallpapers

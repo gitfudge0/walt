@@ -22,6 +22,7 @@ enum CliCommand {
     LaunchUi,
     Gui,
     Help,
+    Version,
     Random(RandomCommand),
     Uninstall { yes: bool },
     RotateDaemon,
@@ -74,6 +75,11 @@ fn main() -> Result<()> {
         CliCommand::Help => {
             log::info!("printing help text");
             print_usage();
+            return Ok(());
+        }
+        CliCommand::Version => {
+            log::info!("printing version");
+            print_version();
             return Ok(());
         }
         CliCommand::Random(command) => return run_random_wallpaper(command),
@@ -146,6 +152,7 @@ fn parse_command(args: &[&str]) -> Result<CliCommand> {
         ))),
         ["rotation", action] => Ok(CliCommand::Rotation(parse_rotation_command(action)?)),
         ["rotation", _, ..] => bail!("Usage: {ROTATION_USAGE}"),
+        ["--version"] | ["-v"] => Ok(CliCommand::Version),
         ["--rotate-daemon"] => Ok(CliCommand::RotateDaemon),
         ["--help"] | ["-h"] => Ok(CliCommand::Help),
         [arg, ..] => bail!("Unknown argument: {arg}"),
@@ -322,17 +329,25 @@ fn print_usage() {
     println!("{}", usage_text());
 }
 
+fn print_version() {
+    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+}
+
 fn usage_text() -> String {
     [
         "Walt",
         "",
         "Usage:",
+        "  walt [--version|-v]",
+        "  walt [--help|-h]",
         "  walt gui",
         "  walt random [--same|DISPLAY_INDEX]",
         "  walt uninstall [--yes]",
         "  walt rotation <command>",
         "",
         "Commands:",
+        "  --version, -v             Print the Walt version",
+        "  --help, -h                Show this help text",
         "  gui                       Launch the desktop GUI",
         "  random [--same|index]     Apply random wallpaper(s), zero-based display index clamps to last",
         "  uninstall [--yes]         Remove Walt service, config, cache, and ~/.local/bin/walt",
@@ -414,6 +429,22 @@ mod tests {
     #[test]
     fn parses_gui_command() {
         assert_eq!(parse_command(&["gui"]).expect("command"), CliCommand::Gui);
+    }
+
+    #[test]
+    fn parses_version_long_flag() {
+        assert_eq!(
+            parse_command(&["--version"]).expect("command"),
+            CliCommand::Version
+        );
+    }
+
+    #[test]
+    fn parses_version_short_flag() {
+        assert_eq!(
+            parse_command(&["-v"]).expect("command"),
+            CliCommand::Version
+        );
     }
 
     #[test]
@@ -576,6 +607,8 @@ mod tests {
         assert!(usage.contains("Usage:"));
         assert!(usage.contains("Commands:"));
         assert!(usage.contains("Examples:"));
+        assert!(usage.contains("walt [--version|-v]"));
+        assert!(usage.contains("--version, -v"));
         assert!(usage.contains("walt gui"));
         assert!(usage.contains("walt random [--same|DISPLAY_INDEX]"));
         assert!(usage.contains("walt random --same"));
