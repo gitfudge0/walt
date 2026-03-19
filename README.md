@@ -16,7 +16,7 @@ Walt is a wallpaper manager for Hyprland with both a terminal UI and a native de
 Install Walt quickly:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/gitfudge0/walt/main/install.sh | bash
+yay -S walt-bin
 ```
 
 > If you're on Arch Linux, refer to the [Install](#install) section for `walt-git` and `walt-bin`.
@@ -47,14 +47,16 @@ walt
 
 ### Requirements
 
-- `rust` and `cargo`
 - `hyprpaper`
 - `hyprctl`
 - an image-capable terminal for the TUI preview only:
   - Ghostty
   - Kitty
   - WezTerm
-  - iTerm2
+
+Build from source only:
+
+- `rust` and `cargo`
 
 ### Install
 
@@ -76,7 +78,7 @@ For the prebuilt release package:
 yay -S walt-bin
 ```
 
-`walt-git` builds from the latest source tree. `walt-bin` installs the tagged binary tarballs published on GitHub Releases.
+`walt-git` builds from the latest source tree. `walt-bin` installs the tagged binary release.
 
 This installs `walt` to `~/.local/bin/walt`.
 
@@ -92,18 +94,6 @@ Manual install:
 cargo build --release
 install -Dm755 target/release/walt ~/.local/bin/
 ```
-
-### Releases
-
-Tagged releases publish Linux binary tarballs to the GitHub Releases page.
-
-Current asset layout:
-
-- `walt-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`
-- `walt-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz`
-- `walt-vX.Y.Z-checksums.txt`
-
-These release assets are the canonical upstream source for the AUR `walt-bin` package.
 
 ### First run
 
@@ -130,7 +120,7 @@ windowrulev2 = center, class:^(com\.mitchellh\.ghostty\.walt)$
 
 `$mainMod + Shift + D` opens the Walt TUI. `$mainMod + Ctrl + D` opens the GUI. `$mainMod + D` applies a random wallpaper immediately.
 
-`install.sh` detects Ghostty, WezTerm, or Kitty and prints matching launch instructions, including the random-wallpaper bind.
+`install.sh` detects Ghostty, WezTerm, or Kitty and prints matching launch instructions.
 
 If you want the GUI to float, the `windowrulev2` examples above apply to the GUI window class as well.
 
@@ -140,9 +130,9 @@ Make sure `hyprpaper` is running:
 exec-once = hyprpaper
 ```
 
-Walt handles legacy `hyprpaper` builds that still expose `preload`, newer builds that apply wallpapers without a preload dispatcher, and active-status implementations where `hyprctl` cannot query active wallpapers by falling back to best-effort in-session indicators.
+Walt works across older and newer `hyprpaper` behavior and falls back gracefully when active wallpaper status is unavailable.
 
-Debug logs are written to `~/.cache/walt/logs/walt.log` at `info` level by default. Use `WALT_LOG=debug cargo run`, `WALT_LOG=debug cargo run -- gui`, or `WALT_LOG=debug ./target/debug/walt` for verbose tracing, and `tail -f ~/.cache/walt/logs/walt.log` to watch failures live.
+Debug logs are written to `~/.cache/walt/logs/walt.log`. Use `WALT_LOG=debug` to increase verbosity.
 
 ## GUI
 
@@ -206,19 +196,6 @@ walt rotation uninstall
 - `enable` starts it again
 - `uninstall` removes it completely
 - while the service is running, newly attached displays are handled automatically
-
-Example `status` output:
-
-```text
-Rotation Service
-Status:   running
-Loaded:   loaded (~/.config/systemd/user/walt-rotation.service)
-Enabled:  enabled
-Active:   active
-Mode:     selected wallpapers
-Interval: 300s (5m)
-Entries:  12 wallpapers
-```
 
 Walt does not auto-rotate wallpapers while the TUI is open unless you install the background service.
 When rotate-all mode is enabled from the TUI, `Entries` changes to `all wallpapers`.
