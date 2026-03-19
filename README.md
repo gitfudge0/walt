@@ -19,7 +19,7 @@ Install Walt quickly:
 curl -fsSL https://raw.githubusercontent.com/gitfudge0/walt/main/install.sh | bash
 ```
 
-> If you're on Arch Linux, you can refer to the [Install](#install) section and use the AUR package.
+> If you're on Arch Linux, refer to the [Install](#install) section for `walt-git` and `walt-bin`.
 
 Start using the app with:
 
@@ -70,6 +70,14 @@ If you're on Arch, use your preferred AUR helper:
 yay -S walt-git
 ```
 
+For the prebuilt release package:
+
+```sh
+yay -S walt-bin
+```
+
+`walt-git` builds from the latest source tree. `walt-bin` installs the tagged binary tarballs published on GitHub Releases.
+
 This installs `walt` to `~/.local/bin/walt`.
 
 From a local checkout:
@@ -84,6 +92,18 @@ Manual install:
 cargo build --release
 install -Dm755 target/release/walt ~/.local/bin/
 ```
+
+### Releases
+
+Tagged releases publish Linux binary tarballs to the GitHub Releases page.
+
+Current asset layout:
+
+- `walt-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`
+- `walt-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz`
+- `walt-vX.Y.Z-checksums.txt`
+
+These release assets are the canonical upstream source for the AUR `walt-bin` package.
 
 ### First run
 

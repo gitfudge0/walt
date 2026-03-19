@@ -1,7 +1,11 @@
 [package]
 name = "walt"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2021"
+license = "MIT"
+description = "Wallpaper manager for Hyprland with TUI and GUI interfaces"
+repository = "https://github.com/gitfudge0/walt"
+homepage = "https://github.com/gitfudge0/walt"
 
 [dependencies]
 ratatui = "0.29"
