@@ -19,7 +19,7 @@
         pkgs = nixpkgs.legacyPackages.${system};
         waltPackage = pkgs.rustPlatform.buildRustPackage {
           pname = "walt";
-          version = "0.8.0";
+          version = "0.9.3";
 
           src = pkgs.lib.cleanSource ./.;
 
