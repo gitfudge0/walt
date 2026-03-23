@@ -103,7 +103,7 @@ Or in order to install declaratively, add this to your flake.nix:
 {
     inputs = {
         nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-        walt.url = "https://github.com/gitfudge0/walt";
+        walt.url = "github:gitfudge0/walt";
     };
 
     outputs = {walt, nixpkgs, ...}:
