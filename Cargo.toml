@@ -1,6 +1,6 @@
 [package]
 name = "walt"
-version = "0.9.3"
+version = "0.9.5"
 edition = "2021"
 license = "MIT"
 description = "Wallpaper manager for Hyprland with TUI and GUI interfaces"
