@@ -11,15 +11,18 @@ use eframe::egui::{
     self, Align, Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Id, Key,
     Modifiers, ScrollArea, Stroke, TextEdit, TextStyle, TextureHandle, Ui, Vec2,
 };
+use log::error;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     backend::hyprpaper::get_active_wallpaper_assignments_if_supported,
     backend::{
-        apply_random_plan, disable_rotation_service, enable_rotation_service,
+        apply_random_plan, disable_rotation_service, download_image_async, enable_rotation_service,
         format_rotation_service_status, get_monitors, get_rotation_service_status,
         install_rotation_service, plan_random_assignments, restart_rotation_service_if_active,
         rotation_service_badge, set_wallpaper, set_wallpaper_for_monitor, uninstall_paths,
-        uninstall_rotation_service, uninstall_walt, RandomMode, RandomPlan, RotationServiceStatus,
+        uninstall_rotation_service, uninstall_walt, validate_download_url, DownloadProgressEvent,
+        DownloadRequest, RandomMode, RandomPlan, RotationServiceStatus,
     },
     cache::{IndexedWallpaper, ThumbnailCache, ThumbnailProfile, WallpaperIndex},
     config::Config,
@@ -120,6 +123,33 @@ struct BackendStateResponse {
     snapshot: Option<BackendStateSnapshot>,
 }
 
+struct DownloadWorkerRequest {
+    request_id: u64,
+    request: DownloadRequest,
+    cancel: CancellationToken,
+}
+
+struct DownloadWorkerResponse {
+    request_id: u64,
+    event: DownloadProgressEvent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GuiDownloadStage {
+    Edit,
+    Downloading,
+    Failed(String),
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GuiDownloadState {
+    stage: GuiDownloadStage,
+    final_path: Option<PathBuf>,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+}
+
 pub struct GuiApp {
     config: Config,
     theme: ThemeKind,
@@ -137,12 +167,17 @@ pub struct GuiApp {
     texture_cache: PreviewTextures,
     desired_preview_key: Option<PreviewKey>,
     current_preview_key: Option<PreviewKey>,
+    preview_request_in_flight: bool,
     preview_request_id: u64,
     preview_tx: Sender<PreviewRequest>,
     preview_rx: Receiver<PreviewResponse>,
     index_request_id: u64,
     index_tx: Sender<IndexRequest>,
     index_rx: Receiver<IndexResponse>,
+    download_request_id: u64,
+    download_tx: Sender<DownloadWorkerRequest>,
+    download_rx: Receiver<DownloadWorkerResponse>,
+    download_cancel_token: Option<CancellationToken>,
     backend_state_request_id: u64,
     backend_state_tx: Sender<BackendStateRequest>,
     backend_state_rx: Receiver<BackendStateResponse>,
@@ -157,14 +192,22 @@ pub struct GuiApp {
     random_target_selection: Option<usize>,
     pending_wallpaper_path: Option<PathBuf>,
     pending_random_candidates: Vec<PathBuf>,
+    pending_downloaded_path: Option<PathBuf>,
     show_paths_dialog: bool,
     show_rotation_dialog: bool,
     show_help_dialog: bool,
     show_uninstall_dialog: bool,
     show_display_picker: bool,
     show_random_dialog: bool,
+    show_download_dialog: bool,
     manual_path_input: String,
     interval_buffer: String,
+    download_url_input: String,
+    download_error: Option<String>,
+    download_path_selection: Option<usize>,
+    last_download_path_selection: Option<usize>,
+    download_state: Option<GuiDownloadState>,
+    focus_download_url_input: bool,
     uninstall_confirmed: bool,
     uninstall_summary: Option<String>,
     uninstall_close_deadline: Option<Instant>,
@@ -188,6 +231,7 @@ impl GuiApp {
         let thumbnail_cache = ThumbnailCache::new().ok();
         let (preview_tx, preview_rx) = spawn_preview_worker(thumbnail_cache);
         let (index_tx, index_rx) = spawn_index_worker(wallpaper_index);
+        let (download_tx, download_rx) = spawn_download_worker();
         let (backend_state_tx, backend_state_rx) = spawn_backend_state_worker();
         let backend_state_refresh_interval = Duration::from_secs(2);
 
@@ -208,12 +252,17 @@ impl GuiApp {
             texture_cache: PreviewTextures::new(),
             desired_preview_key: None,
             current_preview_key: None,
+            preview_request_in_flight: false,
             preview_request_id: 0,
             preview_tx,
             preview_rx,
             index_request_id: 0,
             index_tx,
             index_rx,
+            download_request_id: 0,
+            download_tx,
+            download_rx,
+            download_cancel_token: None,
             backend_state_request_id: 0,
             backend_state_tx,
             backend_state_rx,
@@ -228,14 +277,22 @@ impl GuiApp {
             random_target_selection: None,
             pending_wallpaper_path: None,
             pending_random_candidates: vec![],
+            pending_downloaded_path: None,
             show_paths_dialog: false,
             show_rotation_dialog: false,
             show_help_dialog: false,
             show_uninstall_dialog: false,
             show_display_picker: false,
             show_random_dialog: false,
+            show_download_dialog: false,
             manual_path_input: String::new(),
             interval_buffer: String::new(),
+            download_url_input: String::new(),
+            download_error: None,
+            download_path_selection: None,
+            last_download_path_selection: None,
+            download_state: None,
+            focus_download_url_input: false,
             uninstall_confirmed: false,
             uninstall_summary: None,
             uninstall_close_deadline: None,
@@ -624,28 +681,59 @@ impl GuiApp {
     }
 
     fn request_preview_load(&mut self) {
-        let Some(path) = self.current_selected_path() else {
+        let Some(key) = self.selected_preview_key() else {
             self.desired_preview_key = None;
             self.current_preview_key = None;
+            self.preview_request_in_flight = false;
             return;
         };
 
-        let key = PreviewKey {
-            path,
-            profile: ThumbnailProfile::GuiPreview,
-        };
-        self.desired_preview_key = Some(key.clone());
-
         if self.texture_cache.contains(&key) {
+            self.desired_preview_key = Some(key.clone());
             self.current_preview_key = Some(key);
+            self.preview_request_in_flight = false;
             return;
         }
 
+        if self.preview_request_in_flight && self.desired_preview_key.as_ref() == Some(&key) {
+            return;
+        }
+
+        self.desired_preview_key = Some(key.clone());
+        self.preview_request_in_flight = true;
         self.preview_request_id = self.preview_request_id.wrapping_add(1);
         let _ = self.preview_tx.send(PreviewRequest {
             request_id: self.preview_request_id,
             key,
         });
+    }
+
+    fn selected_preview_key(&self) -> Option<PreviewKey> {
+        let path = self.current_selected_path()?;
+        Some(PreviewKey {
+            path,
+            profile: ThumbnailProfile::GuiPreview,
+        })
+    }
+
+    fn ensure_selected_preview_is_available(&mut self) {
+        let Some(key) = self.selected_preview_key() else {
+            self.desired_preview_key = None;
+            self.current_preview_key = None;
+            self.preview_request_in_flight = false;
+            return;
+        };
+
+        self.desired_preview_key = Some(key.clone());
+        if self.texture_cache.contains(&key) {
+            self.current_preview_key = Some(key);
+            self.preview_request_in_flight = false;
+            return;
+        }
+
+        if !self.preview_request_in_flight {
+            self.request_preview_load();
+        }
     }
 
     fn drain_preview_updates(&mut self, ctx: &egui::Context) {
@@ -657,6 +745,7 @@ impl GuiApp {
                         continue;
                     }
 
+                    self.preview_request_in_flight = false;
                     match response.image {
                         Ok(image) => {
                             self.texture_cache.insert(ctx, response.key.clone(), image);
@@ -693,7 +782,9 @@ impl GuiApp {
                             self.wallpapers = wallpapers;
                             self.rebuild_section_cache();
                             self.ensure_section_selection();
-                            if let Some(path) = selected_path {
+                            if self.select_downloaded_wallpaper_in_all() {
+                                // Selection already synchronized to the newly downloaded path.
+                            } else if let Some(path) = selected_path {
                                 let _ = self.select_path_in_section(self.active_section, &path);
                             } else {
                                 self.select_active_wallpaper_in_all();
@@ -704,6 +795,243 @@ impl GuiApp {
                             self.error(format!("Failed to refresh wallpaper index: {error}"))
                         }
                     }
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn select_downloaded_wallpaper_in_all(&mut self) -> bool {
+        let Some(path) = self.pending_downloaded_path.clone() else {
+            return false;
+        };
+
+        self.active_section = SectionKind::All;
+        if self.select_path_in_section(SectionKind::All, &path) {
+            self.pending_downloaded_path = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn open_download_dialog(&mut self) {
+        self.show_download_dialog = true;
+        self.focus_download_url_input = true;
+        self.download_error = None;
+        self.download_state
+            .get_or_insert_with(|| GuiDownloadState {
+                stage: GuiDownloadStage::Edit,
+                final_path: None,
+                downloaded_bytes: 0,
+                total_bytes: None,
+            })
+            .stage = GuiDownloadStage::Edit;
+        self.normalize_download_path_selection();
+    }
+
+    fn normalize_download_path_selection(&mut self) {
+        let next = if self.config.wallpaper_paths.is_empty() {
+            None
+        } else {
+            self.last_download_path_selection
+                .filter(|index| *index < self.config.wallpaper_paths.len())
+                .or(Some(0))
+        };
+        self.download_path_selection = next;
+        self.last_download_path_selection = next;
+    }
+
+    fn start_download(&mut self) {
+        match validate_download_url(&self.download_url_input) {
+            Ok(_) => {}
+            Err(error) => {
+                self.download_error = Some(error.to_string());
+                self.download_state = Some(GuiDownloadState {
+                    stage: GuiDownloadStage::Edit,
+                    final_path: None,
+                    downloaded_bytes: 0,
+                    total_bytes: None,
+                });
+                return;
+            }
+        }
+
+        self.normalize_download_path_selection();
+        let Some(index) = self.download_path_selection else {
+            self.download_error =
+                Some("No wallpaper paths configured. Add a path first.".to_string());
+            self.download_state = Some(GuiDownloadState {
+                stage: GuiDownloadStage::Edit,
+                final_path: None,
+                downloaded_bytes: 0,
+                total_bytes: None,
+            });
+            return;
+        };
+        let Some(destination_dir) = self.config.wallpaper_paths.get(index).cloned() else {
+            self.download_error = Some("Choose a valid wallpaper path.".to_string());
+            self.download_state = Some(GuiDownloadState {
+                stage: GuiDownloadStage::Edit,
+                final_path: None,
+                downloaded_bytes: 0,
+                total_bytes: None,
+            });
+            return;
+        };
+
+        self.last_download_path_selection = Some(index);
+        self.download_request_id = self.download_request_id.wrapping_add(1);
+        let cancel = CancellationToken::new();
+        self.download_cancel_token = Some(cancel.clone());
+        self.download_error = None;
+        self.download_state = Some(GuiDownloadState {
+            stage: GuiDownloadStage::Downloading,
+            final_path: None,
+            downloaded_bytes: 0,
+            total_bytes: None,
+        });
+
+        if let Err(send_error) = self.download_tx.send(DownloadWorkerRequest {
+            request_id: self.download_request_id,
+            request: DownloadRequest {
+                url: self.download_url_input.trim().to_string(),
+                destination_dir,
+            },
+            cancel,
+        }) {
+            error!("failed to send download request to worker: {send_error}");
+            self.download_cancel_token = None;
+            self.download_error = Some("Failed to start download. Please try again.".to_string());
+            self.download_state = Some(GuiDownloadState {
+                stage: GuiDownloadStage::Edit,
+                final_path: None,
+                downloaded_bytes: 0,
+                total_bytes: None,
+            });
+            self.focus_download_url_input = true;
+        }
+    }
+
+    fn handle_download_event(&mut self, event: DownloadProgressEvent) {
+        match event {
+            DownloadProgressEvent::Started {
+                final_path,
+                total_bytes,
+            } => {
+                self.download_state = Some(GuiDownloadState {
+                    stage: GuiDownloadStage::Downloading,
+                    final_path: Some(final_path),
+                    downloaded_bytes: 0,
+                    total_bytes,
+                });
+            }
+            DownloadProgressEvent::Advanced {
+                downloaded_bytes,
+                total_bytes,
+            } => {
+                if let Some(state) = self.download_state.as_mut() {
+                    state.downloaded_bytes = downloaded_bytes;
+                    state.total_bytes = total_bytes;
+                }
+            }
+            DownloadProgressEvent::Finished { saved_path } => {
+                self.download_cancel_token = None;
+                self.pending_downloaded_path = Some(saved_path.clone());
+                self.request_index_refresh();
+                self.show_download_dialog = false;
+                self.download_state = Some(GuiDownloadState {
+                    stage: GuiDownloadStage::Edit,
+                    final_path: Some(saved_path.clone()),
+                    downloaded_bytes: 0,
+                    total_bytes: None,
+                });
+                if let Err(error) = self.apply_downloaded_wallpaper(saved_path) {
+                    self.error(format!("Failed to apply wallpaper: {error}"));
+                }
+            }
+            DownloadProgressEvent::Failed { message } => {
+                self.download_cancel_token = None;
+                self.download_state = Some(GuiDownloadState {
+                    stage: GuiDownloadStage::Failed(message),
+                    final_path: self
+                        .download_state
+                        .as_ref()
+                        .and_then(|state| state.final_path.clone()),
+                    downloaded_bytes: self
+                        .download_state
+                        .as_ref()
+                        .map(|state| state.downloaded_bytes)
+                        .unwrap_or(0),
+                    total_bytes: self
+                        .download_state
+                        .as_ref()
+                        .and_then(|state| state.total_bytes),
+                });
+            }
+            DownloadProgressEvent::Cancelled => {
+                self.download_cancel_token = None;
+                self.download_state = Some(GuiDownloadState {
+                    stage: GuiDownloadStage::Cancelled,
+                    final_path: self
+                        .download_state
+                        .as_ref()
+                        .and_then(|state| state.final_path.clone()),
+                    downloaded_bytes: self
+                        .download_state
+                        .as_ref()
+                        .map(|state| state.downloaded_bytes)
+                        .unwrap_or(0),
+                    total_bytes: self
+                        .download_state
+                        .as_ref()
+                        .and_then(|state| state.total_bytes),
+                });
+            }
+        }
+    }
+
+    fn reset_download_dialog_for_retry(&mut self) {
+        self.download_error = None;
+        self.normalize_download_path_selection();
+        self.download_state = Some(GuiDownloadState {
+            stage: GuiDownloadStage::Edit,
+            final_path: None,
+            downloaded_bytes: 0,
+            total_bytes: None,
+        });
+        self.focus_download_url_input = true;
+    }
+
+    fn close_download_dialog(&mut self) {
+        let is_downloading = self
+            .download_state
+            .as_ref()
+            .map(|state| state.stage == GuiDownloadStage::Downloading)
+            .unwrap_or(false);
+        if is_downloading {
+            if let Some(cancel_token) = self.download_cancel_token.take() {
+                cancel_token.cancel();
+            }
+            return;
+        }
+
+        self.show_download_dialog = false;
+        self.download_error = None;
+        self.download_state = None;
+        self.focus_download_url_input = false;
+    }
+
+    fn drain_download_updates(&mut self, ctx: &egui::Context) {
+        loop {
+            match self.download_rx.try_recv() {
+                Ok(response) => {
+                    ctx.request_repaint();
+                    if response.request_id != self.download_request_id {
+                        continue;
+                    }
+
+                    self.handle_download_event(response.event);
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
@@ -862,6 +1190,23 @@ impl GuiApp {
                     default_display_target_selection(&self.display_targets);
                 self.pending_wallpaper_path = Some(path);
                 self.show_display_picker = true;
+            }
+        }
+    }
+
+    fn apply_downloaded_wallpaper(&mut self, path: PathBuf) -> anyhow::Result<()> {
+        match wallpaper_apply_action(&get_monitors()) {
+            WallpaperApplyAction::ErrorNoMonitors => Err(anyhow::anyhow!("No monitors found")),
+            WallpaperApplyAction::ApplyToSingleDisplay(monitor_name) => {
+                self.apply_wallpaper_to_single_display(&monitor_name, &path)
+            }
+            WallpaperApplyAction::OpenDisplayPicker(monitor_names) => {
+                self.display_targets = display_targets_from_names(&monitor_names);
+                self.display_target_selection =
+                    default_display_target_selection(&self.display_targets);
+                self.pending_wallpaper_path = Some(path);
+                self.show_display_picker = true;
+                Ok(())
             }
         }
     }
@@ -1041,6 +1386,26 @@ impl GuiApp {
             }
         }
 
+        if self.show_download_dialog {
+            if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::U)) {
+                return;
+            }
+            if ctx.wants_keyboard_input() {
+                if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter)) {
+                    let is_edit = self
+                        .download_state
+                        .as_ref()
+                        .map(|state| state.stage == GuiDownloadStage::Edit)
+                        .unwrap_or(true);
+                    if is_edit && !self.config.wallpaper_paths.is_empty() {
+                        self.start_download();
+                    }
+                }
+                return;
+            }
+            return;
+        }
+
         if ctx.wants_keyboard_input() {
             return;
         }
@@ -1067,6 +1432,9 @@ impl GuiApp {
         if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::P)) {
             self.show_paths_dialog = true;
         }
+        if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::U)) {
+            self.open_download_dialog();
+        }
         if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Slash)) {
             self.focus_search = true;
         }
@@ -1086,6 +1454,10 @@ impl GuiApp {
         }
         if self.show_paths_dialog {
             self.show_paths_dialog = false;
+            return true;
+        }
+        if self.show_download_dialog {
+            self.close_download_dialog();
             return true;
         }
         if self.show_help_dialog {
@@ -1156,6 +1528,16 @@ impl GuiApp {
                     .clicked()
                 {
                     self.trigger_random_wallpaper();
+                }
+                if ui
+                    .add(GuiChrome::button(
+                        "Download and save",
+                        GuiTextRole::ActionLabel,
+                        palette,
+                    ))
+                    .clicked()
+                {
+                    self.open_download_dialog();
                 }
                 if ui
                     .add(GuiChrome::button(
@@ -1449,11 +1831,11 @@ impl GuiApp {
 
     fn current_preview_texture(&mut self) -> Option<TextureHandle> {
         let desired = self.desired_preview_key.as_ref()?;
-        let current = self.current_preview_key.as_ref()?;
-        if desired != current {
-            return None;
+        let texture = self.texture_cache.get_cloned(desired);
+        if texture.is_some() {
+            self.current_preview_key = Some(desired.clone());
         }
-        self.texture_cache.get_cloned(current)
+        texture
     }
 
     fn render_metadata(&mut self, ui: &mut Ui) {
@@ -1904,6 +2286,273 @@ impl GuiApp {
         );
     }
 
+    fn render_download_window(&mut self, ctx: &egui::Context) {
+        let palette = self.palette();
+        let stage = self
+            .download_state
+            .as_ref()
+            .map(|state| state.stage.clone())
+            .unwrap_or(GuiDownloadStage::Edit);
+        self.normalize_download_path_selection();
+
+        self.show_download_dialog = show_popup_shell(
+            ctx,
+            "download-and-save",
+            "Download and Save",
+            palette,
+            Some(720.0),
+            |ui| {
+                let mut close_requested = false;
+
+                match stage {
+                    GuiDownloadStage::Edit => {
+                        if self.config.wallpaper_paths.is_empty() {
+                            ui.label(GuiTypography::rich(
+                                GuiTextRole::PopupBody,
+                                "No wallpaper paths configured.",
+                                palette,
+                            ));
+                            ui.label(GuiTypography::rich(
+                                GuiTextRole::MetaLabel,
+                                "Open Paths to add a wallpaper folder, then come back here.",
+                                palette,
+                            ));
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(GuiChrome::button(
+                                        "Open Paths",
+                                        GuiTextRole::ActionLabel,
+                                        palette,
+                                    ))
+                                    .clicked()
+                                {
+                                    self.show_paths_dialog = true;
+                                }
+                                if ui
+                                    .add(GuiChrome::button(
+                                        "Close",
+                                        GuiTextRole::ActionLabel,
+                                        palette,
+                                    ))
+                                    .clicked()
+                                {
+                                    close_requested = true;
+                                }
+                            });
+                            return close_requested;
+                        }
+
+                        ui.label(GuiTypography::rich(
+                            GuiTextRole::PopupBody,
+                            "Enter a direct image URL and choose one configured wallpaper path.",
+                            palette,
+                        ));
+                        ui.add_space(6.0);
+                        let response = ui.add(
+                            TextEdit::singleline(&mut self.download_url_input)
+                                .font(GuiTypography::font_id(GuiTextRole::MetaValue))
+                                .desired_width(finite_ui_width(ui))
+                                .hint_text("https://example.com/wallpaper.jpg"),
+                        );
+                        if self.focus_download_url_input {
+                            response.request_focus();
+                            self.focus_download_url_input = false;
+                        }
+
+                        if let Some(error) = &self.download_error {
+                            ui.add_space(6.0);
+                            ui.label(GuiTypography::rich_color(
+                                GuiTextRole::PopupBody,
+                                error,
+                                palette.danger,
+                            ));
+                        }
+
+                        GuiChrome::rule(ui, palette, 8.0);
+                        ui.label(GuiTypography::rich(
+                            GuiTextRole::MetaLabel,
+                            "Save into wallpaper path",
+                            palette,
+                        ));
+                        ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                            for (index, path) in self.config.wallpaper_paths.iter().enumerate() {
+                                if popup_choice_row(
+                                    ui,
+                                    ("download-path", index),
+                                    self.download_path_selection == Some(index),
+                                    &path.display().to_string(),
+                                    palette,
+                                )
+                                .clicked()
+                                {
+                                    self.download_path_selection = Some(index);
+                                    self.last_download_path_selection = Some(index);
+                                }
+                            }
+                        });
+
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(GuiChrome::button(
+                                    "Download and Save",
+                                    GuiTextRole::ActionLabel,
+                                    palette,
+                                ))
+                                .clicked()
+                            {
+                                self.start_download();
+                            }
+                            if ui
+                                .add(GuiChrome::button(
+                                    "Cancel",
+                                    GuiTextRole::ActionLabel,
+                                    palette,
+                                ))
+                                .clicked()
+                            {
+                                close_requested = true;
+                            }
+                        });
+                    }
+                    GuiDownloadStage::Downloading => {
+                        let state = self.download_state.clone().unwrap_or(GuiDownloadState {
+                            stage: GuiDownloadStage::Downloading,
+                            final_path: None,
+                            downloaded_bytes: 0,
+                            total_bytes: None,
+                        });
+                        if let Some(path) = state.final_path {
+                            ui.label(GuiTypography::rich(
+                                GuiTextRole::PopupBody,
+                                format!("Saving as {}", path.display()),
+                                palette,
+                            ));
+                            if let Some(parent) = path.parent() {
+                                ui.label(GuiTypography::rich(
+                                    GuiTextRole::MetaLabel,
+                                    format!("Destination: {}", parent.display()),
+                                    palette,
+                                ));
+                            }
+                        } else {
+                            ui.label(GuiTypography::rich(
+                                GuiTextRole::PopupBody,
+                                "Preparing download...",
+                                palette,
+                            ));
+                        }
+
+                        ui.add_space(8.0);
+                        if let Some(total_bytes) = state.total_bytes {
+                            let progress = if total_bytes == 0 {
+                                0.0
+                            } else {
+                                state.downloaded_bytes as f32 / total_bytes as f32
+                            };
+                            ui.add(
+                                egui::ProgressBar::new(progress.clamp(0.0, 1.0))
+                                    .desired_width(finite_ui_width(ui))
+                                    .text(format!(
+                                        "{} / {}",
+                                        format_file_size(state.downloaded_bytes),
+                                        format_file_size(total_bytes)
+                                    )),
+                            );
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(GuiTypography::rich(
+                                    GuiTextRole::PopupBody,
+                                    format!(
+                                        "Downloaded {}",
+                                        format_file_size(state.downloaded_bytes)
+                                    ),
+                                    palette,
+                                ));
+                            });
+                        }
+
+                        ui.add_space(8.0);
+                        if ui
+                            .add(GuiChrome::button(
+                                "Cancel Download",
+                                GuiTextRole::ActionLabel,
+                                palette,
+                            ))
+                            .clicked()
+                        {
+                            self.close_download_dialog();
+                        }
+                    }
+                    GuiDownloadStage::Failed(message) => {
+                        ui.label(GuiTypography::rich_color(
+                            GuiTextRole::PopupBody,
+                            message,
+                            palette.danger,
+                        ));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(GuiChrome::button(
+                                    "Retry",
+                                    GuiTextRole::ActionLabel,
+                                    palette,
+                                ))
+                                .clicked()
+                            {
+                                self.reset_download_dialog_for_retry();
+                            }
+                            if ui
+                                .add(GuiChrome::button(
+                                    "Close",
+                                    GuiTextRole::ActionLabel,
+                                    palette,
+                                ))
+                                .clicked()
+                            {
+                                close_requested = true;
+                            }
+                        });
+                    }
+                    GuiDownloadStage::Cancelled => {
+                        ui.label(GuiTypography::rich(
+                            GuiTextRole::PopupBody,
+                            "Download cancelled.",
+                            palette,
+                        ));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(GuiChrome::button(
+                                    "Retry",
+                                    GuiTextRole::ActionLabel,
+                                    palette,
+                                ))
+                                .clicked()
+                            {
+                                self.reset_download_dialog_for_retry();
+                            }
+                            if ui
+                                .add(GuiChrome::button(
+                                    "Close",
+                                    GuiTextRole::ActionLabel,
+                                    palette,
+                                ))
+                                .clicked()
+                            {
+                                close_requested = true;
+                            }
+                        });
+                    }
+                }
+
+                close_requested
+            },
+        );
+    }
+
     fn render_help_window(&mut self, ctx: &egui::Context) {
         let palette = self.palette();
         self.show_help_dialog =
@@ -1913,6 +2562,7 @@ impl GuiApp {
                     ("Enter", "Apply selected wallpaper"),
                     ("/", "Focus the search box"),
                     ("Ctrl+R", "Open random wallpaper flow"),
+                    ("u", "Open download and save flow"),
                     ("r", "Toggle selected wallpaper in rotation list"),
                     ("R", "Open rotation service dialog"),
                     ("p", "Open wallpaper paths"),
@@ -2063,8 +2713,16 @@ impl GuiApp {
         for (index, toast) in self.toasts.iter().enumerate() {
             let background = match toast.kind {
                 ToastKind::Info => palette.surface_alt,
-                ToastKind::Success => palette.success.gamma_multiply(0.25),
-                ToastKind::Error => palette.danger.gamma_multiply(0.22),
+                ToastKind::Success => Color32::from_rgb(
+                    palette.success.r() / 4,
+                    palette.success.g() / 4,
+                    palette.success.b() / 4,
+                ),
+                ToastKind::Error => Color32::from_rgb(
+                    palette.danger.r() / 4,
+                    palette.danger.g() / 4,
+                    palette.danger.b() / 4,
+                ),
             };
             egui::Area::new(Id::new(("toast", toast.id)))
                 .anchor(
@@ -2094,7 +2752,9 @@ impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_index_updates(ctx);
         self.drain_preview_updates(ctx);
+        self.drain_download_updates(ctx);
         self.drain_backend_state_updates(ctx);
+        self.ensure_selected_preview_is_available();
         self.expire_toasts();
         self.handle_shortcuts(ctx);
         self.maybe_request_backend_state_refresh();
@@ -2167,6 +2827,9 @@ impl eframe::App for GuiApp {
         if self.show_rotation_dialog {
             self.render_rotation_window(ctx);
         }
+        if self.show_download_dialog {
+            self.render_download_window(ctx);
+        }
         if self.show_paths_dialog {
             self.render_paths_window(ctx);
         }
@@ -2203,6 +2866,46 @@ fn spawn_index_worker(index: WallpaperIndex) -> (Sender<IndexRequest>, Receiver<
     });
 
     (request_tx, response_rx)
+}
+
+fn spawn_download_worker() -> (
+    Sender<DownloadWorkerRequest>,
+    Receiver<DownloadWorkerResponse>,
+) {
+    let (request_tx, request_rx) = mpsc::channel::<DownloadWorkerRequest>();
+    let (response_tx, response_rx) = mpsc::channel::<DownloadWorkerResponse>();
+
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build download runtime");
+        while let Ok(request) = request_rx.recv() {
+            let progress_tx = progress_tx_to_gui(request.request_id, response_tx.clone());
+            let _ = runtime.block_on(download_image_async(
+                request.request,
+                &progress_tx,
+                request.cancel,
+            ));
+        }
+    });
+
+    (request_tx, response_rx)
+}
+
+fn progress_tx_to_gui(
+    request_id: u64,
+    response_tx: Sender<DownloadWorkerResponse>,
+) -> Sender<DownloadProgressEvent> {
+    let (progress_tx, progress_rx) = mpsc::channel::<DownloadProgressEvent>();
+
+    std::thread::spawn(move || {
+        while let Ok(event) = progress_rx.recv() {
+            let _ = response_tx.send(DownloadWorkerResponse { request_id, event });
+        }
+    });
+
+    progress_tx
 }
 
 fn spawn_backend_state_worker() -> (Sender<BackendStateRequest>, Receiver<BackendStateResponse>) {
@@ -2314,7 +3017,7 @@ fn render_search_bar(
                     palette,
                 ))
                 .text_color(palette.text)
-                .desired_width(f32::INFINITY),
+                .desired_width(finite_ui_width(ui)),
         );
         changed = response.changed();
         if *focus_search {
@@ -2383,6 +3086,15 @@ fn wallpaper_badges(is_active: bool, in_rotation: bool) -> String {
     }
 }
 
+fn finite_ui_width(ui: &Ui) -> f32 {
+    let width = ui.available_width();
+    if width.is_finite() {
+        width.max(120.0)
+    } else {
+        120.0
+    }
+}
+
 fn fit_size(texture_size: Vec2, available: Vec2) -> Vec2 {
     if texture_size.x <= 0.0 || texture_size.y <= 0.0 || available.x <= 0.0 || available.y <= 0.0 {
         return Vec2::new(0.0, 0.0);
@@ -2447,14 +3159,25 @@ fn format_interval(seconds: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendStateSnapshot, GuiApp, RotationServiceStatus, SectionKind};
-    use crate::{config::Config, theme::ThemeKind};
+    use super::{
+        BackendStateSnapshot, DownloadWorkerRequest, DownloadWorkerResponse, GuiApp,
+        GuiDownloadStage, GuiDownloadState, RotationServiceStatus, SectionKind,
+    };
+    use crate::{
+        backend::DownloadProgressEvent,
+        cache::{IndexedWallpaper, ThumbnailProfile},
+        config::Config,
+        gui::preview::PreviewKey,
+        theme::ThemeKind,
+    };
+    use eframe::egui::{ColorImage, Context};
     use std::{
         collections::{HashMap, HashSet},
         path::PathBuf,
         sync::mpsc,
         time::{Duration, Instant},
     };
+    use tokio_util::sync::CancellationToken;
 
     fn test_config() -> Config {
         Config {
@@ -2474,6 +3197,8 @@ mod tests {
         let (_, preview_rx) = mpsc::channel();
         let (index_tx, _) = mpsc::channel();
         let (_, index_rx) = mpsc::channel();
+        let (download_tx, _) = mpsc::channel::<DownloadWorkerRequest>();
+        let (_, download_rx) = mpsc::channel::<DownloadWorkerResponse>();
         let (backend_state_tx, _) = mpsc::channel();
         let (_, backend_state_rx) = mpsc::channel();
 
@@ -2494,12 +3219,17 @@ mod tests {
             texture_cache: super::PreviewTextures::new(),
             desired_preview_key: None,
             current_preview_key: None,
+            preview_request_in_flight: false,
             preview_request_id: 0,
             preview_tx,
             preview_rx,
             index_request_id: 0,
             index_tx,
             index_rx,
+            download_request_id: 0,
+            download_tx,
+            download_rx,
+            download_cancel_token: None,
             backend_state_request_id: 0,
             backend_state_tx,
             backend_state_rx,
@@ -2514,14 +3244,22 @@ mod tests {
             random_target_selection: None,
             pending_wallpaper_path: None,
             pending_random_candidates: vec![],
+            pending_downloaded_path: None,
             show_paths_dialog: false,
             show_rotation_dialog: false,
             show_help_dialog: false,
             show_uninstall_dialog: false,
             show_display_picker: false,
             show_random_dialog: false,
+            show_download_dialog: false,
             manual_path_input: String::new(),
             interval_buffer: String::new(),
+            download_url_input: String::new(),
+            download_error: None,
+            download_path_selection: None,
+            last_download_path_selection: None,
+            download_state: None,
+            focus_download_url_input: false,
             uninstall_confirmed: false,
             uninstall_summary: None,
             uninstall_close_deadline: None,
@@ -2529,6 +3267,39 @@ mod tests {
             toasts: vec![],
             next_toast_id: 0,
         }
+    }
+
+    fn sample_wallpaper(path: &str) -> IndexedWallpaper {
+        let path = PathBuf::from(path);
+        IndexedWallpaper {
+            path: path.clone(),
+            name: path
+                .file_stem()
+                .expect("stem")
+                .to_string_lossy()
+                .to_string(),
+            directory: path.parent().expect("parent").to_path_buf(),
+            extension: path
+                .extension()
+                .expect("extension")
+                .to_string_lossy()
+                .to_string(),
+            modified_unix_secs: 0,
+            file_size: 0,
+            width: Some(1),
+            height: Some(1),
+        }
+    }
+
+    fn preview_key(path: &str) -> PreviewKey {
+        PreviewKey {
+            path: PathBuf::from(path),
+            profile: ThumbnailProfile::GuiPreview,
+        }
+    }
+
+    fn image() -> ColorImage {
+        ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255])
     }
 
     #[test]
@@ -2594,5 +3365,325 @@ mod tests {
             app.active_wallpaper_paths,
             HashSet::from([PathBuf::from("/tmp/shared.png")])
         );
+    }
+
+    #[test]
+    fn opening_download_dialog_initializes_edit_state() {
+        let mut app = test_app();
+        app.config.wallpaper_paths = vec![PathBuf::from("/tmp/wallpapers")];
+
+        app.open_download_dialog();
+
+        assert!(app.show_download_dialog);
+        assert_eq!(app.download_path_selection, Some(0));
+        assert_eq!(
+            app.download_state,
+            Some(GuiDownloadState {
+                stage: GuiDownloadStage::Edit,
+                final_path: None,
+                downloaded_bytes: 0,
+                total_bytes: None,
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_download_url_stays_in_edit_state() {
+        let mut app = test_app();
+        app.config.wallpaper_paths = vec![PathBuf::from("/tmp/wallpapers")];
+        app.download_url_input = "notaurl".to_string();
+        app.download_path_selection = Some(0);
+
+        app.start_download();
+
+        assert!(app.download_error.is_some());
+        assert_eq!(
+            app.download_state.as_ref().map(|state| &state.stage),
+            Some(&GuiDownloadStage::Edit)
+        );
+    }
+
+    #[test]
+    fn download_worker_send_failure_restores_edit_state() {
+        let mut app = test_app();
+        app.config.wallpaper_paths = vec![PathBuf::from("/tmp/wallpapers")];
+        app.download_url_input = "https://example.com/image.jpg".to_string();
+        app.download_path_selection = Some(0);
+        app.show_download_dialog = true;
+
+        app.start_download();
+
+        assert!(app.show_download_dialog);
+        assert_eq!(app.download_url_input, "https://example.com/image.jpg");
+        assert_eq!(app.download_path_selection, Some(0));
+        assert!(app.download_error.is_some());
+        assert!(app.download_cancel_token.is_none());
+        assert_eq!(
+            app.download_state.as_ref().map(|state| &state.stage),
+            Some(&GuiDownloadStage::Edit)
+        );
+    }
+
+    #[test]
+    fn closing_download_dialog_cancels_active_token() {
+        let mut app = test_app();
+        let cancel = CancellationToken::new();
+        let waiter = cancel.clone();
+        app.download_cancel_token = Some(cancel);
+        app.download_state = Some(GuiDownloadState {
+            stage: GuiDownloadStage::Downloading,
+            final_path: None,
+            downloaded_bytes: 0,
+            total_bytes: None,
+        });
+
+        app.close_download_dialog();
+
+        assert!(waiter.is_cancelled());
+        assert!(app.show_download_dialog || app.download_state.is_some());
+    }
+
+    #[test]
+    fn no_wallpaper_paths_leave_download_without_selection() {
+        let mut app = test_app();
+
+        app.open_download_dialog();
+
+        assert_eq!(app.download_path_selection, None);
+        assert!(app.show_download_dialog);
+    }
+
+    #[test]
+    fn download_progress_events_update_state() {
+        let mut app = test_app();
+
+        app.handle_download_event(DownloadProgressEvent::Started {
+            final_path: PathBuf::from("/tmp/wallpapers/sample.jpg"),
+            total_bytes: Some(200),
+        });
+        app.handle_download_event(DownloadProgressEvent::Advanced {
+            downloaded_bytes: 75,
+            total_bytes: Some(200),
+        });
+
+        let state = app.download_state.expect("download state");
+        assert_eq!(
+            state.final_path,
+            Some(PathBuf::from("/tmp/wallpapers/sample.jpg"))
+        );
+        assert_eq!(state.downloaded_bytes, 75);
+        assert_eq!(state.total_bytes, Some(200));
+        assert_eq!(state.stage, GuiDownloadStage::Downloading);
+    }
+
+    #[test]
+    fn download_failure_and_cancellation_set_terminal_state() {
+        let mut app = test_app();
+        app.download_state = Some(GuiDownloadState {
+            stage: GuiDownloadStage::Downloading,
+            final_path: None,
+            downloaded_bytes: 10,
+            total_bytes: Some(20),
+        });
+
+        app.handle_download_event(DownloadProgressEvent::Failed {
+            message: "boom".to_string(),
+        });
+        assert_eq!(
+            app.download_state.as_ref().map(|state| &state.stage),
+            Some(&GuiDownloadStage::Failed("boom".to_string()))
+        );
+
+        app.handle_download_event(DownloadProgressEvent::Cancelled);
+        assert_eq!(
+            app.download_state.as_ref().map(|state| &state.stage),
+            Some(&GuiDownloadStage::Cancelled)
+        );
+    }
+
+    #[test]
+    fn successful_download_marks_pending_path() {
+        let mut app = test_app();
+        app.download_state = Some(GuiDownloadState {
+            stage: GuiDownloadStage::Downloading,
+            final_path: None,
+            downloaded_bytes: 0,
+            total_bytes: None,
+        });
+
+        app.handle_download_event(DownloadProgressEvent::Finished {
+            saved_path: PathBuf::from("/tmp/wallpapers/new.jpg"),
+        });
+
+        assert_eq!(
+            app.pending_downloaded_path,
+            Some(PathBuf::from("/tmp/wallpapers/new.jpg"))
+        );
+        assert!(!app.show_download_dialog);
+    }
+
+    #[test]
+    fn select_downloaded_wallpaper_promotes_all_section_selection() {
+        let mut app = test_app();
+        app.wallpapers = vec![IndexedWallpaper {
+            path: PathBuf::from("/tmp/wallpapers/new.jpg"),
+            name: "new".to_string(),
+            directory: PathBuf::from("/tmp/wallpapers"),
+            extension: "jpg".to_string(),
+            modified_unix_secs: 0,
+            file_size: 0,
+            width: None,
+            height: None,
+        }];
+        app.rebuild_section_cache();
+        app.pending_downloaded_path = Some(PathBuf::from("/tmp/wallpapers/new.jpg"));
+
+        let changed = app.select_downloaded_wallpaper_in_all();
+
+        assert!(changed);
+        assert!(app.active_section == SectionKind::All);
+        assert_eq!(app.selected_all, Some(0));
+        assert_eq!(app.pending_downloaded_path, None);
+    }
+
+    #[test]
+    fn close_top_dialog_prefers_paths_over_download() {
+        let mut app = test_app();
+        app.show_download_dialog = true;
+        app.show_paths_dialog = true;
+
+        assert!(app.close_top_dialog());
+        assert!(!app.show_paths_dialog);
+        assert!(app.show_download_dialog);
+    }
+
+    #[test]
+    fn request_preview_load_queues_when_selected_preview_missing() {
+        let mut app = test_app();
+        app.wallpapers = vec![sample_wallpaper("/tmp/preview.png")];
+        app.rebuild_section_cache();
+        app.selected_all = Some(0);
+
+        app.request_preview_load();
+
+        assert_eq!(
+            app.desired_preview_key,
+            Some(preview_key("/tmp/preview.png"))
+        );
+        assert!(app.preview_request_in_flight);
+    }
+
+    #[test]
+    fn request_preview_load_is_noop_when_texture_already_cached() {
+        let mut app = test_app();
+        let ctx = Context::default();
+        let key = preview_key("/tmp/preview.png");
+        app.wallpapers = vec![sample_wallpaper("/tmp/preview.png")];
+        app.rebuild_section_cache();
+        app.selected_all = Some(0);
+        app.texture_cache.insert(&ctx, key.clone(), image());
+
+        app.request_preview_load();
+
+        assert_eq!(app.desired_preview_key, Some(key.clone()));
+        assert_eq!(app.current_preview_key, Some(key));
+        assert!(!app.preview_request_in_flight);
+    }
+
+    #[test]
+    fn ensure_selected_preview_is_available_requeues_missing_selected_texture() {
+        let mut app = test_app();
+        app.wallpapers = vec![sample_wallpaper("/tmp/preview.png")];
+        app.rebuild_section_cache();
+        app.selected_all = Some(0);
+        app.desired_preview_key = Some(preview_key("/tmp/preview.png"));
+        app.preview_request_in_flight = false;
+
+        app.ensure_selected_preview_is_available();
+
+        assert!(app.preview_request_in_flight);
+        assert_eq!(
+            app.desired_preview_key,
+            Some(preview_key("/tmp/preview.png"))
+        );
+    }
+
+    #[test]
+    fn current_preview_texture_prefers_cached_desired_key() {
+        let mut app = test_app();
+        let ctx = Context::default();
+        let desired = preview_key("/tmp/desired.png");
+        app.desired_preview_key = Some(desired.clone());
+        app.current_preview_key = Some(preview_key("/tmp/stale.png"));
+        app.texture_cache.insert(&ctx, desired.clone(), image());
+
+        let texture = app.current_preview_texture();
+
+        assert!(texture.is_some());
+        assert_eq!(app.current_preview_key, Some(desired));
+    }
+
+    #[test]
+    fn ensure_selected_preview_clears_state_when_nothing_selected() {
+        let mut app = test_app();
+        app.selected_all = None;
+        app.selected_rotation = None;
+        app.desired_preview_key = Some(preview_key("/tmp/preview.png"));
+        app.current_preview_key = Some(preview_key("/tmp/preview.png"));
+        app.preview_request_in_flight = true;
+
+        app.ensure_selected_preview_is_available();
+
+        assert_eq!(app.desired_preview_key, None);
+        assert_eq!(app.current_preview_key, None);
+        assert!(!app.preview_request_in_flight);
+    }
+
+    #[test]
+    fn drain_preview_updates_clears_in_flight_on_success() {
+        let mut app = test_app();
+        let ctx = Context::default();
+        let (response_tx, response_rx) = mpsc::channel();
+        app.preview_rx = response_rx;
+        app.preview_request_id = 7;
+        app.preview_request_in_flight = true;
+        response_tx
+            .send(super::PreviewResponse {
+                request_id: 7,
+                key: preview_key("/tmp/preview.png"),
+                image: Ok(image()),
+            })
+            .expect("send response");
+        drop(response_tx);
+
+        app.drain_preview_updates(&ctx);
+
+        assert!(!app.preview_request_in_flight);
+        assert_eq!(
+            app.current_preview_key,
+            Some(preview_key("/tmp/preview.png"))
+        );
+    }
+
+    #[test]
+    fn drain_preview_updates_clears_in_flight_on_failure() {
+        let mut app = test_app();
+        let ctx = Context::default();
+        let (response_tx, response_rx) = mpsc::channel();
+        app.preview_rx = response_rx;
+        app.preview_request_id = 9;
+        app.preview_request_in_flight = true;
+        response_tx
+            .send(super::PreviewResponse {
+                request_id: 9,
+                key: preview_key("/tmp/preview.png"),
+                image: Err(anyhow::anyhow!("failed")),
+            })
+            .expect("send response");
+        drop(response_tx);
+
+        app.drain_preview_updates(&ctx);
+
+        assert!(!app.preview_request_in_flight);
     }
 }

@@ -19,7 +19,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     symbols::border,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph as Para, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph as Para, Wrap},
     Frame, Terminal,
 };
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol, Resize, StatefulImage};
@@ -30,14 +30,16 @@ use std::{
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::backend::hyprpaper::get_active_wallpaper_assignments_if_supported;
 use crate::backend::{
-    apply_random_plan, disable_rotation_service, enable_rotation_service, get_monitors,
-    get_rotation_service_status, install_rotation_service, plan_random_assignments,
+    apply_random_plan, disable_rotation_service, download_image_async, enable_rotation_service,
+    get_monitors, get_rotation_service_status, install_rotation_service, plan_random_assignments,
     restart_rotation_service_if_active, rotation_service_badge, rotation_service_status,
     scan_directory, set_wallpaper, set_wallpaper_for_monitor, uninstall_rotation_service,
-    RandomMode, RandomPlan, RotationServiceStatus,
+    validate_download_url, DownloadProgressEvent, DownloadRequest, RandomMode, RandomPlan,
+    RotationServiceStatus,
 };
 use crate::cache::{IndexedWallpaper, ThumbnailCache, ThumbnailProfile, WallpaperIndex};
 use crate::config::Config;
@@ -61,6 +63,9 @@ enum AppMode {
     Wallpaper,
     DisplaySelect,
     RandomMenu,
+    UrlInput,
+    DownloadPathSelect,
+    DownloadProgress,
     Search,
     IntervalEdit,
     RotationMenu,
@@ -210,6 +215,66 @@ struct IndexResponse {
     wallpapers: anyhow::Result<Vec<IndexedWallpaper>>,
 }
 
+struct DownloadWorkerRequest {
+    request_id: u64,
+    request: DownloadRequest,
+    cancel: CancellationToken,
+}
+
+struct DownloadWorkerResponse {
+    request_id: u64,
+    event: DownloadProgressEvent,
+}
+
+enum DownloadStage {
+    Running,
+    Applying,
+    Failed(String),
+    ApplyFailed(String),
+    Cancelled,
+}
+
+struct DownloadUiState {
+    final_path: Option<PathBuf>,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    stage: DownloadStage,
+}
+
+fn download_url_overlay_constraints(has_error: bool) -> Vec<Constraint> {
+    if has_error {
+        vec![
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Length(2),
+        ]
+    } else {
+        vec![Constraint::Length(3), Constraint::Length(2)]
+    }
+}
+
+fn download_progress_status_line(state: &DownloadUiState) -> String {
+    match &state.stage {
+        DownloadStage::Running => {
+            if let Some(total_bytes) = state.total_bytes {
+                format!(
+                    "Downloaded {} of {}",
+                    format_file_size(state.downloaded_bytes),
+                    format_file_size(total_bytes)
+                )
+            } else {
+                format!("Downloaded {}", format_file_size(state.downloaded_bytes))
+            }
+        }
+        DownloadStage::Applying => "Applying wallpaper...".to_string(),
+        DownloadStage::Failed(message) => format!("Download failed: {message}"),
+        DownloadStage::ApplyFailed(message) => {
+            format!("Saved image, but applying wallpaper failed: {message}")
+        }
+        DownloadStage::Cancelled => "Download cancelled".to_string(),
+    }
+}
+
 pub struct App {
     config: Config,
     theme: ThemeKind,
@@ -236,6 +301,10 @@ pub struct App {
     index_request_id: u64,
     index_tx: Sender<IndexRequest>,
     index_rx: Receiver<IndexResponse>,
+    download_request_id: u64,
+    download_tx: Sender<DownloadWorkerRequest>,
+    download_rx: Receiver<DownloadWorkerResponse>,
+    download_cancel_token: Option<CancellationToken>,
     search_buffer: String,
     search_before_open: String,
     interval_buffer: String,
@@ -256,6 +325,12 @@ pub struct App {
     rotation_filter: String,
     dir_suggestions: Vec<PathBuf>,
     suggestion_state: ListState,
+    download_url_buffer: String,
+    download_error: Option<String>,
+    download_path_state: ListState,
+    last_download_path_selection: Option<usize>,
+    download_state: Option<DownloadUiState>,
+    pending_downloaded_path: Option<PathBuf>,
 }
 
 impl App {
@@ -289,6 +364,7 @@ impl App {
         let (preview_tx, preview_rx) = spawn_preview_worker(picker, thumbnail_cache.clone());
         let prewarm_tx = spawn_prewarm_worker(thumbnail_cache);
         let (index_tx, index_rx) = spawn_index_worker(WallpaperIndex::new()?);
+        let (download_tx, download_rx) = spawn_download_worker();
 
         let mut app = Self {
             config,
@@ -316,6 +392,10 @@ impl App {
             index_request_id: 0,
             index_tx,
             index_rx,
+            download_request_id: 0,
+            download_tx,
+            download_rx,
+            download_cancel_token: None,
             search_buffer: String::new(),
             search_before_open: String::new(),
             interval_buffer: String::new(),
@@ -336,6 +416,12 @@ impl App {
             rotation_filter: String::new(),
             dir_suggestions: vec![],
             suggestion_state,
+            download_url_buffer: String::new(),
+            download_error: None,
+            download_path_state: ListState::default(),
+            last_download_path_selection: None,
+            download_state: None,
+            pending_downloaded_path: None,
         };
 
         app.rebuild_section_cache();
@@ -407,6 +493,7 @@ impl App {
         loop {
             self.drain_preview_updates();
             self.drain_index_updates();
+            self.drain_download_updates();
             terminal.draw(|f| self.ui(f))?;
 
             if event::poll(std::time::Duration::from_millis(16))? {
@@ -417,6 +504,11 @@ impl App {
                             AppMode::PathManage => self.handle_path_manage_key(key.code),
                             AppMode::DisplaySelect => self.handle_display_select_key(key.code),
                             AppMode::RandomMenu => self.handle_random_menu_key(key.code),
+                            AppMode::UrlInput => self.handle_url_input_key(key.code),
+                            AppMode::DownloadPathSelect => self.handle_download_path_key(key.code),
+                            AppMode::DownloadProgress => {
+                                self.handle_download_progress_key(key.code)
+                            }
                             AppMode::Search => self.handle_search_key(key.code),
                             AppMode::IntervalEdit => self.handle_interval_key(key.code),
                             AppMode::RotationMenu => self.handle_rotation_menu_key(key.code),
@@ -502,6 +594,7 @@ impl App {
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), KeyModifiers::NONE) | (KeyCode::Esc, _) => return Ok(true),
             (KeyCode::Char('p'), KeyModifiers::NONE) => self.mode = AppMode::PathManage,
+            (KeyCode::Char('u'), KeyModifiers::NONE) => self.open_url_input(),
             (KeyCode::Char('r'), KeyModifiers::NONE) => self.toggle_rotation(),
             (KeyCode::Char('r'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.trigger_random_wallpaper()?
@@ -639,6 +732,108 @@ impl App {
         }
     }
 
+    fn handle_url_input_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => self.close_url_input(),
+            KeyCode::Enter => self.open_download_path_picker(),
+            KeyCode::Backspace => {
+                self.download_url_buffer.pop();
+                self.download_error = None;
+            }
+            KeyCode::Char(c) => {
+                self.download_url_buffer.push(c);
+                self.download_error = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_download_path_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => self.mode = AppMode::UrlInput,
+            KeyCode::Char('j') | KeyCode::Down => {
+                let len = self.config.wallpaper_paths.len();
+                if len > 0 {
+                    let index = self.download_path_state.selected().unwrap_or(0);
+                    self.download_path_state.select(Some((index + 1) % len));
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                let len = self.config.wallpaper_paths.len();
+                if len > 0 {
+                    let index = self.download_path_state.selected().unwrap_or(0);
+                    self.download_path_state.select(Some(if index == 0 {
+                        len - 1
+                    } else {
+                        index - 1
+                    }));
+                }
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                if !self.config.wallpaper_paths.is_empty() {
+                    self.download_path_state.select(Some(0));
+                }
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                if !self.config.wallpaper_paths.is_empty() {
+                    self.download_path_state
+                        .select(Some(self.config.wallpaper_paths.len() - 1));
+                }
+            }
+            KeyCode::Enter => self.start_download(),
+            _ => {}
+        }
+    }
+
+    fn handle_download_progress_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => {
+                let is_running = self
+                    .download_state
+                    .as_ref()
+                    .map(|state| matches!(state.stage, DownloadStage::Running))
+                    .unwrap_or(false);
+                let is_terminal = self
+                    .download_state
+                    .as_ref()
+                    .map(|state| {
+                        matches!(
+                            state.stage,
+                            DownloadStage::Failed(_)
+                                | DownloadStage::ApplyFailed(_)
+                                | DownloadStage::Cancelled
+                        )
+                    })
+                    .unwrap_or(false);
+                if is_running {
+                    if let Some(cancel_token) = self.download_cancel_token.take() {
+                        cancel_token.cancel();
+                    }
+                } else if is_terminal {
+                    self.finish_download_overlay();
+                }
+            }
+            KeyCode::Enter => {
+                let is_terminal = self
+                    .download_state
+                    .as_ref()
+                    .map(|state| {
+                        matches!(
+                            state.stage,
+                            DownloadStage::Failed(_)
+                                | DownloadStage::ApplyFailed(_)
+                                | DownloadStage::Cancelled
+                        )
+                    })
+                    .unwrap_or(false);
+                if is_terminal {
+                    self.finish_download_overlay();
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_theme_select_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::Esc | KeyCode::Char('q') => self.cancel_theme_picker(),
@@ -690,6 +885,9 @@ impl App {
             }
             AppMode::DisplaySelect => {}
             AppMode::RandomMenu => {}
+            AppMode::UrlInput => {}
+            AppMode::DownloadPathSelect => {}
+            AppMode::DownloadProgress => {}
             AppMode::Search => {}
             AppMode::IntervalEdit => {}
             AppMode::RotationMenu => {}
@@ -745,6 +943,9 @@ impl App {
                     self.random_menu_state.select(Some((index + 1) % len));
                 }
             }
+            AppMode::UrlInput => {}
+            AppMode::DownloadPathSelect => {}
+            AppMode::DownloadProgress => {}
             AppMode::Search => {}
             AppMode::IntervalEdit => {}
             AppMode::RotationMenu => {
@@ -819,6 +1020,9 @@ impl App {
                     }));
                 }
             }
+            AppMode::UrlInput => {}
+            AppMode::DownloadPathSelect => {}
+            AppMode::DownloadProgress => {}
             AppMode::Search => {}
             AppMode::IntervalEdit => {}
             AppMode::RotationMenu => {
@@ -864,6 +1068,9 @@ impl App {
                     self.random_menu_state.select(Some(0));
                 }
             }
+            AppMode::UrlInput => {}
+            AppMode::DownloadPathSelect => {}
+            AppMode::DownloadProgress => {}
             AppMode::Search => {}
             AppMode::IntervalEdit => {}
             AppMode::RotationMenu => self.rotation_menu_state.select(Some(0)),
@@ -910,6 +1117,9 @@ impl App {
                         .select(Some(self.random_targets.len() - 1));
                 }
             }
+            AppMode::UrlInput => {}
+            AppMode::DownloadPathSelect => {}
+            AppMode::DownloadProgress => {}
             AppMode::Search => {}
             AppMode::IntervalEdit => {}
             AppMode::RotationMenu => {
@@ -975,6 +1185,84 @@ impl App {
         self.search_buffer = self.active_filter().to_string();
         self.search_before_open = self.search_buffer.clone();
         self.mode = AppMode::Search;
+    }
+
+    fn open_url_input(&mut self) {
+        self.download_error = None;
+        self.mode = AppMode::UrlInput;
+    }
+
+    fn close_url_input(&mut self) {
+        self.download_error = None;
+        self.mode = AppMode::Wallpaper;
+    }
+
+    fn open_download_path_picker(&mut self) {
+        match validate_download_url(&self.download_url_buffer) {
+            Ok(_) => {}
+            Err(error) => {
+                self.download_error = Some(error.to_string());
+                return;
+            }
+        }
+
+        if self.config.wallpaper_paths.is_empty() {
+            self.download_error =
+                Some("No wallpaper paths configured. Add a path first with 'p'.".to_string());
+            return;
+        }
+
+        let selection = self
+            .last_download_path_selection
+            .filter(|index| *index < self.config.wallpaper_paths.len())
+            .or(Some(0));
+        self.download_path_state.select(selection);
+        self.download_error = None;
+        self.mode = AppMode::DownloadPathSelect;
+    }
+
+    fn start_download(&mut self) {
+        let Some(index) = self.download_path_state.selected() else {
+            return;
+        };
+        let Some(destination_dir) = self.config.wallpaper_paths.get(index).cloned() else {
+            return;
+        };
+
+        self.last_download_path_selection = Some(index);
+        self.download_request_id = self.download_request_id.wrapping_add(1);
+        let cancel = CancellationToken::new();
+        self.download_cancel_token = Some(cancel.clone());
+        self.download_state = Some(DownloadUiState {
+            final_path: None,
+            downloaded_bytes: 0,
+            total_bytes: None,
+            stage: DownloadStage::Running,
+        });
+
+        if let Err(send_error) = self.download_tx.send(DownloadWorkerRequest {
+            request_id: self.download_request_id,
+            request: DownloadRequest {
+                url: self.download_url_buffer.trim().to_string(),
+                destination_dir,
+            },
+            cancel,
+        }) {
+            error!("failed to send download request to worker: {send_error}");
+            self.download_cancel_token = None;
+            self.download_state = None;
+            self.download_error = Some("Failed to start download. Please try again.".to_string());
+            self.mode = AppMode::UrlInput;
+            return;
+        }
+        self.mode = AppMode::DownloadProgress;
+    }
+
+    fn finish_download_overlay(&mut self) {
+        self.download_cancel_token = None;
+        self.download_state = None;
+        self.download_error = None;
+        self.mode = AppMode::Wallpaper;
     }
 
     fn open_interval_editor(&mut self) {
@@ -1236,6 +1524,84 @@ impl App {
         self.all_state.select(Some(selected));
     }
 
+    fn select_downloaded_wallpaper_in_all(&mut self) -> bool {
+        let Some(path) = self.pending_downloaded_path.clone() else {
+            return false;
+        };
+
+        let all_indices = self.section_indices(SectionKind::All);
+        let Some(selected) = all_indices.iter().position(|index| {
+            self.wallpapers
+                .get(*index)
+                .map(|wallpaper| wallpaper.path == path)
+                .unwrap_or(false)
+        }) else {
+            return false;
+        };
+
+        self.active_section = SectionKind::All;
+        self.all_state.select(Some(selected));
+        self.pending_downloaded_path = None;
+        true
+    }
+
+    fn handle_download_event(&mut self, event: DownloadProgressEvent) {
+        match event {
+            DownloadProgressEvent::Started {
+                final_path,
+                total_bytes,
+            } => {
+                self.download_state = Some(DownloadUiState {
+                    final_path: Some(final_path),
+                    downloaded_bytes: 0,
+                    total_bytes,
+                    stage: DownloadStage::Running,
+                });
+            }
+            DownloadProgressEvent::Advanced {
+                downloaded_bytes,
+                total_bytes,
+            } => {
+                if let Some(state) = self.download_state.as_mut() {
+                    state.downloaded_bytes = downloaded_bytes;
+                    state.total_bytes = total_bytes;
+                }
+            }
+            DownloadProgressEvent::Finished { saved_path } => {
+                self.download_cancel_token = None;
+                self.pending_downloaded_path = Some(saved_path.clone());
+                self.request_index_refresh();
+                if let Some(state) = self.download_state.as_mut() {
+                    state.final_path = Some(saved_path.clone());
+                    state.stage = DownloadStage::Applying;
+                }
+                if let Err(error) = self.apply_downloaded_wallpaper(saved_path) {
+                    if let Some(state) = self.download_state.as_mut() {
+                        state.stage = DownloadStage::ApplyFailed(error.to_string());
+                    }
+                } else {
+                    self.download_state = None;
+                    self.download_error = None;
+                    if self.mode == AppMode::DownloadProgress {
+                        self.mode = AppMode::Wallpaper;
+                    }
+                }
+            }
+            DownloadProgressEvent::Failed { message } => {
+                self.download_cancel_token = None;
+                if let Some(state) = self.download_state.as_mut() {
+                    state.stage = DownloadStage::Failed(message);
+                }
+            }
+            DownloadProgressEvent::Cancelled => {
+                self.download_cancel_token = None;
+                if let Some(state) = self.download_state.as_mut() {
+                    state.stage = DownloadStage::Cancelled;
+                }
+            }
+        }
+    }
+
     fn update_suggestions(&mut self) {
         self.dir_suggestions = if self.input_buffer.is_empty() {
             vec![
@@ -1394,6 +1760,9 @@ impl App {
             AppMode::Wallpaper
             | AppMode::DisplaySelect
             | AppMode::RandomMenu
+            | AppMode::UrlInput
+            | AppMode::DownloadPathSelect
+            | AppMode::DownloadProgress
             | AppMode::Search
             | AppMode::IntervalEdit
             | AppMode::RotationMenu
@@ -1420,6 +1789,13 @@ impl App {
                         self.render_display_select_overlay(frame, chunks[0], theme)
                     }
                     AppMode::RandomMenu => self.render_random_menu_overlay(frame, chunks[0], theme),
+                    AppMode::UrlInput => self.render_url_input_overlay(frame, chunks[0], theme),
+                    AppMode::DownloadPathSelect => {
+                        self.render_download_path_overlay(frame, chunks[0], theme)
+                    }
+                    AppMode::DownloadProgress => {
+                        self.render_download_progress_overlay(frame, chunks[0], theme)
+                    }
                     AppMode::Search => self.render_search_overlay(frame, chunks[0], theme),
                     AppMode::IntervalEdit => self.render_interval_overlay(frame, chunks[0], theme),
                     AppMode::RotationMenu => {
@@ -1749,6 +2125,15 @@ impl App {
             AppMode::RandomMenu => {
                 vec![("↑/↓", "choose"), ("Enter", "apply"), ("Esc", "close")]
             }
+            AppMode::UrlInput => {
+                vec![("Type", "URL"), ("Enter", "save to"), ("Esc", "cancel")]
+            }
+            AppMode::DownloadPathSelect => {
+                vec![("↑/↓", "choose"), ("Enter", "download"), ("Esc", "back")]
+            }
+            AppMode::DownloadProgress => {
+                vec![("Esc", "cancel/close"), ("Enter", "close result")]
+            }
             AppMode::Search => vec![("Type", "filter"), ("Enter", "confirm"), ("Esc", "cancel")],
             AppMode::IntervalEdit => {
                 vec![("Type", "seconds"), ("Enter", "save"), ("Esc", "cancel")]
@@ -1770,6 +2155,7 @@ impl App {
                 ("r", "rotate"),
                 ("R", "rotation options"),
                 ("Ctrl+r", "random/options"),
+                ("u", "download and save"),
                 ("p", "paths"),
             ],
         };
@@ -1808,6 +2194,210 @@ impl App {
         .block(self.themed_block(" Filter Active Section ", theme))
         .alignment(Alignment::Left);
         self.render_popup(frame, popup, theme, input);
+    }
+
+    fn render_url_input_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
+        let popup = centered_rect(70, 8, area);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(Block::default().style(theme.surface), popup);
+
+        let block = self
+            .themed_block(" Download and Save ", theme)
+            .style(theme.surface);
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+
+        let constraints = download_url_overlay_constraints(self.download_error.is_some());
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(inner);
+
+        let cursor = if self.download_url_buffer.is_empty() {
+            "_"
+        } else {
+            ""
+        };
+        frame.render_widget(
+            Para::new(Line::from(vec![
+                Span::styled("URL: ", theme.key),
+                Span::styled(
+                    format!("{}{}", self.download_url_buffer, cursor),
+                    if self.download_url_buffer.is_empty() {
+                        theme.placeholder
+                    } else {
+                        theme.accent
+                    },
+                ),
+            ]))
+            .block(self.themed_block(" Input ", theme))
+            .alignment(Alignment::Left),
+            sections[0],
+        );
+
+        if let Some(error) = &self.download_error {
+            frame.render_widget(
+                Para::new(Line::from(Span::styled(error.clone(), theme.highlight)))
+                    .alignment(Alignment::Left),
+                sections[1],
+            );
+            frame.render_widget(
+                Para::new(vec![
+                    Line::from(Span::styled(
+                        "Enter opens the save destination picker.",
+                        theme.muted,
+                    )),
+                    Line::from(Span::styled("Esc cancels.", theme.key)),
+                ])
+                .alignment(Alignment::Left),
+                sections[2],
+            );
+            return;
+        }
+
+        frame.render_widget(
+            Para::new(vec![
+                Line::from(Span::styled(
+                    "Enter opens the save destination picker.",
+                    theme.muted,
+                )),
+                Line::from(Span::styled("Esc cancels.", theme.key)),
+            ])
+            .alignment(Alignment::Left),
+            sections[1],
+        );
+    }
+
+    fn render_download_path_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
+        let popup_height = (self.config.wallpaper_paths.len() as u16 + 6).max(8);
+        let popup = centered_rect(70, popup_height, area);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(Block::default().style(theme.surface), popup);
+
+        let block = self
+            .themed_block(" Save Downloaded Image To ", theme)
+            .style(theme.surface);
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(inner);
+
+        frame.render_widget(
+            Para::new(vec![
+                Line::from(Span::styled(
+                    "Choose one configured wallpaper path.",
+                    theme.muted,
+                )),
+                Line::from(Span::styled("Esc returns to URL entry.", theme.key)),
+            ])
+            .alignment(Alignment::Left),
+            sections[0],
+        );
+
+        let selected = self.download_path_state.selected();
+        let items = self
+            .config
+            .wallpaper_paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let style = if selected == Some(index) {
+                    theme.highlight
+                } else {
+                    theme.accent
+                };
+                ListItem::new(path.to_string_lossy().to_string()).style(style)
+            })
+            .collect::<Vec<_>>();
+        let mut state = self.download_path_state.clone();
+        let list = List::new(items)
+            .style(theme.surface)
+            .highlight_style(theme.highlight)
+            .highlight_symbol("› ");
+        frame.render_stateful_widget(list, sections[1], &mut state);
+    }
+
+    fn render_download_progress_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
+        let popup = centered_rect(72, 10, area);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(Block::default().style(theme.surface), popup);
+
+        let block = self
+            .themed_block(" Download Progress ", theme)
+            .style(theme.surface);
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+
+        let Some(state) = self.download_state.as_ref() else {
+            return;
+        };
+        let final_path = state
+            .final_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Preparing download...".to_string());
+        let status_line = download_progress_status_line(state);
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(2),
+                Constraint::Length(2),
+                Constraint::Min(0),
+            ])
+            .split(inner);
+
+        frame.render_widget(
+            Para::new(Line::from(vec![
+                Span::styled("File: ", theme.key),
+                Span::styled(final_path, theme.accent),
+            ])),
+            sections[0],
+        );
+        frame.render_widget(
+            Para::new(Line::from(Span::styled(status_line, theme.accent))),
+            sections[1],
+        );
+
+        if let Some(total_bytes) = state.total_bytes {
+            let ratio = if total_bytes == 0 {
+                0.0
+            } else {
+                state.downloaded_bytes as f64 / total_bytes as f64
+            };
+            frame.render_widget(
+                Gauge::default()
+                    .block(self.themed_block(" Progress ", theme))
+                    .ratio(ratio.clamp(0.0, 1.0))
+                    .gauge_style(theme.highlight)
+                    .label(format!("{:.0}%", ratio.clamp(0.0, 1.0) * 100.0)),
+                sections[2],
+            );
+        } else {
+            frame.render_widget(
+                Para::new(Line::from(Span::styled(
+                    "Total size unknown; download progress is shown by bytes received.",
+                    theme.muted,
+                ))),
+                sections[2],
+            );
+        }
+
+        let footer = match state.stage {
+            DownloadStage::Running => "Esc cancels the active download.",
+            DownloadStage::Applying => "Applying the downloaded wallpaper...",
+            DownloadStage::Failed(_) | DownloadStage::ApplyFailed(_) | DownloadStage::Cancelled => {
+                "Enter or Esc closes this dialog."
+            }
+        };
+        frame.render_widget(
+            Para::new(Line::from(Span::styled(footer, theme.key))),
+            sections[3],
+        );
     }
 
     fn render_interval_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
@@ -1991,15 +2581,16 @@ impl App {
     }
 
     fn render_keybindings_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
-        let popup = centered_rect(72, 13, area);
+        let popup = centered_rect(72, 14, area);
         let pairs = [
             (("Move", "↑/↓ or j/k"), ("Sections", "Tab/l, S-Tab/h")),
             (("Apply", "Enter / popup"), ("All Displays", "A")),
             (("Random", "Ctrl+r / popup"), ("Rotation", "r")),
-            (("Rotation Options", "R"), ("Interval", "i")),
-            (("Sort", "s"), ("Filter", "/")),
-            (("Paths", "p"), ("Theme", "t")),
-            (("Keybindings", "?"), ("Quit", "q / Esc")),
+            (("Download and save", "u"), ("Rotation Options", "R")),
+            (("Interval", "i"), ("Filter", "/")),
+            (("Sort", "s"), ("Paths", "p")),
+            (("Theme", "t"), ("Keybindings", "?")),
+            (("Quit", "q / Esc"), ("", "")),
         ];
         let left_label_width = pairs
             .iter()
@@ -2173,9 +2764,23 @@ impl App {
                         self.wallpapers = wallpapers;
                         self.rebuild_section_cache();
                         self.ensure_section_selection();
-                        self.select_active_wallpaper_in_all();
+                        if !self.select_downloaded_wallpaper_in_all() {
+                            self.select_active_wallpaper_in_all();
+                        }
                         self.request_preview_load();
                     }
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn drain_download_updates(&mut self) {
+        loop {
+            match self.download_rx.try_recv() {
+                Ok(response) if response.request_id == self.download_request_id => {
+                    self.handle_download_event(response.event);
                 }
                 Ok(_) => {}
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
@@ -2191,6 +2796,19 @@ impl App {
             self.apply_wallpaper_to_all_displays(&path)?;
         }
         Ok(())
+    }
+
+    fn apply_downloaded_wallpaper(&mut self, path: PathBuf) -> anyhow::Result<()> {
+        match wallpaper_apply_action(&get_monitors()) {
+            WallpaperApplyAction::ErrorNoMonitors => Err(anyhow::anyhow!("No monitors found")),
+            WallpaperApplyAction::ApplyToSingleDisplay(monitor_name) => {
+                self.apply_wallpaper_to_single_display(&monitor_name, &path)
+            }
+            WallpaperApplyAction::OpenDisplayPicker(monitor_names) => {
+                self.open_display_picker(monitor_names, path);
+                Ok(())
+            }
+        }
     }
 
     fn apply_wallpaper_on_enter(&mut self) -> anyhow::Result<()> {
@@ -2374,6 +2992,47 @@ fn spawn_index_worker(index: WallpaperIndex) -> (Sender<IndexRequest>, Receiver<
     (request_tx, response_rx)
 }
 
+fn spawn_download_worker() -> (
+    Sender<DownloadWorkerRequest>,
+    Receiver<DownloadWorkerResponse>,
+) {
+    let (request_tx, request_rx) = mpsc::channel::<DownloadWorkerRequest>();
+    let (response_tx, response_rx) = mpsc::channel::<DownloadWorkerResponse>();
+
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build download runtime");
+        while let Ok(request) = request_rx.recv() {
+            let progress_tx = response_tx.clone();
+            let request_id = request.request_id;
+            let _ = runtime.block_on(download_image_async(
+                request.request,
+                &progress_tx_to_worker(request_id, progress_tx),
+                request.cancel,
+            ));
+        }
+    });
+
+    (request_tx, response_rx)
+}
+
+fn progress_tx_to_worker(
+    request_id: u64,
+    response_tx: Sender<DownloadWorkerResponse>,
+) -> Sender<DownloadProgressEvent> {
+    let (progress_tx, progress_rx) = mpsc::channel::<DownloadProgressEvent>();
+
+    thread::spawn(move || {
+        while let Ok(event) = progress_rx.recv() {
+            let _ = response_tx.send(DownloadWorkerResponse { request_id, event });
+        }
+    });
+
+    progress_tx
+}
+
 fn spawn_preview_worker(
     picker: Picker,
     thumbnail_cache: Option<ThumbnailCache>,
@@ -2550,11 +3209,13 @@ fn wallpaper_marker_prefix(is_active: bool) -> String {
 #[cfg(test)]
 mod marker_tests {
     use super::{
+        download_progress_status_line, download_url_overlay_constraints,
         normalized_section_selection, rotation_section_message,
-        sync_random_plan_into_active_wallpaper_state, wallpaper_marker_prefix, RotationMenuAction,
-        RotationServiceStatus,
+        sync_random_plan_into_active_wallpaper_state, wallpaper_marker_prefix, DownloadStage,
+        DownloadUiState, RotationMenuAction, RotationServiceStatus,
     };
     use crate::backend::{random::RandomAssignment, RandomMode, RandomPlan};
+    use ratatui::layout::Constraint;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
@@ -2674,6 +3335,29 @@ mod marker_tests {
                 PathBuf::from("/wallpapers/gamma.jpg"),
                 PathBuf::from("/wallpapers/beta.jpg"),
             ])
+        );
+    }
+
+    #[test]
+    fn download_url_overlay_uses_visible_help_row_without_error() {
+        assert_eq!(
+            download_url_overlay_constraints(false),
+            vec![Constraint::Length(3), Constraint::Length(2)]
+        );
+    }
+
+    #[test]
+    fn download_progress_status_line_distinguishes_apply_failures() {
+        let state = DownloadUiState {
+            final_path: Some(PathBuf::from("/tmp/wallpaper.jpg")),
+            downloaded_bytes: 128,
+            total_bytes: Some(256),
+            stage: DownloadStage::ApplyFailed("No monitors found".to_string()),
+        };
+
+        assert_eq!(
+            download_progress_status_line(&state),
+            "Saved image, but applying wallpaper failed: No monitors found"
         );
     }
 }

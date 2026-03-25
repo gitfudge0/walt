@@ -1,6 +1,6 @@
 [package]
 name = "walt"
-version = "0.9.5"
+version = "0.10.0"
 edition = "2021"
 license = "MIT"
 description = "Wallpaper manager for Hyprland with TUI and GUI interfaces"
@@ -31,6 +31,10 @@ anyhow = "1.0"
 rand = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 log = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+percent-encoding = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [profile.release]
 opt-level = 3

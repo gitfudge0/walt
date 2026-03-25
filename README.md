@@ -8,6 +8,7 @@ Walt is a wallpaper manager for Hyprland with both a terminal UI and a native de
 - Preview wallpapers before switching
 - Manage multi-display wallpaper assignment
 - Apply random wallpapers from the app or CLI
+- Download and save wallpapers from direct image URLs in both the TUI and GUI
 - Control a background rotation service
 - Manage wallpaper directories and themes
 
@@ -40,6 +41,7 @@ walt
   - native desktop window
   - larger visual preview
   - better for pointer-driven browsing and dialogs
+  - toolbar button and `u` shortcut for direct image downloads
 
 ![Walt GUI screenshot](assets/screenshot-gui.png)
 
@@ -178,6 +180,7 @@ Walt ships with a native `egui` desktop interface alongside the original TUI. Th
 - wallpaper browsing and large preview
 - multi-display apply flows
 - random wallpaper actions
+- direct image URL download-and-save flow
 - rotation service controls
 - wallpaper path management
 - uninstall flow
@@ -272,6 +275,7 @@ Walt opens with the current wallpaper selected in the `All` list when it is alre
 - `s` toggle sort for the active section between name and modification date
 - `r` add or remove the selected wallpaper from the manual rotation list
 - `Ctrl+r` apply a random wallpaper directly when one display is detected, or open random options when multiple displays are detected
+- `u` download and save an image from a direct URL into a configured wallpaper path, then apply it
 - `R` open the rotation options for service actions, wallpaper scope, and display mode
 - `All displays` in the display picker applies the selected wallpaper to every display from inside the popup
 - `i` change the interval used by the installed rotation service
@@ -284,7 +288,7 @@ Walt opens with the current wallpaper selected in the `All` list when it is alre
 
 ### Popup Controls
 
-The TUI uses focused popups for display selection, random options, rotation controls, path management, and theme selection.
+The TUI uses focused popups for display selection, random options, URL downloads, rotation controls, path management, and theme selection.
 
 ### Display picker
 
@@ -305,6 +309,15 @@ The TUI uses focused popups for display selection, random options, rotation cont
 - `↑/↓` or `j/k` move
 - `Enter` apply
 - `Esc` or `q` close
+
+### URL download
+
+- Open with `u`
+- First enter a direct `http://` or `https://` image URL
+- Then choose one configured wallpaper path as the save destination
+- The progress popup shows bytes received and a progress bar when the server reports total size
+- `Esc` cancels an active download, or closes the result popup after a failure/cancel
+- After a successful save, Walt applies the downloaded image using the normal single-display or multi-display apply flow
 
 ### Rotation options
 

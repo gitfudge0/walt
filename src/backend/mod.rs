@@ -1,9 +1,13 @@
+pub mod download;
 pub mod hyprpaper;
 pub mod random;
 pub mod rotation;
 pub mod scanner;
 pub mod uninstall;
 
+pub use download::{
+    download_image_async, validate_download_url, DownloadProgressEvent, DownloadRequest,
+};
 #[allow(unused_imports)]
 pub use hyprpaper::{
     get_active_wallpapers, get_monitors, set_wallpaper, set_wallpaper_for_monitor,
