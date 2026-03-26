@@ -159,7 +159,7 @@ pub(crate) fn interactive_row<R>(
     height: f32,
     add_contents: impl FnOnce(&mut Ui, Rect, &Response) -> R,
 ) -> (Response, R) {
-    let width = ui.available_width();
+    let width = finite_width(ui.available_width());
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
     let id = ui.make_persistent_id(id_source);
     let inner_rect = rect.shrink2(egui::vec2(0.0, 1.0));
@@ -172,6 +172,14 @@ pub(crate) fn interactive_row<R>(
     let result = add_contents(&mut child, inner_rect, &preview_response);
     let response = ui.interact(rect, id, Sense::click());
     (response, result)
+}
+
+fn finite_width(width: f32) -> f32 {
+    if width.is_finite() {
+        width.max(1.0)
+    } else {
+        1.0
+    }
 }
 
 pub(crate) fn show_popup_shell(
