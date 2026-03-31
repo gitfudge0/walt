@@ -15,7 +15,9 @@ use log::error;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    backend::hyprpaper::get_active_wallpaper_assignments_if_supported,
+    backend::hyprpaper::{
+        get_active_wallpaper_assignments_if_supported, hyprpaper_compatibility_notice,
+    },
     backend::{
         apply_random_plan, disable_rotation_service, download_image_async, enable_rotation_service,
         format_rotation_service_status, get_monitors, get_rotation_service_status,
@@ -327,6 +329,7 @@ impl GuiApp {
         app.refresh_active_wallpapers(true);
         app.select_active_wallpaper_in_all();
         app.refresh_rotation_status();
+        app.show_hyprpaper_compatibility_notice();
         install_editorial_mono(&cc.egui_ctx);
         app.apply_visuals(&cc.egui_ctx);
         if !app.config.is_empty() {
@@ -430,6 +433,12 @@ impl GuiApp {
         let message = message.into();
         log::info!("gui info: {message}");
         self.push_toast(ToastKind::Info, message);
+    }
+
+    fn show_hyprpaper_compatibility_notice(&mut self) {
+        if let Some(message) = hyprpaper_compatibility_notice() {
+            self.info(message);
+        }
     }
 
     fn success(&mut self, message: impl Into<String>) {
@@ -630,7 +639,11 @@ impl GuiApp {
         let preview_path = self
             .thumbnail_cache
             .as_ref()
-            .and_then(|cache| cache.generate_thumbnail(path, ThumbnailProfile::GuiList).ok())
+            .and_then(|cache| {
+                cache
+                    .generate_thumbnail(path, ThumbnailProfile::GuiList)
+                    .ok()
+            })
             .unwrap_or_else(|| path.clone());
         let rgba = image::open(&preview_path).ok()?.to_rgba8();
         let width = usize::try_from(rgba.width()).ok()?;
@@ -1205,6 +1218,7 @@ impl GuiApp {
             active_wallpaper_paths_from_assignments(&self.active_wallpaper_assignments);
         self.refresh_active_wallpapers(false);
         self.sync_selection_with_random_plan(&plan);
+        self.show_hyprpaper_compatibility_notice();
 
         if let Some(assignment) = plan.assignments.first() {
             if matches!(plan.mode, RandomMode::DifferentAll) {
@@ -1296,6 +1310,7 @@ impl GuiApp {
             active_wallpaper_paths_from_assignments(&self.active_wallpaper_assignments);
         self.refresh_active_wallpapers(false);
         self.success(format!("Wallpaper set on {monitor_name}: {path_str}"));
+        self.show_hyprpaper_compatibility_notice();
         Ok(())
     }
 
@@ -1313,6 +1328,7 @@ impl GuiApp {
             active_wallpaper_paths_from_assignments(&self.active_wallpaper_assignments);
         self.refresh_active_wallpapers(false);
         self.success(format!("Wallpaper set on all displays: {path_str}"));
+        self.show_hyprpaper_compatibility_notice();
         Ok(())
     }
 
@@ -1888,113 +1904,116 @@ impl GuiApp {
         let columns = ((total_width + spacing) / (min_card_width + spacing))
             .floor()
             .max(1.0) as usize;
-        let card_width =
-            ((total_width - spacing * (columns.saturating_sub(1)) as f32) / columns as f32)
-                .max(min_card_width);
+        let card_width = ((total_width - spacing * (columns.saturating_sub(1)) as f32)
+            / columns as f32)
+            .max(min_card_width);
         let image_height = (card_width * 9.0 / 16.0).max(124.0);
         let card_height = image_height + 56.0;
 
-        ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(spacing, spacing);
-            ui.horizontal_wrapped(|ui| {
-                for (row, index) in indices.iter().copied().enumerate() {
-                    let Some(wallpaper) = self.wallpapers.get(index).cloned() else {
-                        continue;
-                    };
-                    let selected = self.selected_index(self.active_section) == Some(row);
-                    let badges = wallpaper_badges(
-                        self.active_wallpaper_paths.contains(&wallpaper.path),
-                        self.rotation_paths.contains(&wallpaper.path),
-                    );
-                    let (rect, response) = ui.allocate_exact_size(
-                        egui::vec2(card_width, card_height),
-                        egui::Sense::click(),
-                    );
-                    ui.painter().rect(
-                        rect,
-                        0.0,
-                        if selected {
-                            palette.surface_alt
-                        } else {
-                            palette.surface
-                        },
-                        Stroke::new(
-                            1.0,
+        ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(spacing, spacing);
+                ui.horizontal_wrapped(|ui| {
+                    for (row, index) in indices.iter().copied().enumerate() {
+                        let Some(wallpaper) = self.wallpapers.get(index).cloned() else {
+                            continue;
+                        };
+                        let selected = self.selected_index(self.active_section) == Some(row);
+                        let badges = wallpaper_badges(
+                            self.active_wallpaper_paths.contains(&wallpaper.path),
+                            self.rotation_paths.contains(&wallpaper.path),
+                        );
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::vec2(card_width, card_height),
+                            egui::Sense::click(),
+                        );
+                        ui.painter().rect(
+                            rect,
+                            0.0,
                             if selected {
-                                palette.highlight
+                                palette.surface_alt
                             } else {
-                                palette.border
+                                palette.surface
                             },
-                        ),
-                        egui::StrokeKind::Outside,
-                    );
-
-                    let inner_rect = rect.shrink2(egui::vec2(10.0, 10.0));
-                    let mut child = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(inner_rect)
-                            .layout(egui::Layout::top_down(Align::Min)),
-                    );
-                    let image_size = egui::vec2(inner_rect.width(), image_height.min(inner_rect.height()));
-                    if let Some(texture) = self.gallery_texture(ui.ctx(), &wallpaper.path) {
-                        let size = fit_size(texture.size_vec2(), image_size);
-                        ui.put(
-                            egui::Rect::from_min_size(
-                                egui::pos2(
-                                    inner_rect.center().x - size.x * 0.5,
-                                    inner_rect.top() + (image_size.y - size.y) * 0.5,
-                                ),
-                                size,
+                            Stroke::new(
+                                1.0,
+                                if selected {
+                                    palette.highlight
+                                } else {
+                                    palette.border
+                                },
                             ),
-                            egui::Image::new(&texture).fit_to_exact_size(size),
+                            egui::StrokeKind::Outside,
                         );
-                    } else {
-                        child.allocate_ui_with_layout(
-                            image_size,
-                            egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                            |ui| {
-                                ui.label(GuiTypography::rich(
-                                    GuiTextRole::BodyMuted,
-                                    "Preview unavailable",
-                                    palette,
-                                ));
-                            },
+
+                        let inner_rect = rect.shrink2(egui::vec2(10.0, 10.0));
+                        let mut child = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(inner_rect)
+                                .layout(egui::Layout::top_down(Align::Min)),
                         );
-                    }
+                        let image_size =
+                            egui::vec2(inner_rect.width(), image_height.min(inner_rect.height()));
+                        if let Some(texture) = self.gallery_texture(ui.ctx(), &wallpaper.path) {
+                            let size = fit_size(texture.size_vec2(), image_size);
+                            ui.put(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(
+                                        inner_rect.center().x - size.x * 0.5,
+                                        inner_rect.top() + (image_size.y - size.y) * 0.5,
+                                    ),
+                                    size,
+                                ),
+                                egui::Image::new(&texture).fit_to_exact_size(size),
+                            );
+                        } else {
+                            child.allocate_ui_with_layout(
+                                image_size,
+                                egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                                |ui| {
+                                    ui.label(GuiTypography::rich(
+                                        GuiTextRole::BodyMuted,
+                                        "Preview unavailable",
+                                        palette,
+                                    ));
+                                },
+                            );
+                        }
 
-                    child.add_space(image_height + 6.0);
-                    child.label(
-                        GuiTypography::rich_color(
-                            GuiTextRole::ListItem,
-                            wallpaper.name,
-                            if selected {
-                                palette.highlight
-                            } else {
-                                palette.text
-                            },
-                        )
-                        .strong(),
-                    );
-                    if !badges.is_empty() {
-                        child.label(GuiTypography::rich(
-                            GuiTextRole::ListBadge,
-                            badges,
-                            palette,
-                        ));
-                    }
+                        child.add_space(image_height + 6.0);
+                        child.label(
+                            GuiTypography::rich_color(
+                                GuiTextRole::ListItem,
+                                wallpaper.name,
+                                if selected {
+                                    palette.highlight
+                                } else {
+                                    palette.text
+                                },
+                            )
+                            .strong(),
+                        );
+                        if !badges.is_empty() {
+                            child.label(GuiTypography::rich(
+                                GuiTextRole::ListBadge,
+                                badges,
+                                palette,
+                            ));
+                        }
 
-                    if response.clicked() {
-                        self.set_selected_index(self.active_section, Some(row));
-                        self.request_preview_load();
+                        if response.clicked() {
+                            self.set_selected_index(self.active_section, Some(row));
+                            self.request_preview_load();
+                        }
+                        if response.double_clicked() {
+                            self.set_selected_index(self.active_section, Some(row));
+                            self.request_preview_load();
+                            self.apply_selected_wallpaper();
+                        }
                     }
-                    if response.double_clicked() {
-                        self.set_selected_index(self.active_section, Some(row));
-                        self.request_preview_load();
-                        self.apply_selected_wallpaper();
-                    }
-                }
+                });
             });
-        });
     }
 
     fn render_preview_panel(&mut self, ui: &mut Ui) {
