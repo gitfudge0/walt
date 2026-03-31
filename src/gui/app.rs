@@ -45,13 +45,15 @@ use super::style::{
     interactive_row, show_popup_shell, GuiChrome, GuiPalette, GuiTextRole, GuiTypography,
 };
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SectionKind {
     All,
     Rotation,
 }
 
 impl SectionKind {
+    const ALL: [SectionKind; 2] = [SectionKind::All, SectionKind::Rotation];
+
     fn label(self) -> &'static str {
         match self {
             Self::All => "All",
@@ -63,6 +65,21 @@ impl SectionKind {
         match self {
             Self::All => "all",
             Self::Rotation => "rotation",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ViewMode {
+    List,
+    Gallery,
+}
+
+impl ViewMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::List => "List",
+            Self::Gallery => "Gallery",
         }
     }
 }
@@ -154,6 +171,7 @@ pub struct GuiApp {
     config: Config,
     theme: ThemeKind,
     wallpapers: Vec<IndexedWallpaper>,
+    view_mode: ViewMode,
     active_section: SectionKind,
     all_indices: Vec<usize>,
     rotation_indices: Vec<usize>,
@@ -165,6 +183,7 @@ pub struct GuiApp {
     active_wallpaper_paths: HashSet<PathBuf>,
     rotation_paths: HashSet<PathBuf>,
     texture_cache: PreviewTextures,
+    thumbnail_cache: Option<ThumbnailCache>,
     desired_preview_key: Option<PreviewKey>,
     current_preview_key: Option<PreviewKey>,
     preview_request_in_flight: bool,
@@ -229,7 +248,7 @@ impl GuiApp {
             wallpaper_index.load(&config.wallpaper_paths)
         };
         let thumbnail_cache = ThumbnailCache::new().ok();
-        let (preview_tx, preview_rx) = spawn_preview_worker(thumbnail_cache);
+        let (preview_tx, preview_rx) = spawn_preview_worker(thumbnail_cache.clone());
         let (index_tx, index_rx) = spawn_index_worker(wallpaper_index);
         let (download_tx, download_rx) = spawn_download_worker();
         let (backend_state_tx, backend_state_rx) = spawn_backend_state_worker();
@@ -239,6 +258,7 @@ impl GuiApp {
             config,
             theme,
             wallpapers,
+            view_mode: ViewMode::List,
             active_section: SectionKind::All,
             all_indices: vec![],
             rotation_indices: vec![],
@@ -250,6 +270,7 @@ impl GuiApp {
             active_wallpaper_paths: HashSet::new(),
             rotation_paths: HashSet::new(),
             texture_cache: PreviewTextures::new(),
+            thumbnail_cache,
             desired_preview_key: None,
             current_preview_key: None,
             preview_request_in_flight: false,
@@ -466,6 +487,24 @@ impl GuiApp {
         }
     }
 
+    fn set_view_mode(&mut self, view_mode: ViewMode) {
+        self.view_mode = view_mode;
+        if self.view_mode == ViewMode::List {
+            self.request_preview_load();
+        }
+    }
+
+    fn cycle_active_section(&mut self, delta: isize) {
+        let current = SectionKind::ALL
+            .iter()
+            .position(|section| *section == self.active_section)
+            .unwrap_or(0) as isize;
+        let next = (current + delta).rem_euclid(SectionKind::ALL.len() as isize) as usize;
+        self.active_section = SectionKind::ALL[next];
+        self.ensure_section_selection();
+        self.request_preview_load();
+    }
+
     fn section_is_informational(&self, section: SectionKind) -> bool {
         section == SectionKind::Rotation && self.config.uses_all_wallpapers_for_rotation()
     }
@@ -577,6 +616,31 @@ impl GuiApp {
         let next = (current + delta).clamp(0, (len - 1) as isize) as usize;
         self.set_selected_index(section, Some(next));
         self.request_preview_load();
+    }
+
+    fn gallery_texture(&mut self, ctx: &egui::Context, path: &PathBuf) -> Option<TextureHandle> {
+        let key = PreviewKey {
+            path: path.clone(),
+            profile: ThumbnailProfile::GuiList,
+        };
+        if let Some(texture) = self.texture_cache.get_cloned(&key) {
+            return Some(texture);
+        }
+
+        let preview_path = self
+            .thumbnail_cache
+            .as_ref()
+            .and_then(|cache| cache.generate_thumbnail(path, ThumbnailProfile::GuiList).ok())
+            .unwrap_or_else(|| path.clone());
+        let rgba = image::open(&preview_path).ok()?.to_rgba8();
+        let width = usize::try_from(rgba.width()).ok()?;
+        let height = usize::try_from(rgba.height()).ok()?;
+        self.texture_cache.insert(
+            ctx,
+            key.clone(),
+            egui::ColorImage::from_rgba_unmultiplied([width, height], rgba.as_raw()),
+        );
+        self.texture_cache.get_cloned(&key)
     }
 
     fn refresh_active_wallpapers(&mut self, quiet: bool) {
@@ -1416,6 +1480,12 @@ impl GuiApp {
         if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowUp)) {
             self.move_selection(-1);
         }
+        if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::CloseBracket)) {
+            self.cycle_active_section(1);
+        }
+        if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::OpenBracket)) {
+            self.cycle_active_section(-1);
+        }
         if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter)) {
             self.apply_selected_wallpaper();
         }
@@ -1585,14 +1655,45 @@ impl GuiApp {
                     ));
                 });
             });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(GuiTypography::rich(GuiTextRole::MetaLabel, "VIEW", palette));
+                for view_mode in [ViewMode::List, ViewMode::Gallery] {
+                    let selected = self.view_mode == view_mode;
+                    let text = if selected {
+                        GuiTypography::rich_color(
+                            GuiTextRole::MetaValue,
+                            view_mode.label().to_uppercase(),
+                            palette.highlight,
+                        )
+                        .strong()
+                    } else {
+                        GuiTypography::rich(
+                            GuiTextRole::MetaValue,
+                            view_mode.label().to_uppercase(),
+                            palette,
+                        )
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(text)
+                                .fill(palette.background)
+                                .stroke(Stroke::new(1.0, palette.border))
+                                .corner_radius(0.0),
+                        )
+                        .clicked()
+                    {
+                        self.set_view_mode(view_mode);
+                    }
+                }
+            });
         });
     }
 
-    fn render_sidebar(&mut self, ui: &mut Ui) {
+    fn render_section_tabs(&mut self, ui: &mut Ui) {
         let palette = self.palette();
-        section_heading(ui, "LIBRARY", palette);
         ui.horizontal_wrapped(|ui| {
-            for section in [SectionKind::All, SectionKind::Rotation] {
+            for section in SectionKind::ALL {
                 let selected = self.active_section == section;
                 let label = if section == SectionKind::Rotation {
                     let badge = self
@@ -1625,7 +1726,22 @@ impl GuiApp {
                 }
             }
         });
+    }
 
+    fn empty_section_message(&self) -> &'static str {
+        if self.filter_query(self.active_section).is_empty() {
+            match self.active_section {
+                SectionKind::All => "No wallpapers indexed yet.",
+                SectionKind::Rotation => "Rotation list is empty.",
+            }
+        } else {
+            "No matches for the current filter."
+        }
+    }
+
+    fn render_section_browser(&mut self, ui: &mut Ui) -> bool {
+        let palette = self.palette();
+        self.render_section_tabs(ui);
         subtle_rule(ui, palette);
         let changed = match self.active_section {
             SectionKind::All => {
@@ -1663,23 +1779,24 @@ impl GuiApp {
                 "Manual rotation list is preserved while rotate-all mode is enabled.",
                 palette,
             ));
-            return;
+            return true;
         }
 
+        false
+    }
+
+    fn render_sidebar(&mut self, ui: &mut Ui) {
+        let palette = self.palette();
+        section_heading(ui, "LIBRARY", palette);
+        if self.render_section_browser(ui) {
+            return;
+        }
         let indices = self.section_indices(self.active_section);
         if indices.is_empty() {
-            let message = if self.filter_query(self.active_section).is_empty() {
-                match self.active_section {
-                    SectionKind::All => "No wallpapers indexed yet.",
-                    SectionKind::Rotation => "Rotation list is empty.",
-                }
-            } else {
-                "No matches for the current filter."
-            };
             ui.add_space(24.0);
             ui.label(GuiTypography::rich(
                 GuiTextRole::BodyMuted,
-                message,
+                self.empty_section_message(),
                 palette,
             ));
             return;
@@ -1745,6 +1862,139 @@ impl GuiApp {
                 }
             },
         );
+    }
+
+    fn render_gallery(&mut self, ui: &mut Ui) {
+        let palette = self.palette();
+        section_heading(ui, "GALLERY", palette);
+        if self.render_section_browser(ui) {
+            return;
+        }
+
+        let indices = self.section_indices(self.active_section);
+        if indices.is_empty() {
+            ui.add_space(24.0);
+            ui.label(GuiTypography::rich(
+                GuiTextRole::BodyMuted,
+                self.empty_section_message(),
+                palette,
+            ));
+            return;
+        }
+
+        let spacing = 12.0;
+        let min_card_width = 220.0;
+        let total_width = ui.available_width().max(min_card_width);
+        let columns = ((total_width + spacing) / (min_card_width + spacing))
+            .floor()
+            .max(1.0) as usize;
+        let card_width =
+            ((total_width - spacing * (columns.saturating_sub(1)) as f32) / columns as f32)
+                .max(min_card_width);
+        let image_height = (card_width * 9.0 / 16.0).max(124.0);
+        let card_height = image_height + 56.0;
+
+        ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(spacing, spacing);
+            ui.horizontal_wrapped(|ui| {
+                for (row, index) in indices.iter().copied().enumerate() {
+                    let Some(wallpaper) = self.wallpapers.get(index).cloned() else {
+                        continue;
+                    };
+                    let selected = self.selected_index(self.active_section) == Some(row);
+                    let badges = wallpaper_badges(
+                        self.active_wallpaper_paths.contains(&wallpaper.path),
+                        self.rotation_paths.contains(&wallpaper.path),
+                    );
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(card_width, card_height),
+                        egui::Sense::click(),
+                    );
+                    ui.painter().rect(
+                        rect,
+                        0.0,
+                        if selected {
+                            palette.surface_alt
+                        } else {
+                            palette.surface
+                        },
+                        Stroke::new(
+                            1.0,
+                            if selected {
+                                palette.highlight
+                            } else {
+                                palette.border
+                            },
+                        ),
+                        egui::StrokeKind::Outside,
+                    );
+
+                    let inner_rect = rect.shrink2(egui::vec2(10.0, 10.0));
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(inner_rect)
+                            .layout(egui::Layout::top_down(Align::Min)),
+                    );
+                    let image_size = egui::vec2(inner_rect.width(), image_height.min(inner_rect.height()));
+                    if let Some(texture) = self.gallery_texture(ui.ctx(), &wallpaper.path) {
+                        let size = fit_size(texture.size_vec2(), image_size);
+                        ui.put(
+                            egui::Rect::from_min_size(
+                                egui::pos2(
+                                    inner_rect.center().x - size.x * 0.5,
+                                    inner_rect.top() + (image_size.y - size.y) * 0.5,
+                                ),
+                                size,
+                            ),
+                            egui::Image::new(&texture).fit_to_exact_size(size),
+                        );
+                    } else {
+                        child.allocate_ui_with_layout(
+                            image_size,
+                            egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                            |ui| {
+                                ui.label(GuiTypography::rich(
+                                    GuiTextRole::BodyMuted,
+                                    "Preview unavailable",
+                                    palette,
+                                ));
+                            },
+                        );
+                    }
+
+                    child.add_space(image_height + 6.0);
+                    child.label(
+                        GuiTypography::rich_color(
+                            GuiTextRole::ListItem,
+                            wallpaper.name,
+                            if selected {
+                                palette.highlight
+                            } else {
+                                palette.text
+                            },
+                        )
+                        .strong(),
+                    );
+                    if !badges.is_empty() {
+                        child.label(GuiTypography::rich(
+                            GuiTextRole::ListBadge,
+                            badges,
+                            palette,
+                        ));
+                    }
+
+                    if response.clicked() {
+                        self.set_selected_index(self.active_section, Some(row));
+                        self.request_preview_load();
+                    }
+                    if response.double_clicked() {
+                        self.set_selected_index(self.active_section, Some(row));
+                        self.request_preview_load();
+                        self.apply_selected_wallpaper();
+                    }
+                }
+            });
+        });
     }
 
     fn render_preview_panel(&mut self, ui: &mut Ui) {
@@ -2559,6 +2809,7 @@ impl GuiApp {
             show_popup_shell(ctx, "shortcuts", "Shortcuts", palette, None, |ui| {
                 let shortcuts = [
                     ("Arrow Up / Arrow Down", "Move selection"),
+                    ("[ / ]", "Switch between All and Rotation tabs"),
                     ("Enter", "Apply selected wallpaper"),
                     ("/", "Focus the search box"),
                     ("Ctrl+R", "Open random wallpaper flow"),
@@ -2800,23 +3051,36 @@ impl eframe::App for GuiApp {
             .frame(GuiChrome::panel_frame(self.palette(), 18))
             .show(ctx, |ui| self.render_toolbar(ui));
 
-        egui::SidePanel::left("sidebar")
-            .default_width(430.0)
-            .resizable(true)
-            .show_separator_line(false)
-            .frame(GuiChrome::panel_frame(self.palette(), 18))
-            .show(ctx, |ui| self.render_sidebar(ui));
+        if self.view_mode == ViewMode::List {
+            egui::SidePanel::left("sidebar")
+                .default_width(430.0)
+                .resizable(true)
+                .show_separator_line(false)
+                .frame(GuiChrome::panel_frame(self.palette(), 18))
+                .show(ctx, |ui| self.render_sidebar(ui));
 
-        egui::CentralPanel::default()
-            .frame(GuiChrome::panel_frame(self.palette(), 18))
-            .show(ctx, |ui| {
-                egui::TopBottomPanel::bottom("metadata")
-                    .show_separator_line(false)
-                    .min_height(212.0)
-                    .show_inside(ui, |ui| self.render_metadata(ui));
+            egui::CentralPanel::default()
+                .frame(GuiChrome::panel_frame(self.palette(), 18))
+                .show(ctx, |ui| {
+                    egui::TopBottomPanel::bottom("metadata")
+                        .show_separator_line(false)
+                        .min_height(212.0)
+                        .show_inside(ui, |ui| self.render_metadata(ui));
 
-                self.render_preview_panel(ui);
-            });
+                    self.render_preview_panel(ui);
+                });
+        } else {
+            egui::CentralPanel::default()
+                .frame(GuiChrome::panel_frame(self.palette(), 18))
+                .show(ctx, |ui| {
+                    egui::TopBottomPanel::bottom("metadata")
+                        .show_separator_line(false)
+                        .min_height(212.0)
+                        .show_inside(ui, |ui| self.render_metadata(ui));
+
+                    self.render_gallery(ui);
+                });
+        }
 
         if self.show_display_picker {
             self.render_display_picker_window(ctx);
@@ -3161,7 +3425,7 @@ fn format_interval(seconds: u64) -> String {
 mod tests {
     use super::{
         BackendStateSnapshot, DownloadWorkerRequest, DownloadWorkerResponse, GuiApp,
-        GuiDownloadStage, GuiDownloadState, RotationServiceStatus, SectionKind,
+        GuiDownloadStage, GuiDownloadState, RotationServiceStatus, SectionKind, ViewMode,
     };
     use crate::{
         backend::DownloadProgressEvent,
@@ -3206,6 +3470,7 @@ mod tests {
             config: test_config(),
             theme: ThemeKind::System,
             wallpapers: vec![],
+            view_mode: ViewMode::List,
             active_section: SectionKind::All,
             all_indices: vec![],
             rotation_indices: vec![],
@@ -3217,6 +3482,7 @@ mod tests {
             active_wallpaper_paths: HashSet::new(),
             rotation_paths: HashSet::new(),
             texture_cache: super::PreviewTextures::new(),
+            thumbnail_cache: None,
             desired_preview_key: None,
             current_preview_key: None,
             preview_request_in_flight: false,
@@ -3300,6 +3566,46 @@ mod tests {
 
     fn image() -> ColorImage {
         ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255])
+    }
+
+    #[test]
+    fn switching_back_to_list_requests_preview_for_selection() {
+        let mut app = test_app();
+        app.wallpapers = vec![sample_wallpaper("/tmp/preview.png")];
+        app.rebuild_section_cache();
+        app.selected_all = Some(0);
+        app.view_mode = ViewMode::Gallery;
+
+        app.set_view_mode(ViewMode::List);
+
+        assert_eq!(app.view_mode, ViewMode::List);
+        assert_eq!(
+            app.desired_preview_key,
+            Some(preview_key("/tmp/preview.png"))
+        );
+        assert!(app.preview_request_in_flight);
+    }
+
+    #[test]
+    fn cycling_sections_wraps_between_all_and_rotation() {
+        let mut app = test_app();
+        app.wallpapers = vec![
+            sample_wallpaper("/tmp/all.png"),
+            sample_wallpaper("/tmp/rotation.png"),
+        ];
+        app.config.rotation = vec![PathBuf::from("/tmp/rotation.png")];
+        app.rebuild_section_cache();
+        app.selected_all = Some(0);
+        app.selected_rotation = Some(0);
+
+        app.cycle_active_section(1);
+        assert!(app.active_section == SectionKind::Rotation);
+
+        app.cycle_active_section(1);
+        assert!(app.active_section == SectionKind::All);
+
+        app.cycle_active_section(-1);
+        assert!(app.active_section == SectionKind::Rotation);
     }
 
     #[test]

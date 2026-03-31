@@ -39,7 +39,7 @@ walt
 
 - `walt gui`
   - native desktop window
-  - larger visual preview
+  - toggle between list and gallery browsing
   - better for pointer-driven browsing and dialogs
   - toolbar button and `u` shortcut for direct image downloads
 
@@ -177,13 +177,15 @@ Debug logs are written to `~/.cache/walt/logs/walt.log`. Use `WALT_LOG=debug` to
 
 Walt ships with a native `egui` desktop interface alongside the original TUI. The GUI keeps the same core capabilities as the terminal app:
 
-- wallpaper browsing and large preview
+- wallpaper browsing in list or gallery view
 - multi-display apply flows
 - random wallpaper actions
 - direct image URL download-and-save flow
 - rotation service controls
 - wallpaper path management
 - uninstall flow
+
+Gallery mode keeps the All and Rotation lists as tabs at the top of the browser, and you can switch between those tabs with `[` and `]`.
 
 If you do not have a graphical session available, `walt gui` exits with a clear error and you can still use `walt` for the terminal interface.
 

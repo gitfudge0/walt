@@ -34,7 +34,7 @@ pub struct PreviewTextures {
 }
 
 impl PreviewTextures {
-    const DEFAULT_MAX_PREVIEW_TEXTURES: usize = 8;
+    const DEFAULT_MAX_PREVIEW_TEXTURES: usize = 48;
 
     pub fn new() -> Self {
         Self::with_capacity(Self::DEFAULT_MAX_PREVIEW_TEXTURES)
