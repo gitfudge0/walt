@@ -32,7 +32,9 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::backend::hyprpaper::get_active_wallpaper_assignments_if_supported;
+use crate::backend::hyprpaper::{
+    get_active_wallpaper_assignments_if_supported, hyprpaper_compatibility_notice,
+};
 use crate::backend::{
     apply_random_plan, disable_rotation_service, download_image_async, enable_rotation_service,
     get_monitors, get_rotation_service_status, install_rotation_service, plan_random_assignments,
@@ -334,6 +336,12 @@ pub struct App {
 }
 
 impl App {
+    fn print_hyprpaper_compatibility_notice(&self) {
+        if let Some(message) = hyprpaper_compatibility_notice() {
+            println!("Note: {message}");
+        }
+    }
+
     pub fn new() -> anyhow::Result<Self> {
         let config = Config::new();
         let theme = ThemeKind::from_name(&config.theme_name);
@@ -429,6 +437,7 @@ impl App {
         app.refresh_active_wallpapers();
         app.select_active_wallpaper_in_all();
         app.refresh_rotation_status();
+        app.print_hyprpaper_compatibility_notice();
 
         if !app.config.is_empty() {
             app.request_index_refresh();
@@ -1705,6 +1714,7 @@ impl App {
         );
         self.refresh_active_wallpapers();
         self.sync_selection_with_random_plan(&plan);
+        self.print_hyprpaper_compatibility_notice();
 
         if let Some(assignment) = plan.assignments.first() {
             if matches!(plan.mode, RandomMode::DifferentAll) {
@@ -2871,6 +2881,7 @@ impl App {
             active_wallpaper_paths_from_assignments(&self.active_wallpaper_assignments);
         self.refresh_active_wallpapers();
         println!("Wallpaper set on {monitor_name}: {path_str}");
+        self.print_hyprpaper_compatibility_notice();
         Ok(())
     }
 
@@ -2888,6 +2899,7 @@ impl App {
             active_wallpaper_paths_from_assignments(&self.active_wallpaper_assignments);
         self.refresh_active_wallpapers();
         println!("Wallpaper set to: {path_str}");
+        self.print_hyprpaper_compatibility_notice();
         Ok(())
     }
 
