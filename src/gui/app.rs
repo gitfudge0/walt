@@ -15,7 +15,9 @@ use log::error;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    backend::hyprpaper::get_active_wallpaper_assignments_if_supported,
+    backend::hyprpaper::{
+        get_active_wallpaper_assignments_if_supported, hyprpaper_compatibility_notice,
+    },
     backend::{
         apply_random_plan, disable_rotation_service, download_image_async, enable_rotation_service,
         format_rotation_service_status, get_monitors, get_rotation_service_status,
@@ -306,6 +308,7 @@ impl GuiApp {
         app.refresh_active_wallpapers(true);
         app.select_active_wallpaper_in_all();
         app.refresh_rotation_status();
+        app.show_hyprpaper_compatibility_notice();
         install_editorial_mono(&cc.egui_ctx);
         app.apply_visuals(&cc.egui_ctx);
         if !app.config.is_empty() {
@@ -409,6 +412,12 @@ impl GuiApp {
         let message = message.into();
         log::info!("gui info: {message}");
         self.push_toast(ToastKind::Info, message);
+    }
+
+    fn show_hyprpaper_compatibility_notice(&mut self) {
+        if let Some(message) = hyprpaper_compatibility_notice() {
+            self.info(message);
+        }
     }
 
     fn success(&mut self, message: impl Into<String>) {
@@ -1141,6 +1150,7 @@ impl GuiApp {
             active_wallpaper_paths_from_assignments(&self.active_wallpaper_assignments);
         self.refresh_active_wallpapers(false);
         self.sync_selection_with_random_plan(&plan);
+        self.show_hyprpaper_compatibility_notice();
 
         if let Some(assignment) = plan.assignments.first() {
             if matches!(plan.mode, RandomMode::DifferentAll) {
@@ -1232,6 +1242,7 @@ impl GuiApp {
             active_wallpaper_paths_from_assignments(&self.active_wallpaper_assignments);
         self.refresh_active_wallpapers(false);
         self.success(format!("Wallpaper set on {monitor_name}: {path_str}"));
+        self.show_hyprpaper_compatibility_notice();
         Ok(())
     }
 
@@ -1249,6 +1260,7 @@ impl GuiApp {
             active_wallpaper_paths_from_assignments(&self.active_wallpaper_assignments);
         self.refresh_active_wallpapers(false);
         self.success(format!("Wallpaper set on all displays: {path_str}"));
+        self.show_hyprpaper_compatibility_notice();
         Ok(())
     }
 
