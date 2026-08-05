@@ -300,6 +300,12 @@ fn classify_backend_unavailable_message(message: &str) -> Option<BackendUnavaila
         return Some(BackendUnavailableReason::HyprpaperUnavailable);
     }
 
+    if normalized.contains("failed to connect to hyprpaper")
+        || normalized.contains("hyprpaper doesn't have the spec")
+    {
+        return Some(BackendUnavailableReason::HyprpaperUnavailable);
+    }
+
     if normalized.contains("no monitors found") {
         return Some(BackendUnavailableReason::NoMonitors);
     }
@@ -586,7 +592,7 @@ fn log_hyprpaper_failure(context: &str, failure: HyprpaperCommandFailure, detail
             context, reason, details
         ),
         HyprpaperCommandFailure::UnsupportedPreload => {
-            warn!(
+            info!(
                 "hyprpaper {} unsupported-preload details={}",
                 context, details
             )
@@ -780,6 +786,39 @@ mod tests {
         assert_eq!(
             classify_backend_unavailable_message(
                 "Preload failed: status exit status: 3, stdout: Couldn't connect to /run/user/1000/hypr/instance/.hyprpaper.sock. (3)"
+            ),
+            Some(BackendUnavailableReason::HyprpaperUnavailable)
+        );
+    }
+
+    #[test]
+    fn classifies_hyprctl_056_connection_refused_as_transient() {
+        assert_eq!(
+            classify_backend_unavailable_message(
+                "wallpaper command failed: status exit status: 1, stdout: can't send: failed to connect to hyprpaper (is it running?)"
+            ),
+            Some(BackendUnavailableReason::HyprpaperUnavailable)
+        );
+    }
+
+    #[test]
+    fn retries_hyprctl_056_connection_refused_failure() {
+        let failure = classify_hyprpaper_command_failure_message(
+            "wallpaper command failed: status exit status: 1, stdout: can't send: failed to connect to hyprpaper (is it running?)"
+        );
+
+        assert_eq!(
+            failure,
+            HyprpaperCommandFailure::Transient(BackendUnavailableReason::HyprpaperUnavailable)
+        );
+        assert!(should_retry_hyprpaper_command_failure(failure));
+    }
+
+    #[test]
+    fn classifies_hyprctl_056_missing_spec_as_transient() {
+        assert_eq!(
+            classify_backend_unavailable_message(
+                "wallpaper command failed: status exit status: 1, stdout: can't send: hyprpaper doesn't have the spec?!"
             ),
             Some(BackendUnavailableReason::HyprpaperUnavailable)
         );
