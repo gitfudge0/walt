@@ -1,5 +1,6 @@
 pub mod download;
 pub mod hyprpaper;
+pub mod hyprpaper_config;
 pub mod random;
 pub mod rotation;
 pub mod scanner;

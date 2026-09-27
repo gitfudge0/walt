@@ -9,6 +9,8 @@ use std::{
 
 use log::{debug, error, info, warn};
 
+use super::hyprpaper_config::persist_wallpaper_assignments;
+
 const HYPERPAPER_SERVICE: &str = "hyprpaper.service";
 const HYPERPAPER_PROCESS_NAME: &str = "hyprpaper";
 const HYPERPAPER_WAIT_ATTEMPTS: usize = 20;
@@ -109,11 +111,14 @@ pub fn set_wallpaper(wallpaper_path: &str) -> anyhow::Result<()> {
     }
 
     let mut failures = Vec::new();
+    let mut applied = Vec::new();
     for monitor in monitors {
-        if let Err(error) = apply_wallpaper_to_monitor(&monitor.name, wallpaper_path) {
-            failures.push((monitor.name, error.to_string()));
+        match apply_wallpaper_to_monitor(&monitor.name, wallpaper_path) {
+            Ok(()) => applied.push((monitor.name, PathBuf::from(wallpaper_path))),
+            Err(error) => failures.push((monitor.name, error.to_string())),
         }
     }
+    persist_wallpaper_assignments(&applied);
 
     summarize_multi_monitor_apply_failures(&failures)
 }
@@ -121,7 +126,9 @@ pub fn set_wallpaper(wallpaper_path: &str) -> anyhow::Result<()> {
 pub fn set_wallpaper_for_monitor(monitor_name: &str, wallpaper_path: &str) -> anyhow::Result<()> {
     info!("applying wallpaper to single monitor monitor={monitor_name} path={wallpaper_path}");
     preload_wallpaper_if_supported(wallpaper_path)?;
-    apply_wallpaper_to_monitor(monitor_name, wallpaper_path)
+    apply_wallpaper_to_monitor(monitor_name, wallpaper_path)?;
+    persist_wallpaper_assignments(&[(monitor_name.to_string(), PathBuf::from(wallpaper_path))]);
+    Ok(())
 }
 
 pub fn set_wallpapers_for_monitors(assignments: &[(String, PathBuf)]) -> anyhow::Result<()> {
@@ -130,9 +137,15 @@ pub fn set_wallpapers_for_monitors(assignments: &[(String, PathBuf)]) -> anyhow:
         preload_wallpaper_if_supported(&wallpaper_path.to_string_lossy())
     })?;
 
-    for (monitor_name, wallpaper_path) in assignments {
-        apply_wallpaper_to_monitor(monitor_name, &wallpaper_path.to_string_lossy())?;
+    for (index, (monitor_name, wallpaper_path)) in assignments.iter().enumerate() {
+        if let Err(error) =
+            apply_wallpaper_to_monitor(monitor_name, &wallpaper_path.to_string_lossy())
+        {
+            persist_wallpaper_assignments(&assignments[..index]);
+            return Err(error);
+        }
     }
+    persist_wallpaper_assignments(assignments);
 
     Ok(())
 }

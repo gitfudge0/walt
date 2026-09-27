@@ -171,6 +171,16 @@ exec-once = hyprpaper
 
 Walt works across older and newer `hyprpaper` behavior and falls back gracefully when active wallpaper status is unavailable.
 
+### Persisting wallpapers across restarts
+
+Every time Walt applies a wallpaper (from the TUI, GUI, `walt random`, or the rotation service), it records the wallpaper for each monitor in `~/.config/hypr/hyprpaper-walt.conf`. To have `hyprpaper` restore those wallpapers on startup, source the file from `~/.config/hypr/hyprpaper.conf` (requires `hyprpaper` 0.8+):
+
+```conf
+source = ~/.config/hypr/hyprpaper-walt.conf
+```
+
+Walt keeps entries for monitors that aren't currently connected, so docking and undocking don't lose assignments. The file is rewritten on every change, so put manual `wallpaper` blocks in `hyprpaper.conf` instead.
+
 Debug logs are written to `~/.cache/walt/logs/walt.log`. Use `WALT_LOG=debug` to increase verbosity.
 
 ## GUI
