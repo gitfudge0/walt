@@ -20,6 +20,15 @@ pub struct Config {
     pub rotation_interval_secs: u64,
     pub all_sort: String,
     pub rotation_sort: String,
+    pub saved_filters: Vec<SavedFilter>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedFilter {
+    pub name: String,
+    pub query: String,
+    #[serde(default)]
+    pub folder: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -34,6 +43,8 @@ struct ConfigFile {
     rotation_interval_secs: u64,
     all_sort: String,
     rotation_sort: String,
+    #[serde(default)]
+    saved_filters: Vec<SavedFilter>,
 }
 
 impl Default for ConfigFile {
@@ -48,6 +59,7 @@ impl Default for ConfigFile {
             rotation_interval_secs: 0,
             all_sort: String::new(),
             rotation_sort: String::new(),
+            saved_filters: vec![],
         }
     }
 }
@@ -94,6 +106,7 @@ impl Config {
             rotation_interval_secs: 300,
             all_sort: "name".to_string(),
             rotation_sort: "name".to_string(),
+            saved_filters: vec![],
         }
     }
 
@@ -124,6 +137,7 @@ impl Config {
             },
             all_sort: default_sort_name(state.all_sort),
             rotation_sort: default_sort_name(state.rotation_sort),
+            saved_filters: state.saved_filters,
         }
     }
 
@@ -163,6 +177,7 @@ impl Config {
             rotation_interval_secs: self.rotation_interval_secs,
             all_sort: default_sort_name(self.all_sort.clone()),
             rotation_sort: default_sort_name(self.rotation_sort.clone()),
+            saved_filters: self.saved_filters.clone(),
         };
         fs::write(
             config_dir.join(STATE_FILE),
@@ -197,6 +212,45 @@ impl Config {
 
     pub fn set_theme<S: Into<String>>(&mut self, theme_name: S) {
         self.theme_name = theme_name.into();
+    }
+
+    pub fn upsert_saved_filter(
+        &mut self,
+        name: &str,
+        query: &str,
+        folder: Option<PathBuf>,
+    ) -> anyhow::Result<()> {
+        let name = name.trim();
+        let query = query.trim();
+        if name.is_empty() {
+            bail!("Enter a name for the filter.");
+        }
+        if query.is_empty() && folder.is_none() {
+            bail!("Choose a folder or enter a search query before saving a filter.");
+        }
+        if let Some(filter) = self
+            .saved_filters
+            .iter_mut()
+            .find(|filter| filter.name.eq_ignore_ascii_case(name))
+        {
+            filter.name = name.to_string();
+            filter.query = query.to_string();
+            filter.folder = folder;
+        } else {
+            self.saved_filters.push(SavedFilter {
+                name: name.to_string(),
+                query: query.to_string(),
+                folder,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn delete_saved_filter(&mut self, name: &str) -> bool {
+        let before = self.saved_filters.len();
+        self.saved_filters
+            .retain(|filter| !filter.name.eq_ignore_ascii_case(name));
+        self.saved_filters.len() != before
     }
 
     pub fn toggle_rotation(&mut self, path: &PathBuf) -> bool {
@@ -305,6 +359,7 @@ mod tests {
             rotation_interval_secs: 300,
             all_sort: "name".to_string(),
             rotation_sort: "name".to_string(),
+            saved_filters: vec![],
         }
     }
 
@@ -349,6 +404,7 @@ mod tests {
         assert_eq!(config.rotation_interval_secs, 120);
         assert_eq!(config.all_sort, "modified");
         assert_eq!(config.rotation_sort, "modified");
+        assert!(config.saved_filters.is_empty());
 
         fs::remove_dir_all(&temp_root).expect("cleanup temp root");
     }
@@ -448,6 +504,13 @@ mod tests {
         config.rotation = vec![PathBuf::from("/tmp/alpha.jpg")];
         config.rotate_all_wallpapers = true;
         config.rotation_same_wallpaper_on_all_displays = false;
+        config
+            .upsert_saved_filter(
+                " Nature ",
+                " /wallpapers/nature ",
+                Some(PathBuf::from("/wallpapers")),
+            )
+            .unwrap();
         config.save().expect("save config");
 
         let saved = temp_root.join("walt").join("state.json");
@@ -456,6 +519,7 @@ mod tests {
         assert!(loaded.rotate_all_wallpapers);
         assert!(!loaded.uses_same_wallpaper_on_all_displays_for_rotation());
         assert_eq!(loaded.rotation, vec![PathBuf::from("/tmp/alpha.jpg")]);
+        assert_eq!(loaded.saved_filters, config.saved_filters);
 
         fs::remove_dir_all(&temp_root).expect("cleanup temp root");
     }
@@ -470,6 +534,37 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Rotation interval must be greater than 0 seconds."
+        );
+    }
+
+    #[test]
+    fn saved_filter_names_update_without_duplicates_and_can_be_deleted() {
+        let mut config = test_config();
+        config
+            .upsert_saved_filter("Nature", "forest", None)
+            .unwrap();
+        config
+            .upsert_saved_filter("nature", "mountain", None)
+            .unwrap();
+        assert_eq!(config.saved_filters.len(), 1);
+        assert_eq!(config.saved_filters[0].query, "mountain");
+        assert!(config.delete_saved_filter("NATURE"));
+        assert!(config.saved_filters.is_empty());
+        assert!(!config.delete_saved_filter("Nature"));
+    }
+
+    #[test]
+    fn saved_search_without_folder_field_still_loads() {
+        let filter: super::SavedFilter =
+            serde_json::from_str(r#"{"name":"Nature","query":"forest"}"#).unwrap();
+        assert_eq!(filter.folder, None);
+        let mut config = test_config();
+        config
+            .upsert_saved_filter("Folder", "", Some(PathBuf::from("/wallpapers")))
+            .unwrap();
+        assert_eq!(
+            config.saved_filters[0].folder,
+            Some(PathBuf::from("/wallpapers"))
         );
     }
 }
