@@ -1020,6 +1020,7 @@ mod tests {
             rotation_interval_secs: 300,
             all_sort: "name".to_string(),
             rotation_sort: "name".to_string(),
+            saved_filters: vec![],
         }
     }
 

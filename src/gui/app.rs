@@ -25,15 +25,16 @@ use crate::{
         DownloadRequest, RandomMode, RandomPlan, RotationServiceStatus,
     },
     cache::{IndexedWallpaper, ThumbnailCache, ThumbnailProfile, WallpaperIndex},
-    config::Config,
+    config::{Config, SavedFilter},
     shared::{
         active_wallpaper_paths_from_assignments, default_display_target_selection,
         display_targets_from_names, first_active_visible_index,
         merge_active_wallpaper_assignments_from_random_plan, random_apply_action,
         random_menu_actions, selection_for_random_plan, set_active_wallpaper_assignment,
         set_active_wallpaper_assignments_for_all_monitors,
-        set_active_wallpaper_assignments_from_backend, wallpaper_apply_action, DisplayTarget,
-        RandomApplyAction, RandomMenuAction, WallpaperApplyAction,
+        set_active_wallpaper_assignments_from_backend, wallpaper_apply_action,
+        wallpaper_matches_view, DisplayTarget, RandomApplyAction, RandomMenuAction,
+        WallpaperApplyAction,
     },
     theme::ThemeKind,
 };
@@ -142,6 +143,11 @@ enum GuiDownloadStage {
     Cancelled,
 }
 
+enum GuiFilterPending {
+    Replace(SavedFilter),
+    Delete(String),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GuiDownloadState {
     stage: GuiDownloadStage,
@@ -161,6 +167,8 @@ pub struct GuiApp {
     selected_rotation: Option<usize>,
     all_filter: String,
     rotation_filter: String,
+    all_folder: Option<PathBuf>,
+    rotation_folder: Option<PathBuf>,
     active_wallpaper_assignments: HashMap<String, PathBuf>,
     active_wallpaper_paths: HashSet<PathBuf>,
     rotation_paths: HashSet<PathBuf>,
@@ -194,6 +202,10 @@ pub struct GuiApp {
     pending_random_candidates: Vec<PathBuf>,
     pending_downloaded_path: Option<PathBuf>,
     show_paths_dialog: bool,
+    show_saved_filters_dialog: bool,
+    saved_filter_name: String,
+    selected_saved_filter: Option<usize>,
+    saved_filter_pending: Option<GuiFilterPending>,
     show_rotation_dialog: bool,
     show_help_dialog: bool,
     show_uninstall_dialog: bool,
@@ -246,6 +258,8 @@ impl GuiApp {
             selected_rotation: None,
             all_filter: String::new(),
             rotation_filter: String::new(),
+            all_folder: None,
+            rotation_folder: None,
             active_wallpaper_assignments: HashMap::new(),
             active_wallpaper_paths: HashSet::new(),
             rotation_paths: HashSet::new(),
@@ -279,6 +293,10 @@ impl GuiApp {
             pending_random_candidates: vec![],
             pending_downloaded_path: None,
             show_paths_dialog: false,
+            show_saved_filters_dialog: false,
+            saved_filter_name: String::new(),
+            selected_saved_filter: None,
+            saved_filter_pending: None,
             show_rotation_dialog: false,
             show_help_dialog: false,
             show_uninstall_dialog: false,
@@ -452,6 +470,55 @@ impl GuiApp {
         }
     }
 
+    fn folder_for_section(&self, section: SectionKind) -> Option<&PathBuf> {
+        match section {
+            SectionKind::All => self.all_folder.as_ref(),
+            SectionKind::Rotation => self.rotation_folder.as_ref(),
+        }
+    }
+
+    fn apply_saved_filter(&mut self, filter: &SavedFilter) {
+        match self.active_section {
+            SectionKind::All => {
+                self.all_filter = filter.query.clone();
+                self.all_folder = filter.folder.clone();
+            }
+            SectionKind::Rotation => {
+                self.rotation_filter = filter.query.clone();
+                self.rotation_folder = filter.folder.clone();
+            }
+        }
+        self.ensure_section_selection();
+        self.request_preview_load();
+    }
+
+    fn clear_active_filter(&mut self) {
+        self.apply_saved_filter(&SavedFilter {
+            name: String::new(),
+            query: String::new(),
+            folder: None,
+        });
+    }
+
+    fn save_filter(&mut self, filter: SavedFilter) {
+        let mut updated = self.config.clone();
+        match updated
+            .upsert_saved_filter(&filter.name, &filter.query, filter.folder)
+            .and_then(|()| updated.save())
+        {
+            Ok(()) => {
+                self.selected_saved_filter = updated
+                    .saved_filters
+                    .iter()
+                    .position(|candidate| candidate.name.eq_ignore_ascii_case(&filter.name));
+                self.config = updated;
+                self.saved_filter_name.clear();
+                self.success("Filter saved.");
+            }
+            Err(error) => self.error(format!("Could not save filter: {error}")),
+        }
+    }
+
     fn selected_index(&self, section: SectionKind) -> Option<usize> {
         match section {
             SectionKind::All => self.selected_all,
@@ -480,21 +547,13 @@ impl GuiApp {
             SectionKind::Rotation => &self.rotation_indices,
         };
         let filter = self.filter_query(section).to_lowercase();
+        let folder = self.folder_for_section(section);
         let mut indices = base
             .iter()
             .copied()
             .filter(|index| {
                 let wallpaper = &self.wallpapers[*index];
-                if filter.is_empty() {
-                    true
-                } else {
-                    wallpaper.name.to_lowercase().contains(&filter)
-                        || wallpaper
-                            .path
-                            .to_string_lossy()
-                            .to_lowercase()
-                            .contains(&filter)
-                }
+                wallpaper_matches_view(wallpaper, folder.map(PathBuf::as_path), &filter)
             })
             .collect::<Vec<_>>();
 
@@ -1456,6 +1515,10 @@ impl GuiApp {
             self.show_paths_dialog = false;
             return true;
         }
+        if self.show_saved_filters_dialog {
+            self.show_saved_filters_dialog = false;
+            return true;
+        }
         if self.show_download_dialog {
             self.close_download_dialog();
             return true;
@@ -1642,6 +1705,71 @@ impl GuiApp {
             self.ensure_section_selection();
             self.request_preview_load();
         }
+        let active_folder = self.folder_for_section(self.active_section).cloned();
+        let active_query = self.filter_query(self.active_section).to_string();
+        let active_preset = self
+            .config
+            .saved_filters
+            .iter()
+            .find(|filter| filter.folder == active_folder && filter.query == active_query);
+        let label = active_preset
+            .map(|filter| filter.name.as_str())
+            .unwrap_or_else(|| {
+                if active_folder.is_none() && active_query.is_empty() {
+                    "All wallpapers"
+                } else {
+                    "Custom view"
+                }
+            });
+        let mut chosen_filter = None;
+        egui::ComboBox::from_id_salt("saved-filter-picker")
+            .selected_text(format!("Saved: {label}"))
+            .show_ui(ui, |ui| {
+                for filter in &self.config.saved_filters {
+                    if ui.selectable_label(false, &filter.name).clicked() {
+                        chosen_filter = Some(filter.clone());
+                    }
+                }
+                if self.config.saved_filters.is_empty() {
+                    ui.label("No saved filters");
+                }
+            });
+        if let Some(filter) = chosen_filter {
+            self.apply_saved_filter(&filter);
+        }
+        if let Some(folder) = self.folder_for_section(self.active_section) {
+            ui.label(GuiTypography::rich(
+                GuiTextRole::MetaLabel,
+                format!("FOLDER {}", folder.display()),
+                palette,
+            ));
+        }
+        if ui
+            .add(GuiChrome::button(
+                "Clear filter",
+                GuiTextRole::ActionLabel,
+                palette,
+            ))
+            .clicked()
+        {
+            self.clear_active_filter();
+        }
+        if ui
+            .add(GuiChrome::button(
+                "Manage saved filters",
+                GuiTextRole::ActionLabel,
+                palette,
+            ))
+            .clicked()
+        {
+            self.show_saved_filters_dialog = true;
+            self.saved_filter_pending = None;
+            self.selected_saved_filter = if self.config.saved_filters.is_empty() {
+                None
+            } else {
+                Some(0)
+            };
+        }
         if self.active_section == SectionKind::Rotation {
             ui.label(GuiTypography::rich(
                 GuiTextRole::MetaLabel,
@@ -1668,7 +1796,9 @@ impl GuiApp {
 
         let indices = self.section_indices(self.active_section);
         if indices.is_empty() {
-            let message = if self.filter_query(self.active_section).is_empty() {
+            let message = if self.filter_query(self.active_section).is_empty()
+                && self.folder_for_section(self.active_section).is_none()
+            {
                 match self.active_section {
                     SectionKind::All => "No wallpapers indexed yet.",
                     SectionKind::Rotation => "Rotation list is empty.",
@@ -2553,6 +2683,224 @@ impl GuiApp {
         );
     }
 
+    fn render_saved_filters_window(&mut self, ctx: &egui::Context) {
+        let palette = self.palette();
+        let filters = self.config.saved_filters.clone();
+        let current_folder = self.folder_for_section(self.active_section).cloned();
+        let current_query = self.filter_query(self.active_section).to_string();
+        let selected_folder = self
+            .current_selected_wallpaper()
+            .map(|wallpaper| wallpaper.directory.clone());
+        let mut save_current = false;
+        let mut save_folder = false;
+        let mut delete = None;
+        let mut confirm = false;
+        let mut cancel = false;
+        self.show_saved_filters_dialog = show_popup_shell(
+            ctx,
+            "saved-filters",
+            "Saved filters",
+            palette,
+            Some(560.0),
+            |ui| {
+                if let Some(pending) = &self.saved_filter_pending {
+                    let message = match pending {
+                        GuiFilterPending::Replace(filter) => {
+                            format!("Replace '{}' with this saved view?", filter.name)
+                        }
+                        GuiFilterPending::Delete(name) => {
+                            format!("Delete saved filter '{name}'?")
+                        }
+                    };
+                    ui.label(GuiTypography::rich(
+                        GuiTextRole::PopupBody,
+                        message,
+                        palette,
+                    ));
+                    ui.horizontal(|ui| {
+                        confirm = ui
+                            .add(GuiChrome::button(
+                                "Confirm",
+                                GuiTextRole::ActionLabel,
+                                palette,
+                            ))
+                            .clicked();
+                        cancel = ui
+                            .add(GuiChrome::button(
+                                "Cancel",
+                                GuiTextRole::ActionLabel,
+                                palette,
+                            ))
+                            .clicked();
+                    });
+                    return false;
+                }
+                ui.label(GuiTypography::rich(
+                    GuiTextRole::PopupBody,
+                    format!(
+                        "Current view: {} | Search: {}",
+                        current_folder
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "Any folder".to_string()),
+                        if current_query.is_empty() {
+                            "Any"
+                        } else {
+                            &current_query
+                        }
+                    ),
+                    palette,
+                ));
+                ui.add(
+                    TextEdit::singleline(&mut self.saved_filter_name)
+                        .hint_text("Preset name")
+                        .desired_width(280.0),
+                );
+                ui.label(GuiTypography::rich(
+                    GuiTextRole::BodyMuted,
+                    format!(
+                        "Selected wallpaper folder: {}",
+                        selected_folder
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "None".to_string())
+                    ),
+                    palette,
+                ));
+                ui.horizontal(|ui| {
+                    save_current = ui
+                        .add_enabled(
+                            current_folder.is_some() || !current_query.trim().is_empty(),
+                            GuiChrome::button(
+                                "Save current view",
+                                GuiTextRole::ActionLabel,
+                                palette,
+                            ),
+                        )
+                        .clicked();
+                    save_folder = ui
+                        .add_enabled(
+                            selected_folder.is_some(),
+                            GuiChrome::button(
+                                "Save selected wallpaper's folder",
+                                GuiTextRole::ActionLabel,
+                                palette,
+                            ),
+                        )
+                        .clicked();
+                });
+                if current_folder.is_none() && current_query.trim().is_empty() {
+                    ui.label(GuiTypography::rich(
+                        GuiTextRole::BodyMuted,
+                        "Set a folder or enter a search to save the current view.",
+                        palette,
+                    ));
+                }
+                GuiChrome::rule(ui, palette, 8.0);
+                if filters.is_empty() {
+                    ui.label(GuiTypography::rich(
+                        GuiTextRole::BodyMuted,
+                        "No saved filters yet.",
+                        palette,
+                    ));
+                } else {
+                    ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                        for (index, filter) in filters.iter().enumerate() {
+                            let detail = filter
+                                .folder
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|| "Any folder".to_string());
+                            if ui
+                                .selectable_label(
+                                    self.selected_saved_filter == Some(index),
+                                    format!("{}  ·  {}  {}", filter.name, detail, filter.query),
+                                )
+                                .clicked()
+                            {
+                                self.selected_saved_filter = Some(index);
+                            }
+                        }
+                    });
+                    delete = ui
+                        .add(GuiChrome::button(
+                            "Delete selected",
+                            GuiTextRole::ActionLabel,
+                            palette,
+                        ))
+                        .clicked()
+                        .then_some(self.selected_saved_filter)
+                        .flatten();
+                }
+                ui.add(GuiChrome::button(
+                    "Close",
+                    GuiTextRole::ActionLabel,
+                    palette,
+                ))
+                .clicked()
+            },
+        );
+        if cancel {
+            self.saved_filter_pending = None;
+        }
+        if confirm {
+            if let Some(pending) = self.saved_filter_pending.take() {
+                match pending {
+                    GuiFilterPending::Replace(filter) => self.save_filter(filter),
+                    GuiFilterPending::Delete(name) => {
+                        let mut updated = self.config.clone();
+                        updated.delete_saved_filter(&name);
+                        match updated.save() {
+                            Ok(()) => {
+                                self.config = updated;
+                                self.selected_saved_filter = if self.config.saved_filters.is_empty()
+                                {
+                                    None
+                                } else {
+                                    Some(0)
+                                };
+                                self.success("Filter deleted.");
+                            }
+                            Err(error) => self.error(format!("Could not delete filter: {error}")),
+                        }
+                    }
+                }
+            }
+        }
+        if save_current || save_folder {
+            let filter = SavedFilter {
+                name: self.saved_filter_name.trim().to_string(),
+                query: if save_current {
+                    current_query
+                } else {
+                    String::new()
+                },
+                folder: if save_current {
+                    current_folder
+                } else {
+                    selected_folder
+                },
+            };
+            if filter.name.is_empty() {
+                self.error("Enter a name for the filter.");
+            } else if self
+                .config
+                .saved_filters
+                .iter()
+                .any(|candidate| candidate.name.eq_ignore_ascii_case(&filter.name))
+            {
+                self.saved_filter_pending = Some(GuiFilterPending::Replace(filter));
+            } else {
+                self.save_filter(filter);
+            }
+        }
+        if let Some(index) = delete {
+            if let Some(filter) = filters.get(index) {
+                self.saved_filter_pending = Some(GuiFilterPending::Delete(filter.name.clone()));
+            }
+        }
+    }
+
     fn render_help_window(&mut self, ctx: &egui::Context) {
         let palette = self.palette();
         self.show_help_dialog =
@@ -2561,6 +2909,8 @@ impl GuiApp {
                     ("Arrow Up / Arrow Down", "Move selection"),
                     ("Enter", "Apply selected wallpaper"),
                     ("/", "Focus the search box"),
+                    ("Saved filters", "Open from the library sidebar"),
+                    ("Clear filter", "Use the library sidebar"),
                     ("Ctrl+R", "Open random wallpaper flow"),
                     ("u", "Open download and save flow"),
                     ("r", "Toggle selected wallpaper in rotation list"),
@@ -2832,6 +3182,9 @@ impl eframe::App for GuiApp {
         }
         if self.show_paths_dialog {
             self.render_paths_window(ctx);
+        }
+        if self.show_saved_filters_dialog {
+            self.render_saved_filters_window(ctx);
         }
         if self.show_help_dialog {
             self.render_help_window(ctx);
@@ -3189,6 +3542,7 @@ mod tests {
             rotation_interval_secs: 300,
             all_sort: "name".to_string(),
             rotation_sort: "name".to_string(),
+            saved_filters: vec![],
         }
     }
 
@@ -3213,6 +3567,8 @@ mod tests {
             selected_rotation: Some(0),
             all_filter: String::new(),
             rotation_filter: String::new(),
+            all_folder: None,
+            rotation_folder: None,
             active_wallpaper_assignments: HashMap::new(),
             active_wallpaper_paths: HashSet::new(),
             rotation_paths: HashSet::new(),
@@ -3246,6 +3602,10 @@ mod tests {
             pending_random_candidates: vec![],
             pending_downloaded_path: None,
             show_paths_dialog: false,
+            show_saved_filters_dialog: false,
+            saved_filter_name: String::new(),
+            selected_saved_filter: None,
+            saved_filter_pending: None,
             show_rotation_dialog: false,
             show_help_dialog: false,
             show_uninstall_dialog: false,

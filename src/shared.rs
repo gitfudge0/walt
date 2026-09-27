@@ -203,6 +203,24 @@ pub fn active_wallpaper_paths_from_assignments(
     active_wallpaper_assignments.values().cloned().collect()
 }
 
+/// `query_lowercase` is normalized once by the caller for the whole section.
+pub fn wallpaper_matches_view(
+    wallpaper: &crate::cache::IndexedWallpaper,
+    folder: Option<&std::path::Path>,
+    query_lowercase: &str,
+) -> bool {
+    if folder.is_some_and(|folder| wallpaper.directory != folder) {
+        return false;
+    }
+    query_lowercase.is_empty()
+        || wallpaper.name.to_lowercase().contains(query_lowercase)
+        || wallpaper
+            .path
+            .to_string_lossy()
+            .to_lowercase()
+            .contains(query_lowercase)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -237,6 +255,45 @@ mod tests {
             width: None,
             height: None,
         }
+    }
+
+    #[test]
+    fn view_filter_matches_exact_directory_then_text() {
+        let parent = wallpaper("forest");
+        let mut child = wallpaper("forest");
+        child.path = PathBuf::from("/wallpapers/nested/forest.jpg");
+        child.directory = PathBuf::from("/wallpapers/nested");
+        let mut sibling = wallpaper("forest");
+        sibling.path = PathBuf::from("/wallpapers/nature-old/forest.jpg");
+        sibling.directory = PathBuf::from("/wallpapers/nature-old");
+        let mut nature = wallpaper("forest");
+        nature.path = PathBuf::from("/wallpapers/nature/forest.jpg");
+        nature.directory = PathBuf::from("/wallpapers/nature");
+        assert!(super::wallpaper_matches_view(
+            &parent,
+            Some(std::path::Path::new("/wallpapers")),
+            "forest"
+        ));
+        assert!(!super::wallpaper_matches_view(
+            &child,
+            Some(std::path::Path::new("/wallpapers")),
+            "forest"
+        ));
+        assert!(!super::wallpaper_matches_view(
+            &parent,
+            Some(std::path::Path::new("/wallpapers")),
+            "desert"
+        ));
+        assert!(!super::wallpaper_matches_view(
+            &sibling,
+            Some(std::path::Path::new("/wallpapers/nature")),
+            "forest"
+        ));
+        assert!(super::wallpaper_matches_view(
+            &nature,
+            Some(std::path::Path::new("/wallpapers/nature")),
+            "forest"
+        ));
     }
 
     #[test]

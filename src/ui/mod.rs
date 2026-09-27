@@ -50,8 +50,8 @@ use crate::shared::{
     merge_active_wallpaper_assignments_from_random_plan, random_apply_action, random_menu_actions,
     selection_for_random_plan, set_active_wallpaper_assignment,
     set_active_wallpaper_assignments_for_all_monitors,
-    set_active_wallpaper_assignments_from_backend, wallpaper_apply_action, DisplayTarget,
-    RandomApplyAction, RandomMenuAction, WallpaperApplyAction,
+    set_active_wallpaper_assignments_from_backend, wallpaper_apply_action, wallpaper_matches_view,
+    DisplayTarget, RandomApplyAction, RandomMenuAction, WallpaperApplyAction,
 };
 use crate::theme::ThemeKind;
 use theme::ThemePalette;
@@ -67,6 +67,9 @@ enum AppMode {
     DownloadPathSelect,
     DownloadProgress,
     Search,
+    SavedFilters,
+    SavedFilterName,
+    SavedFilterConfirm,
     IntervalEdit,
     RotationMenu,
     Keybindings,
@@ -77,6 +80,17 @@ enum AppMode {
 enum SectionKind {
     All,
     Rotation,
+}
+
+enum SavedFilterPending {
+    Replace {
+        name: String,
+        query: String,
+        folder: Option<PathBuf>,
+    },
+    Delete {
+        name: String,
+    },
 }
 
 impl SectionKind {
@@ -288,6 +302,12 @@ pub struct App {
     rotation_menu_state: ListState,
     display_select_state: ListState,
     random_menu_state: ListState,
+    saved_filter_state: ListState,
+    saved_filter_name: String,
+    saved_filter_error: Option<String>,
+    saved_filter_source_query: String,
+    saved_filter_source_folder: Option<PathBuf>,
+    saved_filter_pending: Option<SavedFilterPending>,
     active_section: SectionKind,
     mode: AppMode,
     interval_return_mode: AppMode,
@@ -323,6 +343,8 @@ pub struct App {
     input_buffer: String,
     all_filter: String,
     rotation_filter: String,
+    all_folder: Option<PathBuf>,
+    rotation_folder: Option<PathBuf>,
     dir_suggestions: Vec<PathBuf>,
     suggestion_state: ListState,
     download_url_buffer: String,
@@ -379,6 +401,12 @@ impl App {
             rotation_menu_state,
             display_select_state,
             random_menu_state,
+            saved_filter_state: ListState::default(),
+            saved_filter_name: String::new(),
+            saved_filter_error: None,
+            saved_filter_source_query: String::new(),
+            saved_filter_source_folder: None,
+            saved_filter_pending: None,
             active_section: SectionKind::All,
             mode,
             interval_return_mode: AppMode::Wallpaper,
@@ -414,6 +442,8 @@ impl App {
             input_buffer: String::new(),
             all_filter: String::new(),
             rotation_filter: String::new(),
+            all_folder: None,
+            rotation_folder: None,
             dir_suggestions: vec![],
             suggestion_state,
             download_url_buffer: String::new(),
@@ -510,6 +540,11 @@ impl App {
                                 self.handle_download_progress_key(key.code)
                             }
                             AppMode::Search => self.handle_search_key(key.code),
+                            AppMode::SavedFilters => self.handle_saved_filters_key(key.code),
+                            AppMode::SavedFilterName => self.handle_saved_filter_name_key(key.code),
+                            AppMode::SavedFilterConfirm => {
+                                self.handle_saved_filter_confirm_key(key.code)
+                            }
                             AppMode::IntervalEdit => self.handle_interval_key(key.code),
                             AppMode::RotationMenu => self.handle_rotation_menu_key(key.code),
                             AppMode::Keybindings => self.handle_keybindings_key(key.code),
@@ -604,6 +639,8 @@ impl App {
             (KeyCode::Char('R'), KeyModifiers::SHIFT) => self.open_rotation_menu(),
             (KeyCode::Char('s'), KeyModifiers::NONE) => self.toggle_sort_mode(),
             (KeyCode::Char('/'), KeyModifiers::NONE) => self.open_search(),
+            (KeyCode::Char('f'), KeyModifiers::NONE) => self.open_saved_filters(),
+            (KeyCode::Char('c'), KeyModifiers::NONE) => self.clear_active_filter(),
             (KeyCode::Char('?'), _) | (KeyCode::Char('/'), KeyModifiers::SHIFT) => {
                 self.mode = AppMode::Keybindings
             }
@@ -654,6 +691,185 @@ impl App {
                 self.request_preview_load();
             }
             _ => {}
+        }
+    }
+
+    fn handle_saved_filters_key(&mut self, key: KeyCode) {
+        let len = self.config.saved_filters.len();
+        match key {
+            KeyCode::Esc => self.mode = AppMode::Wallpaper,
+            KeyCode::Char('a') => {
+                let query = self.active_filter().to_string();
+                let folder = self.folder_for_section(self.active_section).cloned();
+                self.begin_saved_filter_name(query, folder);
+            }
+            KeyCode::Char('o') => {
+                if let Some(folder) = self
+                    .current_selected_wallpaper()
+                    .map(|wallpaper| wallpaper.directory.clone())
+                {
+                    self.begin_saved_filter_name(String::new(), Some(folder));
+                } else {
+                    self.saved_filter_error =
+                        Some("Select a wallpaper to save its folder.".to_string());
+                }
+            }
+            KeyCode::Char('d') if len > 0 => {
+                if let Some(filter) = self
+                    .saved_filter_state
+                    .selected()
+                    .and_then(|index| self.config.saved_filters.get(index))
+                {
+                    self.saved_filter_pending = Some(SavedFilterPending::Delete {
+                        name: filter.name.clone(),
+                    });
+                    self.saved_filter_error = None;
+                    self.mode = AppMode::SavedFilterConfirm;
+                }
+            }
+            KeyCode::Enter if len > 0 => {
+                if let Some(filter) = self
+                    .saved_filter_state
+                    .selected()
+                    .and_then(|index| self.config.saved_filters.get(index))
+                    .cloned()
+                {
+                    self.set_active_filter(filter.query);
+                    self.set_active_folder(filter.folder);
+                    self.ensure_section_selection();
+                    self.request_preview_load();
+                    self.saved_filter_error = None;
+                    self.mode = AppMode::Wallpaper;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') if len > 0 => {
+                let index = self.saved_filter_state.selected().unwrap_or(0);
+                self.saved_filter_state.select(Some((index + 1) % len));
+            }
+            KeyCode::Up | KeyCode::Char('k') if len > 0 => {
+                let index = self.saved_filter_state.selected().unwrap_or(0);
+                self.saved_filter_state
+                    .select(Some((index + len - 1) % len));
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_saved_filter_name_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => {
+                self.saved_filter_error = None;
+                self.mode = AppMode::SavedFilters;
+            }
+            KeyCode::Enter => {
+                let name = self.saved_filter_name.trim().to_string();
+                let query = self.saved_filter_source_query.clone();
+                let folder = self.saved_filter_source_folder.clone();
+                if !name.is_empty()
+                    && self
+                        .config
+                        .saved_filters
+                        .iter()
+                        .any(|filter| filter.name.eq_ignore_ascii_case(&name))
+                {
+                    self.saved_filter_pending = Some(SavedFilterPending::Replace {
+                        name,
+                        query,
+                        folder,
+                    });
+                    self.saved_filter_error = None;
+                    self.mode = AppMode::SavedFilterConfirm;
+                } else {
+                    self.save_named_filter(&name, &query, folder);
+                }
+            }
+            KeyCode::Backspace => {
+                self.saved_filter_name.pop();
+            }
+            KeyCode::Char(c) => self.saved_filter_name.push(c),
+            _ => {}
+        }
+    }
+
+    fn handle_saved_filter_confirm_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                if let Some(pending) = self.saved_filter_pending.take() {
+                    match pending {
+                        SavedFilterPending::Replace {
+                            name,
+                            query,
+                            folder,
+                        } => self.save_named_filter(&name, &query, folder),
+                        SavedFilterPending::Delete { name } => {
+                            let mut updated = self.config.clone();
+                            updated.delete_saved_filter(&name);
+                            match updated.save() {
+                                Ok(()) => {
+                                    self.config = updated;
+                                    let len = self.config.saved_filters.len();
+                                    self.saved_filter_state.select(if len == 0 {
+                                        None
+                                    } else {
+                                        Some(
+                                            self.saved_filter_state
+                                                .selected()
+                                                .unwrap_or(0)
+                                                .min(len - 1),
+                                        )
+                                    });
+                                    self.saved_filter_error = None;
+                                }
+                                Err(error) => self.saved_filter_error = Some(error.to_string()),
+                            }
+                            self.mode = AppMode::SavedFilters;
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.saved_filter_pending = None;
+                self.saved_filter_error = None;
+                self.mode = AppMode::SavedFilters;
+            }
+            _ => {}
+        }
+    }
+
+    fn begin_saved_filter_name(&mut self, query: String, folder: Option<PathBuf>) {
+        if query.trim().is_empty() && folder.is_none() {
+            self.saved_filter_error =
+                Some("Search or choose a folder before saving a filter.".to_string());
+            return;
+        }
+        self.saved_filter_name.clear();
+        self.saved_filter_source_query = query;
+        self.saved_filter_source_folder = folder;
+        self.saved_filter_error = None;
+        self.mode = AppMode::SavedFilterName;
+    }
+
+    fn save_named_filter(&mut self, name: &str, query: &str, folder: Option<PathBuf>) {
+        let mut updated = self.config.clone();
+        match updated
+            .upsert_saved_filter(name, query, folder)
+            .and_then(|()| updated.save())
+        {
+            Ok(()) => {
+                self.config = updated;
+                self.saved_filter_state.select(
+                    self.config
+                        .saved_filters
+                        .iter()
+                        .position(|filter| filter.name.eq_ignore_ascii_case(name)),
+                );
+                self.saved_filter_error = None;
+                self.mode = AppMode::SavedFilters;
+            }
+            Err(error) => {
+                self.saved_filter_error = Some(error.to_string());
+                self.mode = AppMode::SavedFilterName;
+            }
         }
     }
 
@@ -888,7 +1104,10 @@ impl App {
             AppMode::UrlInput => {}
             AppMode::DownloadPathSelect => {}
             AppMode::DownloadProgress => {}
-            AppMode::Search => {}
+            AppMode::Search
+            | AppMode::SavedFilters
+            | AppMode::SavedFilterName
+            | AppMode::SavedFilterConfirm => {}
             AppMode::IntervalEdit => {}
             AppMode::RotationMenu => {}
             AppMode::Keybindings => {}
@@ -946,7 +1165,10 @@ impl App {
             AppMode::UrlInput => {}
             AppMode::DownloadPathSelect => {}
             AppMode::DownloadProgress => {}
-            AppMode::Search => {}
+            AppMode::Search
+            | AppMode::SavedFilters
+            | AppMode::SavedFilterName
+            | AppMode::SavedFilterConfirm => {}
             AppMode::IntervalEdit => {}
             AppMode::RotationMenu => {
                 let len = RotationMenuAction::ALL.len();
@@ -1023,7 +1245,10 @@ impl App {
             AppMode::UrlInput => {}
             AppMode::DownloadPathSelect => {}
             AppMode::DownloadProgress => {}
-            AppMode::Search => {}
+            AppMode::Search
+            | AppMode::SavedFilters
+            | AppMode::SavedFilterName
+            | AppMode::SavedFilterConfirm => {}
             AppMode::IntervalEdit => {}
             AppMode::RotationMenu => {
                 let len = RotationMenuAction::ALL.len();
@@ -1071,7 +1296,10 @@ impl App {
             AppMode::UrlInput => {}
             AppMode::DownloadPathSelect => {}
             AppMode::DownloadProgress => {}
-            AppMode::Search => {}
+            AppMode::Search
+            | AppMode::SavedFilters
+            | AppMode::SavedFilterName
+            | AppMode::SavedFilterConfirm => {}
             AppMode::IntervalEdit => {}
             AppMode::RotationMenu => self.rotation_menu_state.select(Some(0)),
             AppMode::Keybindings => {}
@@ -1120,7 +1348,10 @@ impl App {
             AppMode::UrlInput => {}
             AppMode::DownloadPathSelect => {}
             AppMode::DownloadProgress => {}
-            AppMode::Search => {}
+            AppMode::Search
+            | AppMode::SavedFilters
+            | AppMode::SavedFilterName
+            | AppMode::SavedFilterConfirm => {}
             AppMode::IntervalEdit => {}
             AppMode::RotationMenu => {
                 self.rotation_menu_state
@@ -1185,6 +1416,24 @@ impl App {
         self.search_buffer = self.active_filter().to_string();
         self.search_before_open = self.search_buffer.clone();
         self.mode = AppMode::Search;
+    }
+
+    fn open_saved_filters(&mut self) {
+        self.saved_filter_error = None;
+        self.saved_filter_state
+            .select(if self.config.saved_filters.is_empty() {
+                None
+            } else {
+                Some(0)
+            });
+        self.mode = AppMode::SavedFilters;
+    }
+
+    fn clear_active_filter(&mut self) {
+        self.set_active_filter(String::new());
+        self.set_active_folder(None);
+        self.ensure_section_selection();
+        self.request_preview_load();
     }
 
     fn open_url_input(&mut self) {
@@ -1417,21 +1666,13 @@ impl App {
             SectionKind::Rotation => &self.rotation_indices,
         };
         let filter = self.filter_query(section).to_lowercase();
+        let folder = self.folder_for_section(section);
         let mut indices = base_indices
             .iter()
             .copied()
             .filter(|index| {
                 let wallpaper = &self.wallpapers[*index];
-                if filter.is_empty() {
-                    true
-                } else {
-                    wallpaper.name.to_lowercase().contains(&filter)
-                        || wallpaper
-                            .path
-                            .to_string_lossy()
-                            .to_lowercase()
-                            .contains(&filter)
-                }
+                wallpaper_matches_view(wallpaper, folder.map(PathBuf::as_path), &filter)
             })
             .collect::<Vec<_>>();
         let sort_mode = self.sort_mode(section);
@@ -1466,6 +1707,20 @@ impl App {
 
     fn active_filter(&self) -> &str {
         self.filter_query(self.active_section)
+    }
+
+    fn folder_for_section(&self, section: SectionKind) -> Option<&PathBuf> {
+        match section {
+            SectionKind::All => self.all_folder.as_ref(),
+            SectionKind::Rotation => self.rotation_folder.as_ref(),
+        }
+    }
+
+    fn set_active_folder(&mut self, folder: Option<PathBuf>) {
+        match self.active_section {
+            SectionKind::All => self.all_folder = folder,
+            SectionKind::Rotation => self.rotation_folder = folder,
+        }
     }
 
     fn set_active_filter(&mut self, value: String) {
@@ -1764,6 +2019,9 @@ impl App {
             | AppMode::DownloadPathSelect
             | AppMode::DownloadProgress
             | AppMode::Search
+            | AppMode::SavedFilters
+            | AppMode::SavedFilterName
+            | AppMode::SavedFilterConfirm
             | AppMode::IntervalEdit
             | AppMode::RotationMenu
             | AppMode::Keybindings => {
@@ -1797,6 +2055,11 @@ impl App {
                         self.render_download_progress_overlay(frame, chunks[0], theme)
                     }
                     AppMode::Search => self.render_search_overlay(frame, chunks[0], theme),
+                    AppMode::SavedFilters
+                    | AppMode::SavedFilterName
+                    | AppMode::SavedFilterConfirm => {
+                        self.render_saved_filters_overlay(frame, chunks[0], theme)
+                    }
                     AppMode::IntervalEdit => self.render_interval_overlay(frame, chunks[0], theme),
                     AppMode::RotationMenu => {
                         self.render_rotation_menu_overlay(frame, chunks[0], theme)
@@ -2030,13 +2293,19 @@ impl App {
 
         if indices.is_empty() {
             let message = match section {
-                SectionKind::All if self.filter_query(section).is_empty() => {
+                SectionKind::All
+                    if self.filter_query(section).is_empty()
+                        && self.folder_for_section(section).is_none() =>
+                {
                     "No wallpapers indexed"
                 }
-                SectionKind::Rotation if self.filter_query(section).is_empty() => {
+                SectionKind::Rotation
+                    if self.filter_query(section).is_empty()
+                        && self.folder_for_section(section).is_none() =>
+                {
                     "Rotation list is empty"
                 }
-                _ => "No matches for current filter",
+                _ => "No matches for current view",
             };
             frame.render_widget(
                 Para::new(Line::from(Span::styled(message, theme.muted)))
@@ -2135,6 +2404,15 @@ impl App {
                 vec![("Esc", "cancel/close"), ("Enter", "close result")]
             }
             AppMode::Search => vec![("Type", "filter"), ("Enter", "confirm"), ("Esc", "cancel")],
+            AppMode::SavedFilters => vec![
+                ("↑/↓", "choose"),
+                ("Enter", "apply"),
+                ("a/o", "save"),
+                ("d", "delete"),
+                ("Esc", "close"),
+            ],
+            AppMode::SavedFilterName => vec![("Type", "name"), ("Enter", "save"), ("Esc", "back")],
+            AppMode::SavedFilterConfirm => vec![("y/Enter", "confirm"), ("n/Esc", "cancel")],
             AppMode::IntervalEdit => {
                 vec![("Type", "seconds"), ("Enter", "save"), ("Esc", "cancel")]
             }
@@ -2147,15 +2425,15 @@ impl App {
                 vec![("↑/↓", "preview"), ("Enter", "confirm"), ("Esc", "cancel")]
             }
             AppMode::Wallpaper => vec![
-                ("?", "keybindings"),
+                ("?", "keys"),
                 ("↑/↓", "move"),
                 ("Enter", "apply/select"),
                 ("A", "all displays"),
-                ("/", "filter"),
+                ("/", "search"),
+                ("f", "saved filters"),
+                ("c", "clear filter"),
                 ("r", "rotate"),
-                ("R", "rotation options"),
                 ("Ctrl+r", "random/options"),
-                ("u", "download and save"),
                 ("p", "paths"),
             ],
         };
@@ -2194,6 +2472,151 @@ impl App {
         .block(self.themed_block(" Filter Active Section ", theme))
         .alignment(Alignment::Left);
         self.render_popup(frame, popup, theme, input);
+    }
+
+    fn render_saved_filters_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
+        let popup = centered_rect(
+            72,
+            if self.mode == AppMode::SavedFilters {
+                16
+            } else {
+                8
+            },
+            area,
+        );
+        frame.render_widget(Clear, popup);
+        frame.render_widget(Block::default().style(theme.surface), popup);
+        let block = self.themed_block(" Saved Filters ", theme);
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+
+        if self.mode == AppMode::SavedFilterName {
+            let description = saved_filter_description(
+                &self.saved_filter_source_query,
+                self.saved_filter_source_folder.as_ref(),
+            );
+            let lines = vec![
+                Line::from(Span::styled(format!("View: {description}"), theme.muted)),
+                Line::from(vec![
+                    Span::styled("Name: ", theme.key),
+                    Span::styled(
+                        format!(
+                            "{}{}",
+                            self.saved_filter_name,
+                            if self.saved_filter_name.is_empty() {
+                                "_"
+                            } else {
+                                ""
+                            }
+                        ),
+                        theme.accent,
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    self.saved_filter_error
+                        .as_deref()
+                        .unwrap_or("Enter saves · Esc returns"),
+                    if self.saved_filter_error.is_some() {
+                        theme.highlight
+                    } else {
+                        theme.muted
+                    },
+                )),
+            ];
+            frame.render_widget(Para::new(lines), inner);
+            return;
+        }
+
+        if self.mode == AppMode::SavedFilterConfirm {
+            let question = match self.saved_filter_pending.as_ref() {
+                Some(SavedFilterPending::Replace { name, .. }) => {
+                    format!("Replace saved filter '{name}'?")
+                }
+                Some(SavedFilterPending::Delete { name }) => {
+                    format!("Delete saved filter '{name}'?")
+                }
+                None => "No pending change".to_string(),
+            };
+            frame.render_widget(
+                Para::new(vec![
+                    Line::from(Span::styled(question, theme.accent)),
+                    Line::from(Span::styled(
+                        "y / Enter confirm · n / Esc cancel",
+                        theme.key,
+                    )),
+                ]),
+                inner,
+            );
+            return;
+        }
+
+        let summary = saved_filter_description(
+            self.active_filter(),
+            self.folder_for_section(self.active_section),
+        );
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(0),
+                Constraint::Length(2),
+            ])
+            .split(inner);
+        frame.render_widget(
+            Para::new(vec![
+                Line::from(Span::styled(
+                    format!("Current {}: {summary}", self.active_section.title().trim()),
+                    theme.muted,
+                )),
+                popup_divider_line(sections[0].width, theme),
+            ]),
+            sections[0],
+        );
+        if self.config.saved_filters.is_empty() {
+            frame.render_widget(
+                Para::new("No saved filters yet.").style(theme.muted),
+                sections[1],
+            );
+        } else {
+            let items = self
+                .config
+                .saved_filters
+                .iter()
+                .map(|filter| {
+                    ListItem::new(vec![
+                        Line::from(Span::styled(filter.name.clone(), theme.accent)),
+                        Line::from(Span::styled(
+                            saved_filter_description(&filter.query, filter.folder.as_ref()),
+                            theme.muted,
+                        )),
+                    ])
+                })
+                .collect::<Vec<_>>();
+            let mut state = self.saved_filter_state.clone();
+            frame.render_stateful_widget(
+                List::new(items)
+                    .highlight_style(theme.highlight)
+                    .highlight_symbol("› "),
+                sections[1],
+                &mut state,
+            );
+        }
+        frame.render_widget(
+            Para::new(vec![
+                Line::from(Span::styled(
+                    self.saved_filter_error
+                        .as_deref()
+                        .unwrap_or("a save view · o save folder · d delete · Enter apply"),
+                    if self.saved_filter_error.is_some() {
+                        theme.highlight
+                    } else {
+                        theme.key
+                    },
+                )),
+                Line::from(Span::styled("↑↓ choose · Esc close", theme.muted)),
+            ]),
+            sections[2],
+        );
     }
 
     fn render_url_input_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
@@ -2581,7 +3004,7 @@ impl App {
     }
 
     fn render_keybindings_overlay(&self, frame: &mut Frame, area: Rect, theme: ThemePalette) {
-        let popup = centered_rect(72, 14, area);
+        let popup = centered_rect(72, 16, area);
         let pairs = [
             (("Move", "↑/↓ or j/k"), ("Sections", "Tab/l, S-Tab/h")),
             (("Apply", "Enter / popup"), ("All Displays", "A")),
@@ -2589,6 +3012,12 @@ impl App {
             (("Download and save", "u"), ("Rotation Options", "R")),
             (("Interval", "i"), ("Filter", "/")),
             (("Sort", "s"), ("Paths", "p")),
+            (("Saved filters", "f"), ("Clear filter", "c")),
+            (
+                ("Filter list", "↑↓/j/k · Enter apply"),
+                ("Save", "a view / o folder"),
+            ),
+            (("Delete filter", "d"), ("Confirm", "y/Enter · n/Esc")),
             (("Theme", "t"), ("Keybindings", "?")),
             (("Quit", "q / Esc"), ("", "")),
         ];
@@ -2701,6 +3130,7 @@ impl App {
         else {
             self.current_image = None;
             self.last_preview_target = None;
+            self.preview_request_id = self.preview_request_id.wrapping_add(1);
             return;
         };
 
@@ -2709,6 +3139,7 @@ impl App {
             return;
         }
         self.last_preview_target = Some(target);
+        self.current_image = None;
 
         self.preview_request_id = self.preview_request_id.wrapping_add(1);
         let _ = self.preview_tx.send(PreviewRequest {
@@ -2943,7 +3374,7 @@ impl App {
 
     fn section_title(&self, section: SectionKind) -> String {
         format!(
-            "{} [{}{}]",
+            "{} [{}{}]{}",
             section.title().trim(),
             if section == SectionKind::Rotation {
                 self.rotation_service_state
@@ -2958,6 +3389,11 @@ impl App {
                 format!(" · {}s", self.config.rotation_interval_secs)
             } else {
                 String::new()
+            },
+            if self.filter_query(section).is_empty() && self.folder_for_section(section).is_none() {
+                ""
+            } else {
+                " · Filtered"
             }
         )
     }
@@ -3103,6 +3539,15 @@ fn center_rect(area: Rect, size: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     Rect::new(x, y, width, height)
+}
+
+fn saved_filter_description(query: &str, folder: Option<&PathBuf>) -> String {
+    match (folder, query.trim()) {
+        (None, "") => "All wallpapers".to_string(),
+        (Some(folder), "") => format!("Folder: {}", folder.display()),
+        (None, query) => format!("Search: {query}"),
+        (Some(folder), query) => format!("Folder: {} · Search: {query}", folder.display()),
+    }
 }
 
 fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {

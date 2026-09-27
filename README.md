@@ -272,6 +272,8 @@ Walt opens with the current wallpaper selected in the `All` list when it is alre
 - `Enter` apply the selected wallpaper directly when one display is detected, or open a display picker when multiple displays are detected
 - `A` apply the selected wallpaper to all displays
 - `/` filter the active section
+- `f` open saved filters. Press `a` to save the current view, `o` to save the selected wallpaper's exact folder, `Enter` to apply a preset, or `d` to delete it. Replacing and deleting require confirmation
+- `c` clear the active section's folder and text filter
 - `s` toggle sort for the active section between name and modification date
 - `r` add or remove the selected wallpaper from the manual rotation list
 - `Ctrl+r` apply a random wallpaper directly when one display is detected, or open random options when multiple displays are detected
@@ -289,6 +291,8 @@ Walt opens with the current wallpaper selected in the `All` list when it is alre
 ### Popup Controls
 
 The TUI uses focused popups for display selection, random options, URL downloads, rotation controls, path management, and theme selection.
+
+Saved filters store exact wallpaper folders and optional text searches across launches. They are shared by the TUI and GUI. In the GUI, choose a preset from the picker beside Search to apply it immediately, or use **Manage saved filters** to save and delete presets. Saving a folder includes wallpapers directly in that folder; nested folders are separate. Applying a preset restores the current section's folder and editable search text. Use **Clear filter** in the GUI or `c` in the TUI to show every wallpaper in the section again. Random selection from the TUI or GUI uses the visible wallpapers, so these filters narrow those candidates. CLI random and automatic rotation are unchanged.
 
 ### Display picker
 
