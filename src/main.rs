@@ -12,6 +12,8 @@ use std::io::{self, BufRead, IsTerminal, Write};
 
 use anyhow::{bail, Context, Result};
 
+use crate::backend::hyprpaper::hyprpaper_compatibility_notice;
+
 const ROTATION_OPTIONS: &str = "install, enable, disable, uninstall, status, interval";
 const ROTATION_USAGE: &str = "walt rotation <install|enable|disable|uninstall|status|interval>";
 const RANDOM_USAGE: &str = "walt random [--same|DISPLAY_INDEX]";
@@ -211,7 +213,14 @@ fn run_random_wallpaper(command: RandomCommand) -> Result<()> {
         plan.assignments.len()
     );
     print_random_summary(&plan);
+    print_hyprpaper_compatibility_notice();
     Ok(())
+}
+
+fn print_hyprpaper_compatibility_notice() {
+    if let Some(message) = hyprpaper_compatibility_notice() {
+        println!("Note: {message}");
+    }
 }
 
 fn print_random_summary(plan: &backend::RandomPlan) {

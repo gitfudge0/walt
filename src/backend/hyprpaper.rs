@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
-    path::PathBuf,
+    fs,
+    path::{Path, PathBuf},
     process::{Command, Output},
     sync::{Mutex, OnceLock},
     thread,
@@ -8,6 +9,7 @@ use std::{
 };
 
 use log::{debug, error, info, warn};
+use walkdir::WalkDir;
 
 const HYPERPAPER_SERVICE: &str = "hyprpaper.service";
 const HYPERPAPER_PROCESS_NAME: &str = "hyprpaper";
@@ -463,6 +465,86 @@ fn unsupported_active_query_verification_message(
     )
 }
 
+fn active_query_user_notice(active_query_support: CapabilitySupport) -> Option<&'static str> {
+    (active_query_support == CapabilitySupport::Unsupported).then_some(
+        "Walt sent the wallpaper command, but it cannot verify the visual result because this hyprpaper build does not support `hyprctl hyprpaper listactive`.",
+    )
+}
+
+pub fn hyprpaper_compatibility_notice() -> Option<String> {
+    compatibility_notice(
+        detect_hyprpaper_source_in_hyprland_config().as_deref(),
+        cached_capability_support(&ACTIVE_QUERY_SUPPORT_CACHE),
+    )
+}
+
+fn compatibility_notice(
+    source_file: Option<&Path>,
+    active_query_support: CapabilitySupport,
+) -> Option<String> {
+    let active_query_notice = active_query_user_notice(active_query_support);
+    let source_notice = source_file.map(format_hyprpaper_source_notice);
+
+    match (active_query_notice, source_notice) {
+        (Some(active_query_notice), Some(source_notice)) => {
+            Some(format!("{active_query_notice} {source_notice}"))
+        }
+        (Some(active_query_notice), None) => Some(active_query_notice.to_string()),
+        (None, Some(source_notice)) => Some(source_notice),
+        (None, None) => None,
+    }
+}
+
+fn format_hyprpaper_source_notice(path: &Path) -> String {
+    format!(
+        "Hyprland config `{}` appears to source a hyprpaper config. Remove that `source = ...hyprpaper...` line and keep `exec-once = hyprpaper`; newer hyprpaper reads its own config directly.",
+        path.display()
+    )
+}
+
+fn detect_hyprpaper_source_in_hyprland_config() -> Option<PathBuf> {
+    let hypr_config_dir = dirs::config_dir()?.join("hypr");
+    detect_hyprpaper_source_in_dir(&hypr_config_dir)
+}
+
+fn detect_hyprpaper_source_in_dir(dir: &Path) -> Option<PathBuf> {
+    if !dir.is_dir() {
+        return None;
+    }
+
+    WalkDir::new(dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            let path = entry.path();
+            if !entry.file_type().is_file()
+                || path.extension().and_then(|ext| ext.to_str()) != Some("conf")
+            {
+                return None;
+            }
+
+            let content = fs::read_to_string(path).ok()?;
+            content
+                .lines()
+                .any(line_sources_hyprpaper_config)
+                .then(|| path.to_path_buf())
+        })
+}
+
+fn line_sources_hyprpaper_config(line: &str) -> bool {
+    let uncommented = line.split('#').next().unwrap_or("").trim();
+    let Some((directive, value)) = uncommented.split_once('=') else {
+        return false;
+    };
+
+    if directive.trim() != "source" {
+        return false;
+    }
+
+    let value = value.trim().to_ascii_lowercase();
+    value.contains("hyprpaper.conf") || value.contains("hyprpaper.d")
+}
+
 fn apply_wallpaper_to_monitor(monitor_name: &str, wallpaper_path: &str) -> anyhow::Result<()> {
     let arg = format!("{monitor_name},{wallpaper_path}");
     debug!("applying hyprpaper wallpaper arg={arg}");
@@ -620,10 +702,12 @@ fn should_wait_for_another_hyprpaper_attempt(attempt: usize, max_attempts: usize
 #[cfg(test)]
 mod tests {
     use super::{
-        active_wallpaper_assignments_or_empty, active_wallpapers_from_assignments,
-        capability_cache_state_after_result, classify_backend_unavailable_message,
-        classify_hyprpaper_command_failure_message, command_output_details,
+        active_query_user_notice, active_wallpaper_assignments_or_empty,
+        active_wallpapers_from_assignments, capability_cache_state_after_result,
+        classify_backend_unavailable_message, classify_hyprpaper_command_failure_message,
+        command_output_details, compatibility_notice,
         compatibility_wrap_active_wallpaper_assignments, deduplicate_active_wallpapers,
+        detect_hyprpaper_source_in_dir, line_sources_hyprpaper_config,
         parse_active_wallpaper_assignments, parse_monitors, preload_unique_wallpapers,
         should_retry_hyprpaper_command_failure, should_wait_for_another_hyprpaper_attempt,
         summarize_multi_monitor_apply_failures, unique_wallpaper_paths,
@@ -631,7 +715,23 @@ mod tests {
         ActiveWallpaperAssignment, BackendUnavailableReason, CapabilitySupport,
         HyprpaperCommandFailure, Monitor, PreloadSupport,
     };
-    use std::{os::unix::process::ExitStatusExt, path::PathBuf, process::Output};
+    use std::{
+        fs,
+        os::unix::process::ExitStatusExt,
+        path::{Path, PathBuf},
+        process::Output,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn make_temp_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("walt-hyprpaper-test-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
 
     #[test]
     fn parses_one_monitor() {
@@ -966,6 +1066,62 @@ mod tests {
             unsupported_active_query_verification_message(CapabilitySupport::Supported),
             None
         );
+    }
+
+    #[test]
+    fn reports_user_facing_notice_when_active_query_is_unsupported() {
+        assert_eq!(
+            active_query_user_notice(CapabilitySupport::Unsupported),
+            Some(
+                "Walt sent the wallpaper command, but it cannot verify the visual result because this hyprpaper build does not support `hyprctl hyprpaper listactive`."
+            )
+        );
+        assert_eq!(active_query_user_notice(CapabilitySupport::Supported), None);
+    }
+
+    #[test]
+    fn detects_hyprpaper_config_source_lines() {
+        assert!(line_sources_hyprpaper_config(
+            "source = ~/.config/hypr/hyprpaper.conf"
+        ));
+        assert!(line_sources_hyprpaper_config(
+            "source = ~/.config/hypr/hyprpaper.d/*.conf"
+        ));
+        assert!(!line_sources_hyprpaper_config(
+            "# source = ~/.config/hypr/hyprpaper.conf"
+        ));
+        assert!(!line_sources_hyprpaper_config("exec-once = hyprpaper"));
+    }
+
+    #[test]
+    fn finds_hyprpaper_source_in_hypr_config_tree() {
+        let root = make_temp_dir();
+        let config_dir = root.join("conf.d");
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        let config_path = config_dir.join("paper.conf");
+        fs::write(
+            &config_path,
+            "source = ~/.config/hypr/hyprpaper.conf\nexec-once = hyprpaper\n",
+        )
+        .expect("write config");
+
+        let detected = detect_hyprpaper_source_in_dir(&root).expect("detect source line");
+        assert_eq!(detected, config_path);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn combines_active_query_and_source_notice() {
+        let notice = compatibility_notice(
+            Some(Path::new("/home/test/.config/hypr/hyprland.conf")),
+            CapabilitySupport::Unsupported,
+        )
+        .expect("combined notice");
+
+        assert!(notice.contains("cannot verify the visual result"));
+        assert!(notice.contains("source a hyprpaper config"));
+        assert!(notice.contains("exec-once = hyprpaper"));
     }
 
     #[test]

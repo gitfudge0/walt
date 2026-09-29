@@ -169,6 +169,8 @@ Make sure `hyprpaper` is running:
 exec-once = hyprpaper
 ```
 
+If you are on newer `hyprpaper`, do not add `source = ~/.config/hypr/hyprpaper.conf` to `hyprland.conf`. `hyprpaper` reads `~/.config/hypr/hyprpaper.conf` on its own, and sourcing that file from Hyprland can prevent wallpaper updates even though Walt reports that the IPC call succeeded.
+
 Walt works across older and newer `hyprpaper` behavior and falls back gracefully when active wallpaper status is unavailable.
 
 Debug logs are written to `~/.cache/walt/logs/walt.log`. Use `WALT_LOG=debug` to increase verbosity.
