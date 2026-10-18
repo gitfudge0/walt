@@ -7,14 +7,10 @@ use ratatui::{
     crossterm::{
         event::{
             self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-            KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-            PushKeyboardEnhancementFlags,
+            KeyModifiers,
         },
         execute,
-        terminal::{
-            disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
-            LeaveAlternateScreen,
-        },
+        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     },
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     symbols::border,
@@ -472,44 +468,36 @@ impl App {
     }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
+        use std::io::Write;
+
         info!("starting terminal UI");
-        enable_raw_mode()?;
         let mut stdout = io::stdout();
-        let keyboard_enhancement_enabled = matches!(supports_keyboard_enhancement(), Ok(true))
-            && execute!(
-                stdout,
-                PushKeyboardEnhancementFlags(
-                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-                        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                )
-            )
-            .is_ok();
+
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        enable_raw_mode()?;
         set_stderr_mirroring_enabled(false);
+
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
         let res = self.run_app(&mut terminal);
 
-        if keyboard_enhancement_enabled {
-            execute!(
-                terminal.backend_mut(),
-                PopKeyboardEnhancementFlags,
-                LeaveAlternateScreen,
-                DisableMouseCapture
-            )?;
-        } else {
-            execute!(
-                terminal.backend_mut(),
-                LeaveAlternateScreen,
-                DisableMouseCapture
-            )?;
+        while event::poll(std::time::Duration::from_millis(10)).is_ok_and(|p| p) {
+            let _ = event::read();
         }
+
+        let _ = execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
+        let _ = disable_raw_mode();
+        let _ = terminal.show_cursor();
+
+        let mut stdout = io::stdout();
+        let _ = stdout.write_all(b"\x1b[<u\x1b[=0u");
+        let _ = stdout.flush();
         set_stderr_mirroring_enabled(true);
-        disable_raw_mode()?;
-        terminal.show_cursor()?;
 
         if let Err(err) = res {
             error!("terminal UI exited with error: {:?}", err);
@@ -518,7 +506,6 @@ impl App {
 
         Ok(())
     }
-
     fn run_app<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> io::Result<()> {
         loop {
             self.drain_preview_updates();
